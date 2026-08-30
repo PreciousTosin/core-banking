@@ -79,6 +79,7 @@ services/funds-core/
 │   │   ├── PostingCommand.java
 │   │   ├── PostingResult.java
 │   │   ├── PostingService.java
+│   │   ├── PostingTransactionObserver.java
 │   │   ├── ReversalService.java
 │   │   └── proof/
 │   │       ├── AccountingProofService.java
@@ -104,8 +105,15 @@ services/funds-core/
 │   ├── testsupport/PropertyCases.java
 │   ├── application/PostingServiceIT.java
 │   ├── application/PostingConcurrencyIT.java
+│   ├── application/PostingAtomicityIT.java
+│   ├── application/PostingCrashRecoveryIT.java
+│   ├── application/CrashPostingWorker.java
+│   ├── application/TestPostingStack.java
+│   ├── application/AccountingStateMachineIT.java
 │   ├── application/ReversalServiceIT.java
 │   ├── application/proof/AccountingProofServiceIT.java
+│   ├── testsupport/GeneratedLedgerOperation.java
+│   ├── testsupport/ReferenceLedgerModel.java
 │   └── infrastructure/postgres/
 │       ├── LedgerConstraintIT.java
 │       └── MigrationIT.java
@@ -714,7 +722,7 @@ public interface LedgerRepository {
 ```java
 @ApplicationScoped
 public class PostingService {
-    private final AgroalDataSource dataSource;
+    private final DataSource dataSource;
     private final LedgerRepository repository;
     private final PostgresRetryPolicy retryPolicy;
 
@@ -750,7 +758,7 @@ public class PostingService {
 }
 ```
 
-`LedgerPersistenceException` preserves the `SQLException` as its cause. `PostgresRetryPolicy` walks the cause chain, retries only SQLSTATE `40001` and `40P01`, at most five attempts, and uses injectable jitter so tests do not sleep. Every retry uses the same command ID and hash. Constraint, validation and idempotency conflicts are never retried.
+Quarkus injects its Agroal-backed implementation through the standard `javax.sql.DataSource` interface; the child-process crash harness can therefore supply a `PGSimpleDataSource` without replacing the repository or transaction code. `LedgerPersistenceException` preserves the `SQLException` as its cause. `PostgresRetryPolicy` walks the cause chain, retries only SQLSTATE `40001` and `40P01`, at most five attempts, and uses injectable jitter so tests do not sleep. Every retry uses the same command ID and hash. Constraint, validation and idempotency conflicts are never retried.
 
 - [ ] **Step 5: Run posting tests**
 
@@ -771,6 +779,8 @@ git commit -m "feat(funds-core): post journals atomically"
 
 **Files:**
 - Test: `services/funds-core/src/test/java/com/corebanking/funds/application/PostingConcurrencyIT.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/application/PostingTransactionObserver.java`
+- Modify: `services/funds-core/src/main/java/com/corebanking/funds/application/PostingService.java`
 - Modify: `services/funds-core/src/main/java/com/corebanking/funds/infrastructure/postgres/JdbcLedgerRepository.java`
 - Modify: `services/funds-core/src/main/java/com/corebanking/funds/infrastructure/postgres/PostgresRetryPolicy.java`
 
@@ -798,7 +808,24 @@ Expected: FAIL until lock ordering and waiter behavior are correct.
 
 - [ ] **Step 5: Implement deterministic synchronization points and lock ordering**
 
-Keep production code free of test sleeps. Inject a package-private `PostingTransactionObserver` whose default methods do nothing and whose test implementation coordinates latches after idempotency acquisition and after account locks. Sort accounts before generating `SELECT ... FOR UPDATE` statements.
+Keep production code free of test sleeps. Define `PostingTransactionObserver` as a public internal SPI because both the application transaction coordinator and PostgreSQL repository invoke it; inject a no-op production bean while tests provide deterministic observers. Define these exact callbacks: `afterIdempotencyAcquired(UUID)`, `afterAccountLocks(UUID)`, `afterFinancialRowsBeforeOutbox(UUID)`, `beforeCommit(UUID)` and `afterCommitBeforeReturn(UUID)`, plus `static PostingTransactionObserver noop()`. Task 7 uses the first two; Task 8 uses the remaining callbacks for deterministic failure and crash placement. Sort accounts before generating `SELECT ... FOR UPDATE` statements.
+
+```java
+public interface PostingTransactionObserver {
+    default void afterIdempotencyAcquired(UUID commandId) {}
+    default void afterAccountLocks(UUID commandId) {}
+    default void afterFinancialRowsBeforeOutbox(UUID commandId) {}
+    default void beforeCommit(UUID commandId) {}
+    default void afterCommitBeforeReturn(UUID commandId) {}
+
+    static PostingTransactionObserver noop() {
+        return new PostingTransactionObserver() {};
+    }
+}
+
+@ApplicationScoped
+final class NoOpPostingTransactionObserver implements PostingTransactionObserver {}
+```
 
 - [ ] **Step 6: Run concurrency tests repeatedly**
 
@@ -820,7 +847,200 @@ git commit -m "test(funds-core): prove concurrent posting safety"
 
 ---
 
-### Task 8: Implement closed-period correction and exact reversal
+### Task 8: Prove atomic rollback and idempotent recovery across process termination
+
+**Files:**
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/application/PostingAtomicityIT.java`
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/application/PostingCrashRecoveryIT.java`
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/application/CrashPostingWorker.java`
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/application/TestPostingStack.java`
+- Modify: `services/funds-core/src/main/java/com/corebanking/funds/application/PostingService.java`
+- Modify: `services/funds-core/src/main/java/com/corebanking/funds/application/PostingTransactionObserver.java`
+- Modify: `services/funds-core/src/main/java/com/corebanking/funds/infrastructure/postgres/JdbcLedgerRepository.java`
+
+**Interfaces:**
+- Consumes: `PostingService.post`, the five `PostingTransactionObserver` callbacks from Task 7 and the PostgreSQL datasource exposed by Quarkus Dev Services.
+- Produces: direct evidence that a pre-outbox failure rolls back every financial row, a process death before commit elects a new idempotency owner and a process death after commit returns the stored result without reposting.
+
+- [ ] **Step 1: Write the failing pre-outbox atomicity test**
+
+Construct `PostingService` with an observer whose `afterFinancialRowsBeforeOutbox(commandId)` throws `InjectedPostingFailure`. Snapshot the relevant rows, submit a balanced two-line command and assert that journal, posting, materialised-balance, control-projection, idempotency and outbox state is byte-for-byte unchanged. Submit the same command/hash through the no-op observer and assert exactly one journal, two postings, the two expected balance deltas, one completed idempotency result and one outbox event.
+
+```java
+@Test
+void failureAfterFinancialRowsButBeforeOutboxRollsBackEverything() {
+    var command = CrashPostingWorker.command(COMMAND_ID);
+    LedgerSnapshot before = rows.snapshot(COMMAND_ID, Set.of(PROVIDER_ASSET, CUSTOMER_LIABILITY));
+    var failing = TestPostingStack.create(dataSource, new PostingTransactionObserver() {
+        @Override public void afterFinancialRowsBeforeOutbox(UUID commandId) {
+            throw new InjectedPostingFailure(commandId);
+        }
+    });
+
+    assertThrows(InjectedPostingFailure.class, () -> failing.postingService().post(command));
+    assertEquals(before, rows.snapshot(COMMAND_ID, Set.of(PROVIDER_ASSET, CUSTOMER_LIABILITY)));
+
+    PostingResult recovered = TestPostingStack.create(dataSource, PostingTransactionObserver.noop())
+        .postingService().post(command);
+    assertEquals(1, rows.journalCount(COMMAND_ID));
+    assertEquals(2, rows.postingCount(recovered.journalId()));
+    assertEquals(Map.of(PROVIDER_ASSET, 100_000L, CUSTOMER_LIABILITY, -100_000L),
+        rows.balanceDeltasSince(before));
+    assertEquals(1, rows.controlProjectionDeltaCountSince(before));
+    assertEquals(1, rows.completedIdempotencyCount(COMMAND_ID));
+    assertEquals(1, rows.outboxCount(recovered.journalId()));
+    assertEquals(COMMAND_ID, rows.commandFor(recovered.journalId()));
+}
+```
+
+Define `InjectedPostingFailure`, an immutable `LedgerSnapshot` containing account totals/versions and control-projection totals, and a JDBC-backed `RowProbe rows` as private nested test helpers in `PostingAtomicityIT`. `RowProbe` filters through the command ID, journal ID and fixture account IDs so unrelated seed data is excluded. Snapshot equality after the injected failure proves both newly inserted rows and updates to pre-existing balance rows rolled back.
+
+- [ ] **Step 2: Run the atomicity test to verify failure**
+
+Run: `cd services/funds-core && ./mvnw -Dtest=PostingAtomicityIT test`
+
+Expected: FAIL until the repository calls the observer after journal, posting, balance and control-projection writes but before the outbox insert, and the transaction coordinator rolls the exception back.
+
+- [ ] **Step 3: Wire the pre-outbox callback inside the transaction**
+
+Call `observer.afterFinancialRowsBeforeOutbox(command.commandId())` immediately before `insertOutbox`. Although the Java SPI is public so the repository can invoke it, only the no-op CDI bean is packaged as an injectable production implementation. Do not read a system property, environment variable or request field to select a failure point, so remote callers cannot activate the test seam in a deployed service.
+
+- [ ] **Step 4: Write failing child-process crash tests for both commit boundaries**
+
+`CrashPostingWorker` accepts `commandId` and one of `BEFORE_COMMIT` or `AFTER_COMMIT_BEFORE_RETURN`; it reads the synthetic-test connection values from `CB_TEST_JDBC_URL`, `CB_TEST_DB_USER` and `CB_TEST_DB_PASSWORD` so credentials do not appear in the process argument list. It builds the same deterministic inflow command as the parent through `TestPostingStack`, prints `REACHED:<point>` and flushes stdout, then invokes `Runtime.getRuntime().halt(91)` from the corresponding observer callback. It must not catch the halt or send a synthetic result.
+
+Launch the worker with the Maven test classpath:
+
+```java
+private Process startWorker(CrashPoint point, UUID commandId) throws IOException {
+    var builder = new ProcessBuilder(
+        Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+        "-cp", System.getProperty("surefire.test.class.path"),
+        CrashPostingWorker.class.getName(),
+        commandId.toString(), point.name())
+        .redirectErrorStream(true);
+    builder.environment().put("CB_TEST_JDBC_URL", jdbcUrl);
+    builder.environment().put("CB_TEST_DB_USER", username);
+    builder.environment().put("CB_TEST_DB_PASSWORD", password);
+    return builder.start();
+}
+```
+
+For `BEFORE_COMMIT`, wait for exit code `91`, retry the identical command/hash in the parent and assert one completed idempotency row, one journal, two postings and one outbox event. For `AFTER_COMMIT_BEFORE_RETURN`, first assert the committed row becomes visible, wait for exit code `91`, retry and assert the returned journal ID equals the already committed journal and every row count remains unchanged. Each wait uses a ten-second timeout and forcibly terminates the child in `finally` if it has not exited.
+
+- [ ] **Step 5: Run crash tests to verify failure**
+
+Run: `cd services/funds-core && ./mvnw -Dtest=PostingCrashRecoveryIT test`
+
+Expected: FAIL until `PostingService` invokes `beforeCommit(commandId)` immediately before `connection.commit()` and `afterCommitBeforeReturn(commandId)` immediately after a successful commit but before returning the result.
+
+- [ ] **Step 6: Implement the test stack and commit-boundary callbacks**
+
+`TestPostingStack.create(PGSimpleDataSource, PostingTransactionObserver)` constructs the real `JdbcLedgerRepository`, `JournalValidator`, `CanonicalJournalHasher`, `PostgresRetryPolicy` and `PostingService`; it must not replace persistence with mocks. `CrashPostingWorker.command(UUID)` returns the fixed legal entity, book, period, provider-asset account and customer-liability account command seeded by the integration-test fixture. The parent inserts that reference data before launching the child.
+
+Place `beforeCommit` after all repository work and immediately before JDBC commit. Place `afterCommitBeforeReturn` after JDBC commit. A normal exception before commit rolls back; an actual `halt(91)` proves PostgreSQL rolls back the abandoned connection. After-commit recovery relies only on the completed idempotency record, not an in-memory response cache.
+
+- [ ] **Step 7: Run the complete failure-boundary suite repeatedly**
+
+Run:
+
+```bash
+cd services/funds-core
+for run in 1 2 3 4 5; do
+  ./mvnw -Dtest='PostingAtomicityIT,PostingCrashRecoveryIT' test || exit 1
+done
+```
+
+Expected: five consecutive passes. Every pre-commit termination leaves zero effect before retry; every post-commit termination leaves exactly one recoverable effect.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add services/funds-core/src/main/java services/funds-core/src/test
+git commit -m "test(funds-core): prove posting crash recovery"
+```
+
+---
+
+### Task 9: Generate stateful accounting sequences against PostgreSQL
+
+**Files:**
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/application/AccountingStateMachineIT.java`
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/testsupport/GeneratedLedgerOperation.java`
+- Create: `services/funds-core/src/test/java/com/corebanking/funds/testsupport/ReferenceLedgerModel.java`
+- Modify: `services/funds-core/src/test/java/com/corebanking/funds/testsupport/PropertyCases.java`
+
+**Interfaces:**
+- Consumes: real `PostingService` from Task 6, failure seams from Tasks 7–8 and direct JDBC queries against the schema from Tasks 4–5.
+- Produces: reproducible generated post/retry/conflict/reverse/reject histories whose reference-model balances, database replay, materialised balances, control projections, idempotency results and outbox cardinality agree after every operation.
+
+- [ ] **Step 1: Define generated operations and an independent reference model**
+
+Use this closed operation set:
+
+```java
+public sealed interface GeneratedLedgerOperation {
+    record Post(UUID commandId, long amount) implements GeneratedLedgerOperation {}
+    record RetrySame(UUID commandId) implements GeneratedLedgerOperation {}
+    record RetryDifferentHash(UUID commandId) implements GeneratedLedgerOperation {}
+    record Reverse(UUID commandId, UUID originalJournalId) implements GeneratedLedgerOperation {}
+    record SubmitUnbalanced(UUID commandId, long debit, long credit) implements GeneratedLedgerOperation {}
+}
+```
+
+`ReferenceLedgerModel` stores account totals in `Map<UUID,BigInteger>`, successful results by command ID, their request hashes, journal lines by journal ID and expected outbox IDs. Its `apply` method uses `BigInteger` so the oracle cannot reproduce a `long` overflow from production. It mutates only after the real command succeeds and predicts `InvalidJournalException`, `IdempotencyConflictException` or `MonetaryOverflowException` without querying production tables.
+
+For a generated `Reverse`, construct a new `JournalDraft` directly from the model's original lines using `Math.negateExact`, set `reversalOfJournalId`, and submit it through the real `PostingService`. Task 10 later packages the same rule behind `ReversalService`; this test exercises the ledger invariant without depending on a later task.
+
+- [ ] **Step 2: Write the failing seeded state-machine integration test**
+
+Run 32 fixed seeds derived from `0xCB20260830L`; each seed generates 128 operations. Weight selection as 45% balanced post, 20% same-hash retry, 10% conflicting-hash retry, 15% reversal and 10% unbalanced submission. Generate amounts from boundary values `1`, `2`, `99`, `100`, `1_000_000_000`, `Long.MAX_VALUE / 2` plus bounded random minor units. When an operation requires an existing command or journal, select one from the reference model; if none exists, generate a balanced post instead.
+
+After every operation, query PostgreSQL and assert:
+
+1. every journal sums to zero independently per currency using `numeric`;
+2. each materialised account total equals immutable-posting replay at the current journal cutoff;
+3. each control projection equals an independent posting/account-mapping aggregation;
+4. every successful journal has exactly one outbox event and one completed idempotency result;
+5. same-hash retries retain the original journal ID and conflicting hashes create no additional idempotency, journal, posting or outbox row;
+6. reversal lines are exact negations and original journal hashes remain unchanged.
+
+Assertion messages contain `seed`, zero-based `operationIndex` and the complete generated prefix so a failure is reproducible without guessing.
+
+- [ ] **Step 3: Run the state-machine test to verify failure**
+
+Run: `cd services/funds-core && ./mvnw -Dtest=AccountingStateMachineIT test`
+
+Expected: FAIL until operation generation, the independent model and all six database assertions are implemented.
+
+- [ ] **Step 4: Implement deterministic generation and invariant comparison**
+
+Use `SplittableRandom`, never wall-clock time, for operation choice, IDs and amounts. Create a separate book and account fixture per seed so sequences are isolated without truncating shared tables. Use the seed-derived fixed `bookingTime` and value date so canonical hashes are reproducible. Compare database `numeric` values with `BigInteger`; convert to `long` only when the model says the value is within the permitted range.
+
+If a sequence fails, first rerun the exact prefix once to exclude infrastructure failure, then report the original assertion. Do not automatically discard operations and call the reduced sequence equivalent: stateful idempotency and reversal dependencies make naive shrinking unsound.
+
+- [ ] **Step 5: Run generated sequences twice for reproducibility**
+
+Run:
+
+```bash
+cd services/funds-core
+./mvnw -Dtest=AccountingStateMachineIT test
+./mvnw -Dtest=AccountingStateMachineIT test
+```
+
+Expected: both runs execute the same 4,096 operations in the same order and pass with identical final journal, idempotency and outbox counts.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add services/funds-core/src/test
+git commit -m "test(funds-core): generate accounting invariant histories"
+```
+
+---
+
+### Task 10: Implement closed-period correction and exact reversal
 
 **Files:**
 - Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/ReversalRequest.java`
@@ -871,7 +1091,7 @@ git commit -m "feat(funds-core): add linked exact reversals"
 
 ---
 
-### Task 9: Implement trial-balance and control-account proofs
+### Task 11: Implement trial-balance and control-account proofs
 
 **Files:**
 - Create: `services/funds-core/src/main/java/com/corebanking/funds/application/proof/TrialBalanceProof.java`
@@ -917,7 +1137,7 @@ git commit -m "feat(funds-core): prove trial and control balances"
 
 ---
 
-### Task 10: Enforce least-privilege database roles
+### Task 12: Enforce least-privilege database roles
 
 **Files:**
 - Create: `services/funds-core/src/main/resources/db/migration/V004__application_roles.sql`
@@ -965,7 +1185,7 @@ git commit -m "security(funds-core): enforce ledger database roles"
 
 ---
 
-### Task 11: Add memory-bounded configuration and complete the accounting-kernel gate
+### Task 13: Add memory-bounded configuration and complete the accounting-kernel gate
 
 **Files:**
 - Modify: `services/funds-core/src/main/resources/application.properties`
@@ -1020,7 +1240,7 @@ cd services/funds-core
 ./mvnw clean verify
 ```
 
-Expected: all unit, generated-property and PostgreSQL integration tests pass; no skipped accounting tests; Flyway validates all four migrations.
+Expected: all unit, generated-property, PostgreSQL integration, injected-failure and child-process crash tests pass; no skipped accounting tests; Flyway validates all four migrations.
 
 - [ ] **Step 4: Run a clean package and container smoke test**
 
@@ -1044,7 +1264,7 @@ Expected: build succeeds; container reports Java 25 and stays within the declare
 - migration and application role separation;
 - local test commands;
 - JVM memory flags;
-- implemented acceptance coverage: ACC-01, the accounting portion of ACC-02, ACC-19, ACC-20, ACC-24, ACC-25 configuration inputs, ACC-29 Java fixture prerequisites and ACC-32;
+- implemented acceptance coverage: ACC-01, the accounting portion of ACC-02, ACC-19, ACC-20, ACC-24, ACC-25 configuration inputs, ACC-29 Java fixture prerequisites and ACC-32 including owner termination immediately before and after commit;
 - explicit exclusions: holds, Go contracts, event relay, providers, reconciliation, FX execution, security UI and full 8 GiB orchestration.
 
 - [ ] **Step 6: Commit**
@@ -1071,6 +1291,9 @@ Expected results:
 - Maven exits zero with no failed or skipped accounting tests.
 - Generated-property tests report the fixed seed and failing case in assertion output when applicable.
 - PostgreSQL integration tests prove commit-time balance, immutability, role and period controls.
+- Pre-outbox failure injection proves journal, postings, balances, control projection, idempotency and outbox roll back together.
+- Child-process termination tests prove pre-commit rollback/new-owner recovery and post-commit stored-result recovery.
+- Stateful PostgreSQL generation executes 4,096 post/retry/conflict/reverse/reject operations and checks six invariants after every operation.
 - Concurrent tests pass five consecutive runs.
 - `git diff --check` prints nothing.
 
