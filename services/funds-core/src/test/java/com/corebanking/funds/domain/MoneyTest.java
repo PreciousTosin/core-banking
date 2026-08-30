@@ -2,6 +2,7 @@ package com.corebanking.funds.domain;
 
 import static org.junit.jupiter.api.Assertions.*;
 import org.junit.jupiter.api.Test;
+import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 
 class MoneyTest {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");

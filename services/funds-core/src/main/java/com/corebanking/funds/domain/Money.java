@@ -1,5 +1,7 @@
 package com.corebanking.funds.domain;
 
+import com.corebanking.funds.domain.exception.MonetaryOverflowException;
+
 public record Money(CurrencyCode currency, long minorUnits) {
     public static Money of(CurrencyCode currency, long minorUnits) {
         return new Money(currency, minorUnits);
