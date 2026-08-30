@@ -3,3 +3,6 @@
 
 # Local isolated implementation worktrees.
 /.worktrees/
+
+# Maven build output for the funds-core module.
+/services/funds-core/target/
