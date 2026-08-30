@@ -18,10 +18,11 @@ class NubanTest {
     @Test void validatesGeneratedSerialAndRejectsMutatedDigit() {
         var institutionCode = "011000";
         var serial = "987654321";
-        var nuban = serial + AccountIdentifier.nubanCheckDigit(institutionCode, serial);
+        var nuban = "9876543215";
 
+        assertEquals('5', AccountIdentifier.nubanCheckDigit(institutionCode, serial));
         assertTrue(AccountIdentifier.isValidNuban(institutionCode, nuban));
-        assertFalse(AccountIdentifier.isValidNuban(institutionCode, "987654320" + nuban.charAt(9)));
+        assertFalse(AccountIdentifier.isValidNuban(institutionCode, "9876543205"));
     }
 
     @Test void rejectsNonDigitsAndKeepsSyntheticFixtureValid() {

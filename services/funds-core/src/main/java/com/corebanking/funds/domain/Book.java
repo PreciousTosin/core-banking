@@ -10,7 +10,7 @@ public record Book(
     CurrencyCode functionalCurrency,
     ZoneId timezone,
     String calendar,
-    String policyVersion) {
+    int policyVersion) {
 
     public Book {
         id = Objects.requireNonNull(id, "id");
@@ -18,7 +18,9 @@ public record Book(
         functionalCurrency = Objects.requireNonNull(functionalCurrency, "functionalCurrency");
         timezone = Objects.requireNonNull(timezone, "timezone");
         calendar = requireNonBlank(calendar, "calendar");
-        policyVersion = requireNonBlank(policyVersion, "policyVersion");
+        if (policyVersion < 1) {
+            throw new IllegalArgumentException("policyVersion must be positive");
+        }
     }
 
     private static String requireNonBlank(String value, String name) {
