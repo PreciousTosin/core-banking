@@ -3,7 +3,7 @@
 ## Comprehensive Architecture and Single-VPS Proof-of-Concept Design
 
 **Status:** Architecture-review revision for PoC approval
-**Version:** 3.0
+**Version:** 3.1
 **Date:** 2026-08-30
 **Base currency:** NGN (Naira)
 **Audience:** Architects, engineers, reviewers, security specialists, finance and reconciliation stakeholders
@@ -87,16 +87,24 @@ This revision records the material gaps found during high-level review. “Resol
 | PoC-critical | Subledger-to-general-ledger control totals and trial-balance proof were not explicit | Resolved through INV-16, §8.11, §15.5 and ACC-19 |
 | PoC-critical | Gross, clearing and net-settlement postings could be interpreted inconsistently | Resolved through §13.8 and §15.7 |
 | PoC-critical | Partial execution, late success, fee reversal and closed-period correction lacked complete accounting treatment | Resolved through §11.4, §13.8 and §15.8 |
+| PoC-critical | Partial holds and fee allocation did not prove conservation for a partial execution | Resolved through the allocation invariant in §9.3, the exact example in §13.8 and ACC-37 |
+| PoC-critical | Available balance had no normative formula across debit/credit direction, overdraft floor and partial holds | Resolved in §8.3 and the property/partial-hold tests in §23 |
+| PoC-critical | Final inbound cash for a restricted or closed destination had no safe accounting destination | Resolved through INV-24, §8.14 and ACC-33 |
+| PoC-critical | Concurrent in-progress idempotency and owner-crash behaviour were unspecified | Resolved through the state machine in §9.1 and ACC-32 |
 | PoC-critical | An 8 GiB host cannot honestly run the former 16 GiB topology unchanged | Resolved through profile-based deployment, cgroup limits and acceptance tests in §21 and §23 |
 | PoC-critical | Redpanda was budgeted below its documented production sizing without a claims restriction | Resolved by declaring it an unsupported constrained PoC mode, retaining the journal/outbox as the replay source and prohibiting broker durability/performance claims |
+| PoC-critical | Memory budgets lacked CPU/PID quotas and exact profile-manifest evidence | Resolved through §21.1 and ACC-25/ACC-35 |
+| PoC-critical | Broker-loss recovery after outbox cleanup was not defined for non-journal events | Resolved through INV-25, per-class sources/checkpoints in §16.1 and ACC-36 |
 | Required documentation | Interest, fees, commissions, taxes, provisions and revenue-recognition ownership were incomplete | Resolved at architectural level in §8.13 and §13.8; only the examples named in PoC scope are implemented |
+| Required documentation | FX scope lacked a complete two-currency, rounding and reversal example | Resolved through Example J in §13.8 and ACC-34 |
 | Required documentation | Business date, timezone, settlement calendar, end-of-day and period-close rules were incomplete | Resolved in §8.10 and §15.7 |
 | Required documentation | Account restriction, dormancy, closure and residual-balance behaviour were incomplete | Resolved in §8.14 |
 | Required documentation | Memory pressure, connection exhaustion, disk watermarks and load shedding were not safety policies | Resolved in §19 and §21.10–§21.17 |
+| Required documentation | Tamper-detection claims did not repeat the PoC signer's trust-boundary limitation | Resolved in §3 and §9.6 |
 | Production extension | Full KYC/CDD, sanctions, PEP, AML transaction monitoring and regulatory reporting are outside the PoC | Integration and fail-safe boundaries are made explicit in §14.3 and §17.7; no compliance claim is made |
 | Production extension | Multi-entity consolidation, regulatory chart mapping, capital/liquidity reporting and product profitability are not PoC deliverables | Target boundaries are recorded in §8.9, §8.11 and §20 |
 
-The unresolved implementation risk is empirical sizing: every numeric memory budget is a starting limit and becomes credible only when ACC-25 through ACC-31 pass on the named VM image.
+The unresolved implementation risk is empirical sizing: every numeric memory/CPU budget is a starting limit and becomes credible only when ACC-25 through ACC-37 pass on the named VM image and exact profile overlays.
 
 ---
 
@@ -113,14 +121,14 @@ If every acceptance test in §23 passes, the project may claim that:
 - a crash between journal commit and event delivery does not lose the event;
 - a provider timeout does not trigger an unsafe fallback;
 - externally evidenced unmatched value is represented through suspense without double-counting;
-- journal tampering is detectable against an externally stored signed root;
+- post-anchor journal alteration is detectable against an externally stored signed root when the signing key and external root store remain outside the attacker's control;
 - derived balances and statements can be rebuilt from authoritative records.
 - trial balance and subledger/control-account proofs agree for every tested book and currency;
 - the evidence suite completes across the named 8 GiB profiles within measured resource limits.
 
 ### 3.2 What the PoC must not claim
 
-The project must not describe itself as production-ready, highly available, PCI-compliant, CBN-certified or proven at a stated production throughput. Multiple containers on one host are independent processes but not independent failure domains. Passing tests across profile transitions is not evidence that the complete topology can sustain peak load simultaneously on 8 GiB.
+The project must not describe itself as production-ready, highly available, PCI-compliant, CBN-certified or proven at a stated production throughput. Multiple containers on one host are independent processes but not independent failure domains. Passing tests across profile transitions is not evidence that the complete topology can sustain peak load simultaneously on 8 GiB. A PoC signing key mounted on the VM does not detect a full-host compromise in which the attacker controls the journal, signer credentials and local process; ACC-31 proves only the stated external-anchor trust boundary.
 
 ---
 
@@ -187,8 +195,10 @@ Memory, database connections, goroutines, threads, queues, disk and broker reten
 | INV-21 | A restricted, dormant or closed customer account cannot execute a prohibited posting even when an older workflow retries | `funds-core` | Posting-time status and restriction revalidation under lock |
 | INV-22 | Resource pressure cannot cause an accepted financial command to disappear or be applied twice | Command owner | Admission control before acceptance, durable idempotency and bounded queues |
 | INV-23 | Published-event loss can be recovered from retained authoritative journal/outbox data within the PoC recovery window | Schema owner and relay | Retained outbox payloads, replay command and projection proof |
+| INV-24 | Externally final cash is recognised exactly once even when the intended customer account is restricted, closed or unknown | `funds-core` and `recon-engine` | External-evidence identity plus restricted/unapplied/suspense liability templates |
+| INV-25 | Every required event class is reconstructable for the defined recovery window after total broker loss | Schema owner | Append-only transition facts, per-schema recoverability checkpoint and hashed off-host archive |
 
-Violation of INV-01 through INV-12 and INV-17 through INV-22 must fail the originating command. INV-13 through INV-16 and INV-23 are continuously verified and page an operator when violated.
+Violation of INV-01 through INV-12 and INV-17 through INV-22 must fail the originating command. INV-24 routes externally final value to the required restricted/unapplied/suspense template rather than discarding the evidence. INV-13 through INV-16, INV-23 and INV-25 are continuously verified and page an operator when violated.
 
 ---
 
@@ -261,6 +271,32 @@ Journal sequence orders committed facts for replay; it is not used as an externa
 
 The materialised balance is updated in the same database transaction as its posting. It is an operational optimisation and can be reconstructed from postings. Each balance row carries a version and the most recent account sequence.
 
+Let `signed_postings` be positive for debits and negative for credits. `normal_multiplier` is `+1` for debit-normal accounts and `-1` for credit-normal accounts:
+
+```text
+booked_natural_balance = normal_multiplier × sum(signed_postings)
+```
+
+For a customer liability account whose authorised floor is zero or negative:
+
+```text
+available_to_spend
+  = booked_natural_balance
+  - sum(remaining active debit holds)
+  - authorised_floor
+```
+
+An authorised floor of `-₦20,000` therefore adds ₦20,000 of overdraft capacity. Restrictions and product limits are gates applied after this numeric result: a debit block can force spendable availability to zero without rewriting booked balance. For a provider asset:
+
+```text
+available_provider_float
+  = booked_asset_balance
+  - sum(remaining provider-float reservations)
+  - configured liquidity buffer
+```
+
+Only `funds-core` computes these values. Every mutation recalculates them with checked arithmetic under the locked balance/hold rows. Tests cover one minor unit, negative floors, partial holds and a restriction applied after an older workflow was authorised.
+
 ### 8.4 Hold
 
 A hold is an encumbrance record, not a general-ledger posting. It has:
@@ -273,11 +309,13 @@ A hold is an encumbrance record, not a general-ledger posting. It has:
 - expiry time and reason;
 - creation and terminal timestamps.
 
+Each consumption, release or expiry has an append-only allocation row with command ID, amount, journal reference where applicable and resulting hold version. The hold row is the locked current summary; allocation rows are the replay/audit facts.
+
 Available balance is derived from the materialised ledger balance, active debit holds, credit policy and account normal direction. The formula is implemented once inside `funds-core` and exposed through an API; consumers do not reproduce it.
 
 ### 8.5 Transaction and provider attempt
 
-A transaction is the customer-visible business operation. A provider attempt is one submission to one provider. A transaction can have several attempts over time, but only one attempt may be settlement-capable at any instant unless the product explicitly allows split execution.
+A transaction is the customer-visible business operation. A provider attempt is one submission to one provider. A transaction can have several attempts over time, but only one attempt may be settlement-capable at any instant unless the product explicitly allows split execution. Current state is materialised for efficient queries; every legal transaction and attempt transition is also appended with prior/new state, evidence reference, policy version, actor/source and time so event history can be reconstructed after broker loss.
 
 ### 8.6 Outbox and inbox
 
@@ -345,7 +383,7 @@ The proof reads immutable postings rather than trusting materialised balances. D
 
 Posted amounts use checked signed 64-bit integer minor units. APIs reject values outside configured product and currency maxima before arithmetic. Java uses exact integer operations that throw on overflow. Go uses explicit checked add/subtract helpers; neither language relies on wraparound. Database aggregates use a numeric type large enough to detect an application overflow rather than reproduce it.
 
-Binary floating point is forbidden for money and FX. FX rates use a fixed precision and named direction; conversions declare rounding mode and currency scale. Each rounded trade posts any residual to a rounding account so that “a fraction was discarded” becomes an auditable financial fact. Limits are tested at zero, one minor unit, maximum allowed amount and arithmetic boundaries.
+Binary floating point is forbidden for money and FX. FX rates use a fixed precision and named direction; conversions declare rounding mode and currency scale. Each conversion retains its high-precision unrounded result and booked rounded minor-unit result. A whole-minor-unit imbalance created by component allocation posts to a rounding account. Sub-minor-unit residuals cannot themselves be posted; they accumulate in a high-precision rounding control by currency and policy version and are recognised to the rounding account when they reach one minor unit. Limits are tested at zero, one minor unit, maximum allowed amount and arithmetic boundaries.
 
 ### 8.13 Fees, interest, taxes, provisions and recognition
 
@@ -362,6 +400,18 @@ Expected-loss provisions, amortised cost, effective-interest calculations and fu
 Account lifecycle is independent of transaction lifecycle. Restrictions are typed by direction and product: debit block, credit block, legal freeze, compliance hold, dormant, deceased-estate handling and closure pending. Every posting revalidates current restrictions under the same lock used for funds control; an older authorised workflow cannot bypass a later legal freeze.
 
 Closing an account requires zero active holds, no unresolved settlement-capable attempt, no pending interest/fee, and a zero residual balance or an approved transfer to a legally permitted destination. Closure prevents new ordinary postings but does not prevent controlled corrections, chargebacks or externally evidenced items; those use restricted operations and dedicated accounts under maker-checker policy.
+
+Externally final inbound cash cannot be rejected out of the books merely because its intended destination is restricted. The evidence is booked to an external asset and one of the following liabilities while policy resolves ownership:
+
+| Destination state | Required accounting treatment |
+|---|---|
+| Open and credit-enabled | Credit the customer liability normally |
+| Debit-blocked or dormant but credit-enabled | Credit the customer liability; keep debit availability at zero until restriction policy permits use |
+| Credit-blocked, frozen or compliance-held | Credit a customer-linked restricted-funds liability, not ordinary spendable balance; open/attach a case |
+| Closed account | Credit unapplied-incoming liability linked to original account/evidence; return or reallocate only through approved policy |
+| Unknown or unresolvable destination | Credit incoming suspense and open a reconciliation case |
+
+A later allocation debits the restricted/unapplied/suspense liability and credits the permitted customer liability. A return debits that liability and credits the external asset or settlement payable. The original inbound evidence remains immutable.
 
 ---
 
@@ -383,6 +433,15 @@ Every posting command follows this sequence inside one PostgreSQL `SERIALIZABLE`
 10. Store the command result and commit.
 
 PostgreSQL serialization failures and deadlocks are retried with bounded decorrelated jitter. A command is attempted no more than five times before returning a retryable internal error. Retrying uses the same `command_id`.
+
+The idempotency row has `IN_PROGRESS` and `COMPLETED` states and stores the canonical request hash. It is inserted and locked inside the same transaction as the financial mutation; no durable `IN_PROGRESS` row can outlive a rolled-back posting transaction. Concurrent requests with the same command ID serialize on that row:
+
+- same ID and same hash waits for the owner transaction, then returns the stored committed result;
+- same ID and different hash waits if necessary, then fails deterministically without executing;
+- owner crash before commit rolls back both idempotency and money mutations, allowing one waiter to become the new owner;
+- owner crash after commit exposes only the durable `COMPLETED` result, which every retry returns.
+
+The API has a bounded wait and may return “still processing” with the stable command ID, but it may not start a parallel financial mutation. Equivalent state machines apply at the edge and provider-attempt boundaries.
 
 ### 9.2 Commit-time balance enforcement
 
@@ -620,7 +679,7 @@ No external provider or clearing account participates.
 
 1. Verify and deduplicate provider evidence.
 2. Determine whether the provider evidence is final or uncleared.
-3. If final, post provider float debit and customer liability/fee credits.
+3. If final, post the provider-float debit and credit either the normal customer liability or the customer-linked restricted/unapplied liability selected by §8.14; external cash is never omitted because the intended account is blocked or closed.
 4. If not final, credit an uncleared customer sub-balance and release it only after confirmation.
 5. Reconcile provider report and bank statement.
 
@@ -723,7 +782,7 @@ If both components are refundable, the refund is a new linked journal: debit fee
 
 #### Example G: late success and partial execution
 
-Suppose a ₦30,000 payout timed out, the hold was retained and later evidence proves only ₦20,000 executed. The system posts the proven ₦20,000 using the selected settlement template, consumes ₦20,000 of the hold and releases the unexecuted ₦10,000 only when provider policy supplies authoritative completion evidence. Fees follow their configured partial-execution policy. If the hold had already been released under an approved loss-control exception, the late success creates a case and an evidenced receivable/loss-control journal; it does not silently debit an insufficient customer account.
+Suppose the ₦30,000 payout with ₦500 non-refundable-on-execution fee timed out, the ₦30,500 hold was retained and later evidence proves only ₦20,000 executed. The system posts the proven ₦20,000 principal plus ₦500 fee using the selected settlement template, consumes exactly ₦20,500 of the hold and releases the unexecuted ₦10,000 only when provider policy supplies authoritative completion evidence. Thus `₦20,500 consumed + ₦10,000 released + ₦0 remaining = ₦30,500 original`. A refundable or prorated fee uses a different versioned template with an equally exact allocation and rounding rule. If the hold had already been released under an approved loss-control exception, the late success creates a case and an evidenced receivable/loss-control journal; it does not silently debit an insufficient customer account.
 
 #### Example H: external-only item and suspense
 
@@ -746,6 +805,24 @@ After a merchant was already paid, a confirmed ₦10,000 chargeback creates a re
 | Scheme settlement payable — liability | — | ₦10,000 |
 
 Recovery from an eligible merchant balance debits merchant deposit liability and credits the chargeback receivable. Paying the scheme debits the scheme payable and credits nostro asset. If recovery is doubtful, a separate provision journal records expected loss; the original chargeback is not rewritten.
+
+#### Example J: linked USD/NGN FX trade and reversal
+
+Ada sells **USD 10.01** at a quote of **₦1,503.27 for USD 1**, with no fee. The quote direction is `NGN per USD`, uses fixed decimal precision and `HALF_EVEN` rounding. The unrounded result is ₦15,047.7327 and the booked customer amount is ₦15,047.73. The USD and NGN journals commit in one `funds-core` transaction and share one trade ID:
+
+| USD journal | Debit | Credit |
+|---|---:|---:|
+| Ada USD customer liability | USD 10.01 | — |
+| USD FX position | — | USD 10.01 |
+
+| NGN journal | Debit | Credit |
+|---|---:|---:|
+| NGN FX position | ₦15,047.73 | — |
+| Ada NGN customer liability | — | ₦15,047.73 |
+
+The sub-kobo residual ₦0.0027 is retained in the high-precision rounding control; it is not forced into a journal that can represent only kobo. When accumulated residual reaches a whole kobo, an explicit rounding-account journal recognises it under the policy version. A fee or spread would be a separately stated NGN credit with the NGN FX-position debit increased by the same amount.
+
+An accounting reversal uses the original USD 10.01 and booked ₦15,047.73 in opposite directions, so it exactly reverses the books. If the bank economically replaces the trade later at a different market rate, that replacement is a new trade and its difference posts to realised FX gain/loss. Supplying `USD per NGN` to this template, using an expired quote or creating only one currency journal is rejected.
 
 ### 13.9 Journal templates and policy versions
 
@@ -875,7 +952,18 @@ Provider reversal requests remain indeterminate until outcome evidence is final.
 
 An outbox relay reads committed unpublished records, publishes them to Redpanda and marks publication progress. A crash may cause repeat publication, never silent loss. Consumers insert the event ID into their inbox in the same local transaction as their projection update.
 
-Published rows retain their canonical event payload for at least 72 hours and until a later verified recovery checkpoint rather than being immediately deleted. A replay command can republish a bounded sequence range with the original event IDs. This makes PostgreSQL journal/outbox data—not the constrained single broker—the recoverable source for projection rebuilding.
+The PoC recovery window begins at the earliest checkpoint used by the current evidence suite and ends 72 hours after the latest tagged run. Published rows retain their canonical payload until a later verified **per-schema recoverability checkpoint** and never expire inside that window merely because the broker acknowledged them. Before database cleanup, canonical payloads and sequence manifests are archived off-host with hashes. A replay command republishes a bounded sequence range with original event IDs.
+
+Recoverability is declared by event class:
+
+| Event class | Authoritative reconstruction source |
+|---|---|
+| Journal, balance and hold | Immutable journals/postings plus append-only hold allocations and retained outbox/archive |
+| Transaction and provider attempt | Append-only state-transition history, stable attempt/reference data and retained outbox/archive |
+| Reconciliation and settlement cycle | Versioned source manifests, matches, breaks, cases, proof history and retained outbox/archive |
+| Privileged audit and configuration | Append-only audit/configuration versions and retained outbox/archive |
+
+Mutable current-state rows alone are not sufficient reconstruction sources. Cleanup is permitted only when the checkpoint records the maximum source and outbox sequence, archive hash and a successful reconstruction test for every event class. This makes PostgreSQL facts plus the off-host archive—not the constrained single broker—the recoverable source for projection rebuilding.
 
 Initial outbox thresholds are: warn at 128 MiB, 100,000 unpublished rows or two minutes oldest age; page at 256 MiB, 250,000 rows or five minutes; stop affected admission at 512 MiB, 500,000 rows, ten minutes or the database disk-reserve threshold—whichever happens first. These are deliberately conservative PoC values and may change only with a recorded capacity result. At the stop threshold, commands whose safe completion requires downstream processing are rejected before idempotency acceptance; already accepted work completes atomically and remains queryable. Status queries, reconciliation recovery and outbox draining retain reserved capacity. ACC-23 exercises each transition.
 
@@ -953,7 +1041,7 @@ Retention is a policy matrix by record class and governing instrument. The desig
 
 ### 17.7 PoC identity and privileged-control minimum
 
-The PoC may use a local OIDC provider, but it validates issuer, audience, signature algorithm, expiry/not-before, subject and required assurance/role claims. Administrative sessions are short-lived and cannot use customer-channel tokens. Service-to-service calls are authenticated on the private network; network location alone is not identity.
+The PoC may use a local OIDC provider, but it validates issuer, audience, signature algorithm, expiry/not-before, subject and required assurance/role claims. Administrative sessions are short-lived and cannot use customer-channel tokens. Service-to-service HTTP/gRPC uses mTLS identities issued by a local PoC CA; PostgreSQL, Redpanda, Temporal, Valkey and MinIO enable their supported authenticated encrypted transports. Network location alone is not identity. Test data remains synthetic because the PoC has not established a production key-custody or privacy-compliance boundary.
 
 Maker and checker must be different subjects. Approval binds to the canonical hash of the exact command, including amount, currency, accounts, evidence references and policy version; any change invalidates approval. Direct database roles used by applications cannot alter journal facts, disable invariant triggers, update approvals or impersonate an auditor. Break-glass access is time-bound, separately authorised and automatically reviewed.
 
@@ -1101,7 +1189,23 @@ An evidence-producing run is valid only when swap is disabled or unused, the ker
 | OS, Docker, filesystem cache and safety reserve | 2,048 MiB | 2,048 MiB | 2,048 MiB |
 | **Planned ceiling** | **7,360 MiB** | **7,488 MiB** | **6,144 MiB** |
 
-The concurrency profile disables Grafana, Tempo and nonessential import/export jobs before it starts the second `funds-core` replica and additional Go workers. The restore profile stops customer traffic and Temporal, then gives PostgreSQL and replay workers more headroom. If measured steady-state or peak RSS does not fit, the design fails ACC-25; the remedy is to reduce scope or increase RAM, not enable swap or conceal a component.
+CPU quotas are also profile inputs because scheduler starvation can create false provider timeouts. The initial 4-vCPU allocation leaves unallocated host capacity for the kernel and Docker:
+
+| Component group | Normal demo CPU | Concurrency/fault CPU | Restore/replay CPU |
+|---|---:|---:|---:|
+| PostgreSQL and pooler | 0.75 | 0.80 | 1.50 |
+| Redpanda (`smp=1`) | 0.75 | 0.60 | 0.40 |
+| Temporal server | 0.35 | 0.25 | stopped |
+| Java `funds-core` | 0.60 × 1 | 0.50 × 2 | 0.25 × 1 |
+| Go application services/workers | 0.75 | 0.70 | 0.90 |
+| Valkey and MinIO | 0.10 | 0.10 | 0.20 |
+| Observability | 0.20 | 0.10 | 0.10 |
+| Reverse proxy, Toxiproxy and simulator | 0.10 | 0.20 | 0.05 |
+| **Container quota total** | **3.60** | **3.75** | **3.40** |
+
+Versioned Compose overlays—`normal`, `concurrency` and `restore`—must list every active container and its image digest, CPU quota, memory limit/reservation, PIDs limit, open-file limit, database connections, queue concurrency and volume quota. Java containers start with a 256-PID limit and Go application containers with 128 unless a measured profile justifies less or more; infrastructure limits are explicit per image. ACC-25 fails if a report cannot identify the exact overlay/configuration hash.
+
+The concurrency profile disables Grafana, Tempo and nonessential import/export jobs before it starts the second `funds-core` replica and additional Go workers. The restore profile stops customer traffic and Temporal, then gives PostgreSQL and replay workers more headroom. CPU throttled time, runnable-queue delay and CPU pressure-stall data are recorded alongside memory so a resource-induced timeout cannot be mistaken for provider behaviour. If measured steady-state/peak RSS or CPU pressure does not fit, the design fails ACC-25; the remedy is to reduce scope or increase RAM/CPU, not enable swap or conceal a component.
 
 ### 21.2 Compose topology
 
@@ -1153,6 +1257,8 @@ Workflow input and signal payloads are capped at 128 KiB by application policy. 
 The PoC uses one broker and therefore makes no broker-availability or replicated-durability claim. Redpanda's production guidance is materially above the 768 MiB PoC limit; this is an intentionally constrained and unsupported sizing used only to exercise APIs, ordering, consumer groups and replay logic. It cannot support a production durability, latency or throughput claim.
 
 The broker runs one shard with explicit memory, reserve-memory, partition-count, segment, batch/fetch and retention limits. Unsafe fsync bypass is not permitted in evidence-producing runs. Topics have explicit retention, partition keys, retry policy and dead-letter quotas. The durable journal and retained outbox can reconstruct events after broker loss; total host/disk loss is handled only by restore procedures, not clustering.
+
+The constrained broker profile passes only if it starts and becomes ready within the declared limit, holds the fixed topic/partition inventory, completes bounded produce/consume/replay scenarios, exposes no memory-low-water or allocation failure, preserves fsync, and recovers from a process restart. Failure means the 8 GiB evidence suite must substitute a smaller explicitly tested transport or increase the VM; it may not silently enable unsafe developer flags.
 
 ### 21.8 Cross-language contract boundary
 
@@ -1281,13 +1387,19 @@ Toxiproxy or an equivalent network fault proxy adds latency, disconnection and h
 | ACC-22 | Import partial, duplicate, corrected and late provider/bank sources | Incomplete cycle cannot prove; source versions and approvals are retained; reopening creates a new proof version |
 | ACC-23 | Keep Redpanda unavailable until outbox warning, page and stop thresholds | Admission closes at the declared threshold, PostgreSQL/WAL reserve remains, accepted work replays once after recovery |
 | ACC-24 | Attempt self-approval, changed-payload approval, direct journal mutation and trigger disabling | Every action is denied; successful maker-checker action binds exact hash and commits audit/outbox atomically |
-| ACC-25 | Run each declared 8 GiB profile under its mixed-workload soak | Peak RSS stays within limits and reserve; no swap, unexpected OOM, monotonic leak or invariant failure occurs |
+| ACC-25 | Run each declared 8 GiB/4-vCPU profile under its exact versioned overlay and mixed-workload soak | Peak RSS/CPU pressure stays within declared limits and reserve; throttling does not create false provider outcomes; no swap, unexpected OOM, monotonic leak or invariant failure occurs |
 | ACC-26 | Force cgroup OOM/restart of each non-authoritative component and Java `funds-core` at controlled points | Documented retry/backpressure occurs and no duplicate or partial financial effect exists |
 | ACC-27 | Exhaust Java executors/direct buffers, Go queues/goroutines and database pools | Admission/backpressure remains bounded, recovery capacity remains and no external submission occurs after an unrecorded failure |
 | ACC-28 | Process a reconciliation file larger than every application container limit | Streaming import completes within its memory ceiling; oversize row/decompression bomb is rejected safely |
 | ACC-29 | Encode/decode golden commands and events in Java and Go across supported schema versions | Integer amounts, presence, unknown enum handling and canonical hashes agree byte-for-byte where specified |
 | ACC-30 | Reach disk warning, stop-import and stop-money watermarks | Load sheds in order, reserved WAL/recovery space remains and accepted commands stay recoverable |
 | ACC-31 | Tamper before/after anchor, remove a manifest, restore an older database and rotate signing key | Unanchored window is visible; anchored mutation, rollback, missing manifest and invalid rotation are detected |
+| ACC-32 | Race same idempotency key with same and different hashes, then crash owner before and after commit | Same hash yields one stored result, different hash always fails, rollback elects one new owner and post-commit retry never reposts |
+| ACC-33 | Receive final inbound cash for open, debit-blocked, credit-blocked, frozen, dormant, closed and unknown destinations | External asset is recognised once; normal or restricted/unapplied/suspense liability follows §8.14; no prohibited availability results |
+| ACC-34 | Execute and reverse the USD/NGN example at expiry, rounding and numeric boundaries | Quote direction/expiry guards work, both journals commit atomically, sub-minor control reconciles and reversal uses original booked amounts |
+| ACC-35 | Start constrained Redpanda with fixed inventory and run produce/consume/replay plus restart | Broker stays within CPU/memory/partition/retention limits, preserves fsync and exposes no allocation failure; otherwise profile fails |
+| ACC-36 | Delete the broker after published rows become cleanup-eligible and rebuild every event class | Per-schema checkpoint/archive reconstructs journal, hold, transaction, attempt, reconciliation, audit and configuration events with original IDs |
+| ACC-37 | Race partial consume, release and expiry under refundable, non-refundable and prorated fee templates | Consumed + released + remaining always equals original hold; exactly one terminal state and one policy-correct journal result |
 
 ### 23.2 Property-based tests
 
@@ -1301,12 +1413,16 @@ Generated command sequences verify:
 - multi-currency rounding residual treatment;
 - account sequence monotonicity;
 - journal immutability;
-- projection replay equivalence.
+- projection replay equivalence;
 - checked integer overflow rejection and boundary amounts;
 - journal-template debit/credit equations and permitted account roles;
 - closed-period and account-restriction guards;
 - partial-execution allocation and fee-policy consistency;
-- source-manifest completeness and proof-version monotonicity.
+- source-manifest completeness and proof-version monotonicity;
+- available-balance equations for debit/credit normal direction, overdraft floors and restriction gates;
+- partial-consumption conservation under every configured fee policy;
+- FX direction, quote expiry, sub-minor accumulation and exact reversal;
+- idempotency state-machine concurrency and request-hash mismatch.
 
 ### 23.3 Contract and integration tests
 
@@ -1327,9 +1443,9 @@ The main branch requires:
 - secret scanning;
 - telemetry PII/redaction tests;
 - deterministic build and signed image metadata;
-- the named critical scenarios ACC-01 through ACC-13, ACC-19 through ACC-24 and ACC-29.
+- the named critical scenarios ACC-01 through ACC-13, ACC-19 through ACC-24, ACC-29 and ACC-32 through ACC-37.
 
-Longer restore, tamper, soak, OOM, disk-watermark and full-fault scenarios—including ACC-14 through ACC-18 and ACC-25 through ACC-31—run on a scheduled pipeline and before a tagged demonstration release.
+Longer restore, tamper, soak, OOM, disk-watermark and full-fault scenarios—including ACC-14 through ACC-18 and ACC-25 through ACC-37—run on a scheduled pipeline and before a tagged demonstration release. Scenarios already run as main-branch gates may be repeated under the exact tagged profile.
 
 ### 23.5 Exit criteria
 
