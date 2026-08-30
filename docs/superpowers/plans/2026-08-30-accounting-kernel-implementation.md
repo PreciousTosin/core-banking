@@ -6,7 +6,7 @@
 
 **Architecture:** Implement one Quarkus JVM service around an explicit PostgreSQL transaction boundary. Domain types validate money and journal equations before persistence; PostgreSQL independently enforces per-currency balance, immutability, account/currency compatibility and period state. The posting service locks accounts canonically, resolves idempotency inside the money transaction, writes journal/postings/balances/outbox atomically and exposes proof queries without introducing provider, hold or workflow concerns.
 
-**Tech Stack:** Java 21; Quarkus 3.33.3.1 LTS; Maven 3.9.16 wrapper; PostgreSQL 17.11; JDBC/Agroal; Flyway; JUnit 6 on the Quarkus-managed platform; a deterministic in-repository property-case generator; Testcontainers through Quarkus Dev Services.
+**Tech Stack:** Java 25 LTS; Quarkus 3.33.3.1 LTS; Maven 3.9.16 wrapper; PostgreSQL 18.6; JDBC/Agroal; Flyway; JUnit 6 on the Quarkus-managed platform; a deterministic in-repository property-case generator; Testcontainers through Quarkus Dev Services.
 
 **Spec:** `architecture/modern-core-banking-comprehensive-design-revised.md`
 
@@ -24,6 +24,8 @@
 - Journal, postings, materialised balances, idempotency result and outbox event commit atomically.
 - Database aggregates use `numeric`, not `bigint`, when checking totals so overflow cannot reproduce an application error.
 - The implementation target is JVM mode. Native-image work is excluded from this slice.
+- Compile and run `funds-core` on Java 25 LTS; do not silently fall back to Java 21 or a non-LTS feature release.
+- Build new POC databases directly on PostgreSQL 18.6. An upgrade from an earlier PostgreSQL 18 minor must follow the 18.6 release-note checks for pre-existing `btree_gist` indexes; this fresh POC has no such indexes to migrate.
 - The service uses synthetic test data only.
 - The normal container target is 640 MiB with `-Xms128m -Xmx384m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m -Xss512k`.
 
@@ -129,12 +131,12 @@ services/funds-core/
 - Test: `services/funds-core/src/test/java/com/corebanking/funds/domain/MoneyTest.java`
 
 **Interfaces:**
-- Consumes: Java 21 records and exact integer arithmetic.
+- Consumes: Java 25 records and exact integer arithmetic.
 - Produces: `CurrencyCode.of(String)`, `Money.of(CurrencyCode,long)`, `Money.add(Money)`, `Money.subtract(Money)` and `Money.negate()`.
 
 - [ ] **Step 1: Generate the Maven wrapper and minimal Quarkus project metadata**
 
-Create a Maven project pinned to the Quarkus 3.33.3.1 LTS BOM. Include `quarkus-arc`, `quarkus-jdbc-postgresql`, `quarkus-flyway`, `flyway-database-postgresql`, `quarkus-smallrye-health`, `quarkus-micrometer-registry-prometheus`, `quarkus-junit` and `rest-assured`. Configure compiler release 21 and Enforcer rules requiring Java 21 and Maven 3.9.16 or newer. Do not add a second test-engine BOM: Quarkus 3.33 manages JUnit 6, and the generated property suite below deliberately runs as ordinary JUnit tests.
+Create a Maven project pinned to the Quarkus 3.33.3.1 LTS BOM. Include `quarkus-arc`, `quarkus-jdbc-postgresql`, `quarkus-flyway`, `flyway-database-postgresql`, `quarkus-smallrye-health`, `quarkus-micrometer-registry-prometheus`, `quarkus-junit` and `rest-assured`. Configure compiler release 25 and Enforcer rules requiring Java 25 and Maven 3.9.16 or newer. Do not add a second test-engine BOM: Quarkus 3.33 manages JUnit 6, and the generated property suite below deliberately runs as ordinary JUnit tests.
 
 Run:
 
@@ -144,7 +146,7 @@ mvn -N wrapper:wrapper -Dmaven=3.9.16
 ./mvnw --version
 ```
 
-Expected: Maven reports 3.9.16 and Java 21.
+Expected: Maven reports 3.9.16 and Java 25; the Enforcer rule rejects execution on Java 21 or a non-25 feature release.
 
 - [ ] **Step 2: Write failing exact-money tests**
 
@@ -422,14 +424,14 @@ git commit -m "feat(funds-core): validate balanced journal drafts"
 - Modify: `services/funds-core/src/test/resources/application.properties`
 
 **Interfaces:**
-- Consumes: PostgreSQL 17.11.
+- Consumes: PostgreSQL 18.6.
 - Produces: `funds.book`, `funds.chart_version`, `funds.accounting_period`, `funds.ledger_account` and controlled enum checks.
 
 - [ ] **Step 1: Configure real PostgreSQL tests**
 
 ```properties
 quarkus.datasource.db-kind=postgresql
-quarkus.datasource.devservices.image-name=postgres:17.11-bookworm
+quarkus.datasource.devservices.image-name=postgres:18.6-bookworm
 quarkus.datasource.jdbc.min-size=1
 quarkus.datasource.jdbc.max-size=8
 quarkus.flyway.migrate-at-start=true
@@ -996,7 +998,7 @@ The migration job runs separately with `funds_migrator`; replicas use `funds_app
 - [ ] **Step 2: Create the JVM container**
 
 ```dockerfile
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:25-jre
 WORKDIR /work
 COPY target/quarkus-app/lib/ /work/lib/
 COPY target/quarkus-app/*.jar /work/
@@ -1031,7 +1033,7 @@ docker build -f Dockerfile.jvm -t core-banking/funds-core:accounting-kernel .
 docker run --rm --entrypoint java --memory=640m --cpus=0.60 --pids-limit=256 core-banking/funds-core:accounting-kernel -version
 ```
 
-Expected: build succeeds; container reports Java 21 and stays within the declared runtime constraints. The full service startup test requires the profile PostgreSQL and is performed in the deployment-profile plan.
+Expected: build succeeds; container reports Java 25 and stays within the declared runtime constraints. The full service startup test requires the profile PostgreSQL and is performed in the deployment-profile plan.
 
 - [ ] **Step 5: Document the slice and map acceptance coverage**
 
