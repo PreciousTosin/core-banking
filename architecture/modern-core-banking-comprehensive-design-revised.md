@@ -32,6 +32,9 @@ The supported single-VPS profile targets **4 vCPU, 8 GiB RAM, NVMe-backed storag
 
 - Append-only double-entry ledger
 - Customer balances, holds and limits
+- Versioned conventional deposit products: savings, current and fixed/term deposits
+- Nigerian account addressing through NUBAN and provider-issued virtual-account aliases
+- Non-interest banking contracts, investment pools and profit-allocation boundaries
 - NGN and multi-currency accounts
 - Inflows, intra-book and outbound transfers
 - Card acquiring ledger shapes, including chargebacks
@@ -61,11 +64,17 @@ The supported single-VPS profile targets **4 vCPU, 8 GiB RAM, NVMe-backed storag
 - Bounded-memory operation for Java, Go, database, broker, workflow and observability components
 - Cross-language command and event contract compatibility
 - Explicit accounting examples, control-account proofs and closed-period correction behaviour
+- Synthetic, simulator-only NUBAN and provider-virtual-account issuance, lookup and inbound-credit resolution
+- Versioned savings, current and fixed-deposit examples with deterministic accrual, capitalisation and maturity rules
+- A non-interest investment-pool example that proves profit-allocation conservation without relabelling interest
 
 ### 2.3 Explicitly outside the PoC
 
 - Card issuing, PAN/PIN custody, HSM operation and PCI-DSS certification
 - Real NIBSS, scheme, bank or aggregator connectivity
+- Issuing or advertising an ISO IBAN for a Nigerian domestic account
+- Production NUBAN ranges, institution codes or externally routable account numbers
+- Regulatory approval, Sharia governance certification or a claim that illustrative product accounting is legally sufficient
 - Licensed sanctions and PEP datasets
 - Asynchronous machine-learning fraud models and graph analysis
 - Regulatory return formats
@@ -99,6 +108,9 @@ This revision records the material gaps found during high-level review. “Resol
 | Required documentation | FX scope lacked a complete two-currency, rounding and reversal example | Resolved through Example J in §13.8 and ACC-34 |
 | Required documentation | Business date, timezone, settlement calendar, end-of-day and period-close rules were incomplete | Resolved in §8.10 and §15.7 |
 | Required documentation | Account restriction, dormancy, closure and residual-balance behaviour were incomplete | Resolved in §8.14 |
+| PoC-critical | Customer accounts had no durable NUBAN/provider-virtual-account addressing model, and an account address could be confused with transaction idempotency | Resolved through INV-26–INV-28, §8.1.1, §12.1.1 and ACC-38–ACC-39 |
+| PoC-critical | Savings, current and fixed-deposit liabilities had no versioned product/contract model or executable accrual and maturity rules | Resolved through INV-29–INV-30, §8.15 and ACC-40–ACC-41 |
+| PoC-critical | Non-interest banking could be incorrectly modelled as a conventional product with a zero interest rate | Resolved through INV-31–INV-32, §8.16 and ACC-42–ACC-43 |
 | Required documentation | Memory pressure, connection exhaustion, disk watermarks and load shedding were not safety policies | Resolved in §19 and §21.10–§21.17 |
 | Required documentation | Tamper-detection claims did not repeat the PoC signer's trust-boundary limitation | Resolved in §3 and §9.6 |
 | Production extension | Full KYC/CDD, sanctions, PEP, AML transaction monitoring and regulatory reporting are outside the PoC | Integration and fail-safe boundaries are made explicit in §14.3 and §17.7; no compliance claim is made |
@@ -197,8 +209,15 @@ Memory, database connections, goroutines, threads, queues, disk and broker reten
 | INV-23 | Published-event loss can be recovered from retained authoritative journal/outbox data within the PoC recovery window | Schema owner and relay | Retained outbox payloads, replay command and projection proof |
 | INV-24 | Externally final cash is recognised exactly once even when the intended customer account is restricted, closed or unknown | `funds-core` and `recon-engine` | External-evidence identity plus restricted/unapplied/suspense liability templates |
 | INV-25 | Every required event class is reconstructable for the defined recovery window after total broker loss | Schema owner | Append-only transition facts, per-schema recoverability checkpoint and hashed off-host archive |
+| INV-26 | An active external account identifier resolves to exactly one ledger account at a time and cannot be silently reassigned | `funds-core` | Normalised unique key, immutable lifecycle history and guarded retirement/replacement |
+| INV-27 | A customer ledger account may have several aliases, but at most one active primary NUBAN exists for that account and institution scope | `funds-core` | Partial unique index and account-address policy |
+| INV-28 | A destination account identifier is never used as the identity of an inbound transaction | `provider-gateway` and `funds-core` | Distinct provider/NIP session identity, evidence hash and posting-command idempotency key |
+| INV-29 | Every customer liability account is bound to the immutable version of the product terms under which it was opened | `funds-core` | Product-version foreign key and posting/accrual-time policy validation |
+| INV-30 | Each conventional accrual, capitalisation, maturity and liquidation period is recognised at most once and conserves principal, expense/income, payable and tax components | `funds-core` | Deterministic accrual key, exact day-count/rounding policy and balanced templates |
+| INV-31 | A non-interest product cannot invoke an interest-bearing template, rate or accrued-interest account | `funds-core` | Finance-principle type guard and separated template catalogue |
+| INV-32 | Investment-pool profit or loss allocation equals the approved realised distributable result, with no cross-pool leakage | `funds-core` and proof job | Versioned pool participation units, rational allocation, residual policy and independent conservation proof |
 
-Violation of INV-01 through INV-12 and INV-17 through INV-22 must fail the originating command. INV-24 routes externally final value to the required restricted/unapplied/suspense template rather than discarding the evidence. INV-13 through INV-16, INV-23 and INV-25 are continuously verified and page an operator when violated.
+Violation of INV-01 through INV-12, INV-17 through INV-22 and INV-26 through INV-32 must fail the originating command or product job. INV-24 routes externally final value to the required restricted/unapplied/suspense template rather than discarding the evidence. INV-13 through INV-16, INV-23, INV-25 and the independent part of INV-32 are continuously verified and page an operator when violated.
 
 ---
 
@@ -230,12 +249,12 @@ The system has seven logical application services plus a provider simulator. The
 | Service | Runtime | Owns | Must not own |
 |---|---|---|---|
 | `api-edge` | Go | Channel authentication, authorisation context, validation, edge idempotency, request-body hash, rate limits | Balances, holds, journals or provider state |
-| `funds-core` | Java | Accounts, books, periods, journals, postings, materialised ledger balances, holds, available balances, provider-float reservations, account limits and outbox records for money events | Workflow sequencing or provider HTTP logic |
+| `funds-core` | Java | Accounts, external-account-identifier mappings, product definitions and versions, deposit contracts, books, periods, journals, postings, materialised ledger balances, holds, available balances, provider-float reservations, accrual/allocation facts, account limits and outbox records for money events | Workflow sequencing, provider HTTP logic or provider credentials |
 | `txn-orchestrator` | Go with Temporal Go SDK | Transactions, product-specific workflow state, Temporal workflows, compensating business actions, retry schedules and manual-review tasks | Direct balance or hold mutation |
-| `provider-gateway` | Go | Capability registry, routing observations, provider attempts, adapters, normalisation, webhook inbox, shared breaker and provider rate limits | Authoritative balances or journals |
+| `provider-gateway` | Go | Capability registry, routing observations, provider attempts, NIP/provider session identities, provider-side virtual-account issuance requests, adapters, normalisation, webhook inbox, shared breaker and provider rate limits | Authoritative identifier-to-ledger mapping, balances or journals |
 | `risk-engine` | Go | Versioned rules, feature snapshots, decisions and explanations | Holds or ledger entries; it requests a typed hold through orchestration |
 | `recon-engine` | Go | Imported statements, provider reports, match decisions, breaks, cases, settlement cycles and proof results | Direct ledger-table access or direct posting inserts |
-| `projections` | Go | Operational read models, statements, reporting views and replay checkpoints | Authoritative financial state |
+| `projections` | Go | Operational read models, masked account-details views, statements, reporting views and replay checkpoints | Authoritative financial or account-address state |
 | `provider-simulator` | Go | Deterministic external-rail behaviour and fault scripts | Any access to internal schemas or expected-result calculation |
 
 All inter-service money mutations are commands to `funds-core`. Reconciliation, risk and orchestration never write the ledger schema directly.
@@ -258,6 +277,25 @@ Each account has:
 - created and closed timestamps.
 
 Required account classes include customer liabilities, provider nostro/float assets, clearing, suspense, fee and commission income, provider expense, statutory liabilities, chargeback receivables, provisions, FX position, FX gain/loss and rounding residuals.
+
+### 8.1.1 External account identifiers and account details
+
+The ledger-account UUID is the permanent internal identity. A NUBAN or provider virtual account is an **address** that resolves to that identity; it has no balance and is never used as a journal account, transaction ID or idempotency key. Nigeria is not assigned an ISO IBAN format in the SWIFT IBAN Registry, so this design does not generate a Nigerian “IBAN”. A future foreign-country IBAN can be represented only after its country-specific registry rules are implemented.
+
+An `account_identifier` record contains: immutable ID, ledger-account ID, scheme, normalised value, institution code where applicable, provider ID where applicable, purpose, routing scope, lifecycle status, primary flag, validity interval, issuance evidence and audit timestamps. Initial schemes are `NUBAN` and `PROVIDER_VIRTUAL_ACCOUNT`; the model may later add a country-qualified `IBAN` without changing ledger identity.
+
+Cardinality and lifecycle rules are:
+
+- one ledger account may have several identifiers, including virtual accounts from different providers;
+- an active normalised identifier within its scheme, institution and provider scope resolves to one ledger account only;
+- a customer account normally has one active primary NUBAN, while provider virtual accounts may be one-per-provider or one-per-purpose according to the provider contract;
+- replacement retires the old mapping and creates a new mapping; history is never overwritten and a retired identifier is not silently recycled;
+- internal general-ledger, control, suspense and income/expense accounts are not externally addressable;
+- late evidence for a retired alias still resolves through immutable history and is handled by the account-state policy in §8.14.
+
+The NUBAN customer-facing value is ten digits and is validated using the CBN institution-code/serial/check-digit algorithm. For repeatable PoC tests, the only default is institution code `000000` and NUBAN `0000000017`, marked `SIMULATOR_ONLY`; it must be rejected by every real-provider adapter and production configuration check. Production institution codes and number ranges are externally governed configuration, never guessed by the application.
+
+`GET /accounts/{account_id}/details` returns the authoritative account plus its primary address and masked aliases. `POST /account-addresses:resolve` performs an authenticated internal lookup. NIP-style Name Enquiry is a distinct, rate-limited provider operation that returns only the minimum permitted name/account response. None of these endpoints accepts an account number as proof of ownership.
 
 ### 8.2 Journal and posting
 
@@ -389,7 +427,7 @@ Binary floating point is forbidden for money and FX. FX rates use a fixed precis
 
 Product configuration separates principal, customer fee, provider cost, commission, tax and rounding. It declares who bears each component, when it is earned or incurred, whether it is refundable, and which account receives it. No workflow derives net revenue from a difference between two unexplained totals.
 
-Interest has at least two facts: **accrual**, when income or expense is recognised over time, and **capitalisation/payment**, when the accrued amount becomes part of a customer balance or is paid. A simple savings example for one day is: debit interest expense ₦50; credit interest payable ₦50. At capitalisation: debit interest payable ₦50; credit customer liability ₦50. The PoC documents this shape but implements interest only if selected as an explicit delivery slice.
+Interest has at least two facts: **accrual**, when income or expense is recognised over time, and **capitalisation/payment**, when the accrued amount becomes part of a customer balance or is paid. A simple savings example for one day is: debit interest expense ₦50; credit interest payable ₦50. At capitalisation: debit interest payable ₦50; credit customer liability ₦50. The implementation is isolated in the conventional-deposit delivery slice; it is not implicit in the base journal kernel.
 
 Tax rates and applicability are versioned external policy inputs, not constants in workflow code. An illustrative ₦100 service fee plus a hypothetical ₦7.50 tax produces: debit customer liability ₦107.50; credit fee income ₦100; credit tax payable ₦7.50. This example teaches the split and is not a statement of the tax rate applicable to any real product.
 
@@ -412,6 +450,29 @@ Externally final inbound cash cannot be rejected out of the books merely because
 | Unknown or unresolvable destination | Credit incoming suspense and open a reconciliation case |
 
 A later allocation debits the restricted/unapplied/suspense liability and credits the permitted customer liability. A return debits that liability and credits the external asset or settlement payable. The original inbound evidence remains immutable.
+
+### 8.15 Conventional deposit products and contracts
+
+A product definition names the commercial family; an immutable product version carries the terms that affect accounting. A customer deposit contract binds an account to one version and records opening/value dates, maturity instruction where relevant and permitted overrides. Editing a product creates a version; it never changes historical contracts retroactively.
+
+| Product | Liability behaviour | Required policy fields |
+|---|---|---|
+| Savings | On-demand principal; usually earns configured interest | tier/rate version, day-count basis, minimum/eligible balance, accrual frequency, capitalisation schedule, tax policy |
+| Current | On-demand principal; may have fees, overdraft or no interest | fee schedule, overdraft floor/approval, debit-interest policy if offered, statement cycle |
+| Fixed/term deposit | Principal is contractually placed until maturity; early liquidation follows explicit terms | principal, start/maturity dates, fixed rate, day-count basis, payout instruction, compounding, early-liquidation and withholding-tax policy |
+| Domiciliary deposit | Same liability concepts in exactly one foreign currency | currency-specific scale, permitted transaction types and applicable savings/current/term policy |
+
+Accrual uses daily eligible-balance snapshots and a named convention such as `ACTUAL_365_FIXED`; it does not infer time from wall-clock job execution. Exact rational arithmetic is retained until the declared minor-unit rounding boundary. A deterministic key such as `(contract_id, accrual_date, rule_version)` prevents a restarted job from accruing the same period twice.
+
+Illustrative fixed-deposit example, not a product quote: ₦1,000,000 principal at 12% per annum for 30 days on Actual/365 yields `1,000,000 × 12/100 × 30/365 = ₦9,863.013698…`, booked as ₦9,863.01 under half-even minor-unit rounding. Daily/month-end accrual debits deposit-interest expense and credits accrued-interest payable. At maturity, capitalisation debits accrued-interest payable and credits the customer liability; principal already remains in the customer liability and is not posted a second time. Any withholding tax is a separately calculated debit to the amount payable and credit to a statutory liability. Renewal, payout or early liquidation is a new, idempotent contract operation with explicit penalty/reversal templates.
+
+### 8.16 Non-interest financial services
+
+Non-interest banking is a different financial-principle model, not `interest_rate = 0`. Each product version declares `CONVENTIONAL` or `NON_INTEREST` and, for non-interest products, an approved contract type such as non-remunerated current account, safekeeping/savings arrangement, Mudarabah investment account, Murabahah financing or Ijarah. The PoC implements only the explicitly selected deposit/investment example; financing products remain target extensions.
+
+Non-interest versions require a governance approval reference, permitted asset/pool class, fee/profit rules, loss treatment, purification/charity policy where applicable, and accounting templates that contain no interest-bearing account roles. Investment accounts also bind to one segregated investment pool and participation-unit history. Pool assets, income, expenses, reserves and investor liabilities cannot leak across pools or into conventional interest templates.
+
+Illustrative Mudarabah allocation: an approved pool realises ₦100,000 distributable profit. If the disclosed mudarib share is 30%, the bank receives ₦30,000 and participating investment-account holders collectively receive ₦70,000. Each holder's share is allocated from exact weighted participation units; a declared residual account receives only the final minor-unit rounding difference. The allocation proof must show `bank share + all investor shares + rounding residual = ₦100,000`. Journal account classification and presentation are approved accounting policy, not hard-coded from this example. Loss allocation, reserves and displaced-commercial-risk treatment require their own approved policy and tests; the system must not promise principal or a fixed return by accident.
 
 ---
 
@@ -591,6 +652,14 @@ Sagas use forward recovery. A financial action is never described as rolled back
 
 Card issuing remains outside the PoC. In the target architecture, PAN and PIN are confined to a PCI-DSS-segmented tokenisation and HSM boundary; the core receives tokens and permitted metadata only.
 
+### 12.1.1 Nigerian account addressing and simulated NIP
+
+The provider gateway translates rail/provider messages; it does not become the source of truth for account ownership. For a virtual-account request it asks the selected provider/simulator to issue an alias, then commands `funds-core` to register the returned scheme, provider, normalised value and issuance evidence. A second provider can issue a different alias for the same ledger account. Provider credentials and raw payloads remain in the gateway; the authoritative resolved mapping remains in `funds-core`.
+
+The NIP simulator implements the smallest useful contract: Name Enquiry, Direct Credit notification and Transaction Status Query. Each Direct Credit carries a stable simulated NIP session ID, originator/institution metadata, destination NUBAN, amount, currency, event time and authenticity evidence. The session ID plus source scope identifies the external event; the destination NUBAN only locates the intended account. Duplicate delivery with the same evidence returns the stored result; reuse with conflicting content becomes a case and no second posting.
+
+Real NIBSS connectivity, certificates, institution onboarding and message-field certification remain outside the PoC. Provider-specific virtual-account references follow the same logical contract but keep their provider-specific identity and finality rules.
+
 ### 12.2 Provider contract metadata
 
 The capability registry is versioned data and declares:
@@ -678,10 +747,11 @@ No external provider or clearing account participates.
 ### 13.3 Inbound collection
 
 1. Verify and deduplicate provider evidence.
-2. Determine whether the provider evidence is final or uncleared.
-3. If final, post the provider-float debit and credit either the normal customer liability or the customer-linked restricted/unapplied liability selected by §8.14; external cash is never omitted because the intended account is blocked or closed.
-4. If not final, credit an uncleared customer sub-balance and release it only after confirmation.
-5. Reconcile provider report and bank statement.
+2. Resolve the normalised NUBAN or provider virtual account through `funds-core`, retaining both the identifier-mapping ID and external session/event identity.
+3. Determine whether the provider evidence is final or uncleared.
+4. If final, post the provider-float debit and credit either the normal customer liability or the customer-linked restricted/unapplied liability selected by §8.14; external cash is never omitted because the intended account is blocked, closed, unknown or addressed through a retired alias.
+5. If not final, credit an uncleared customer sub-balance and release it only after confirmation.
+6. Reconcile provider report and bank statement by external session/event identity, never by destination account number alone.
 
 ### 13.4 Card acquiring
 
@@ -698,6 +768,22 @@ Quotes expire deterministically. Execution refers to the exact quote and rate re
 ### 13.7 Card issuing target boundary
 
 The target architecture consumes a real-time tokenised authorisation stream and returns approve or decline within the scheme deadline. Authorisation creates or adjusts a card hold; clearing consumes the hold and posts the journal asynchronously. PAN, PIN blocks and cryptographic keys never enter core-service payloads, logs, events or databases. This boundary is specified for production evolution but is not simulated by the PoC.
+
+### 13.7.1 Account opening and details
+
+1. Select an approved active product version and create the customer ledger account/deposit contract atomically.
+2. Allocate a synthetic NUBAN only for an externally addressable PoC customer account; validate its check digit and unique scope before commit.
+3. Optionally request aliases from one or more provider simulators and register each independently.
+4. Publish an address-changed event without customer name or full number in event headers.
+5. Build the masked account-details projection; authoritative internal resolution continues to call `funds-core`.
+
+### 13.7.2 Conventional accrual and maturity
+
+The scheduler supplies a business date; `funds-core` pages eligible contracts by stable key, computes exact accruals under their immutable product versions and commits each bounded batch with deterministic accrual keys. Capitalisation, maturity, renewal, payout and early liquidation are explicit commands. A crash can repeat discovery but not the financial effect.
+
+### 13.7.3 Non-interest pool distribution
+
+An approved pool-close command freezes its source facts and distributable result. `funds-core` derives weighted participation, the bank share, investor shares and rounding residual under the approved version, records an immutable allocation proof, and posts bounded idempotent distribution batches. The pool cannot close until allocations plus residual reconcile exactly to the approved result.
 
 ### 13.8 Worked accounting examples
 
@@ -1027,6 +1113,9 @@ The governing privacy baseline is the Nigeria Data Protection Act 2023 and appli
 - Collect and retain only required PII.
 - Encrypt sensitive fields at rest with separable keys.
 - Mask account identifiers in logs and interfaces.
+- Normalise identifiers before lookup, encrypt or tokenise full values where operationally practical, and restrict unmasked resolution to named service identities.
+- Return only the minimum permitted name/account response from Name Enquiry; rate-limit enumeration and audit both successful and failed lookups.
+- Preserve retired-alias resolution history for financial evidence while applying retention, access and display minimisation to its customer linkage.
 - Do not place BVN, NIN, PAN, customer names or full account numbers in metric labels, traces, event headers or Temporal search attributes.
 - Define data-subject, legal-hold and deletion handling without deleting immutable financial records that must legally be retained.
 - Document data location, processors and cross-border transfers before production deployment.
@@ -1272,6 +1361,8 @@ The Java container limit covers more than heap: metaspace, JIT code cache, threa
 
 The framework must be measured. A lightweight build is preferred; a heavier framework is acceptable only if ACC-25 passes. JDBC pools are bounded per replica, request and executor queues are bounded, and concurrency is rejected before it creates unbounded platform or virtual threads. Statements, reconciliation results and journal exports stream in pages; idempotency responses and narrations have byte limits. Local caches use maximum weight and expiry and never hold authoritative balances.
 
+Account-address resolution relies first on the indexed PostgreSQL mapping. Any read-through cache is bounded by weight and TTL, stores only normalised lookup keys plus opaque account IDs, is invalidated by lifecycle-version events and may never make a retired identifier active. Accrual and profit-allocation jobs do not create one timer, future or in-memory accumulator per account: they page contracts by stable key (initial batch size 500), use bounded workers, commit resumable checkpoints and release each page before loading the next.
+
 GC choice and percentages are load-test results, not architectural dogma. Evidence includes live heap after full GC, allocation rate, pause percentiles, metaspace, direct buffers, thread count and RSS. Heap dumps are disabled by default because they can contain financial/identity data; an approved encrypted diagnostic workflow is required to enable one.
 
 ### 21.10 Go service memory controls
@@ -1400,6 +1491,12 @@ Toxiproxy or an equivalent network fault proxy adds latency, disconnection and h
 | ACC-35 | Start constrained Redpanda with fixed inventory and run produce/consume/replay plus restart | Broker stays within CPU/memory/partition/retention limits, preserves fsync and exposes no allocation failure; otherwise profile fails |
 | ACC-36 | Delete the broker after published rows become cleanup-eligible and rebuild every event class | Per-schema checkpoint/archive reconstructs journal, hold, transaction, attempt, reconciliation, audit and configuration events with original IDs |
 | ACC-37 | Race partial consume, release and expiry under refundable, non-refundable and prorated fee templates | Consumed + released + remaining always equals original hold; exactly one terminal state and one policy-correct journal result |
+| ACC-38 | Generate, validate, resolve, replace and concurrently allocate synthetic NUBANs | Check digits and normalisation match the CBN algorithm; one active scoped identifier resolves to one account; one primary NUBAN rule and immutable retirement history hold |
+| ACC-39 | Attach aliases from two provider simulators to one ledger account, duplicate/conflict an inbound session and deliver a late final credit to a retired/closed alias | Both aliases resolve correctly; the external event posts at most once; conflict opens a case; final cash follows §8.14 without resurrecting the alias |
+| ACC-40 | Open savings, current and fixed-deposit accounts, then change product terms | Each account remains bound to its opening product version; product-specific restrictions apply; historical accounting does not change |
+| ACC-41 | Accrue, capitalise, mature, renew and early-liquidate fixed/savings contracts across leap day, month end, rounding boundaries and process crashes | Exact day-count/rounding policy applies, each period posts once, component journals balance and restart resumes from durable checkpoints within its memory ceiling |
+| ACC-42 | Attempt to bind a non-interest product to a conventional rate, template or accrued-interest account | Configuration and commands fail closed before any account or journal mutation; approval reference is required |
+| ACC-43 | Allocate a non-interest pool across changing participation units, multiple pages and a rounding residual, including crash/retry | Investor shares, bank share and residual equal the approved distributable result exactly; no cross-pool posting or duplicate allocation exists |
 
 ### 23.2 Property-based tests
 
@@ -1423,10 +1520,14 @@ Generated command sequences verify:
 - partial-consumption conservation under every configured fee policy;
 - FX direction, quote expiry, non-posting sub-minor memorandum treatment, evidenced settlement difference and exact reversal;
 - idempotency state-machine concurrency and request-hash mismatch.
+- NUBAN check-digit validity, scoped identifier uniqueness, lifecycle monotonicity and many-alias/one-account cardinality;
+- separation of destination address from external-event identity;
+- conventional accrual conservation across day-count, eligibility, rounding and product-version boundaries;
+- non-interest finance-principle/template separation and pool-allocation conservation.
 
 ### 23.3 Contract and integration tests
 
-Every provider adapter passes the same conformance suite for reference stability, retry rules, response normalisation, webhook verification, query semantics, submission-intent recovery, settlement model and finality metadata. The suite includes provider-specific expected exceptions rather than forcing unsupported capabilities into one broad interface.
+Every provider adapter passes the same conformance suite for reference stability, retry rules, response normalisation, webhook verification, query semantics, submission-intent recovery, settlement model and finality metadata. Collection adapters also prove alias issuance scope, Name Enquiry minimisation, Direct Credit event identity, duplicate/conflict behaviour and real-provider rejection of `SIMULATOR_ONLY` identifiers. The suite includes provider-specific expected exceptions rather than forcing unsupported capabilities into one broad interface.
 
 Java/Go contract tests compile schemas with breaking-change detection, exchange golden binary/JSON fixtures and verify canonical request hashes. Unknown values that control financial behaviour must become a typed safe failure or indeterminate state, never a language-default zero value.
 
@@ -1443,9 +1544,9 @@ The main branch requires:
 - secret scanning;
 - telemetry PII/redaction tests;
 - deterministic build and signed image metadata;
-- the named critical scenarios ACC-01 through ACC-13, ACC-19 through ACC-24, ACC-29 and ACC-32 through ACC-37.
+- the named critical scenarios ACC-01 through ACC-13, ACC-19 through ACC-24, ACC-29 and ACC-32 through ACC-43.
 
-Longer restore, tamper, soak, OOM, disk-watermark and full-fault scenarios—including ACC-14 through ACC-18 and ACC-25 through ACC-37—run on a scheduled pipeline and before a tagged demonstration release. Scenarios already run as main-branch gates may be repeated under the exact tagged profile.
+Longer restore, tamper, soak, OOM, disk-watermark and full-fault scenarios—including ACC-14 through ACC-18 and ACC-25 through ACC-43—run on a scheduled pipeline and before a tagged demonstration release. Scenarios already run as main-branch gates may be repeated under the exact tagged profile.
 
 ### 23.5 Exit criteria
 
@@ -1469,15 +1570,18 @@ The PoC is complete only when:
 This design should be implemented in vertical correctness slices rather than by creating every service shell first.
 
 1. **Accounting kernel:** legal entity/book, chart of accounts, periods, checked money, journal templates, balanced journals, trial balance and property tests.
-2. **Funds control:** balances, holds, restrictions, idempotent commands, canonical locks and multi-replica race tests.
-3. **Java/Go contracts:** generated commands/events, canonical hashing, compatibility fixtures and unknown-value behaviour.
-4. **Outbox and projections:** durable publication, bounded outage behaviour, inbox deduplication and statement replay.
-5. **Outbound transfer:** explicit prefunded journal template, transaction/attempt split, durable submission intent, simulator, timeout/requery and fallback guard.
-6. **Provider routing:** capability/settlement registry, float reservations, shared breaker and segmented metrics.
-7. **Reconciliation:** source completeness, cycle state, break taxonomy, suspense lifecycle, control accounts and daily proof.
-8. **Multi-currency and FX:** rate precision, rounding and linked journals.
-9. **Security and operations:** identity integration, privileged controls, audit, off-host backup, restore and signed integrity roots.
-10. **8 GiB hardening:** profile automation, mixed-load soak, OOM/disk/backpressure tests, runbooks and limitation statement.
+2. **Account-identifier and product foundations:** NUBAN validation, immutable mappings, product/version references and database constraints without provider connectivity.
+3. **Funds control:** balances, holds, restrictions, idempotent commands, canonical locks and multi-replica race tests.
+4. **Java/Go contracts:** generated commands/events, canonical hashing, compatibility fixtures and unknown-value behaviour.
+5. **Account addressing and simulated NIP inbound:** account details, multi-provider aliases, Name Enquiry, Direct Credit/TSQ, idempotent resolution and restricted-destination handling.
+6. **Outbox and projections:** durable publication, bounded outage behaviour, inbox deduplication and statement/account-details replay.
+7. **Outbound transfer:** explicit prefunded journal template, transaction/attempt split, durable submission intent, simulator, timeout/requery and fallback guard.
+8. **Provider routing:** capability/settlement registry, float reservations, shared breaker and segmented metrics.
+9. **Conventional deposit products:** savings/current rules, fixed-deposit contract, accrual, capitalisation, maturity, liquidation and restart proofs.
+10. **Non-interest products:** governance/type guards, segregated pool participation, profit/loss allocation and conservation proofs.
+11. **Reconciliation:** source completeness, cycle state, break taxonomy, suspense lifecycle, control accounts and daily proof.
+12. **Multi-currency and FX:** rate precision, rounding and linked journals.
+13. **Security, operations and 8 GiB hardening:** identity, privileged controls, audit, backup/restore, integrity roots, profile automation, mixed-load soak and resource-fault runbooks.
 
 Each slice must pass its invariant tests before the next slice adds product breadth.
 
@@ -1511,6 +1615,11 @@ A reviewer should reject the design or implementation if any answer below is unc
 - Does a concurrent idempotency owner crash produce one stored result without stranding an in-progress command?
 - Can every event class be reconstructed for the defined recovery window after broker and published-row loss?
 - Do exact profile overlays prove per-container CPU, memory, PID, connection and volume limits?
+- Can several provider virtual accounts—and only one active primary NUBAN—resolve to the same ledger account without making an address a balance holder?
+- Is inbound idempotency based on external session/evidence identity rather than the destination NUBAN?
+- Does every customer account retain its immutable product version, including after terms change?
+- Can accrual, capitalisation, maturity and liquidation restart without duplicate recognition or unbounded per-account memory?
+- Are non-interest products structurally separated from conventional interest templates and independently prove pool-allocation conservation?
 
 ---
 
@@ -1519,12 +1628,17 @@ A reviewer should reject the design or implementation if any answer below is unc
 These sources inform terminology and tuning boundaries; they do not certify the design or replace product-specific legal, accounting and operational review.
 
 - [IFRS Conceptual Framework for Financial Reporting](https://www.ifrs.org/issued-standards/list-of-standards/conceptual-framework/) — reporting-entity, asset, liability, equity, income and expense concepts.
-- [Oracle Java 21 `java` command reference](https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html) — container detection and JVM memory controls.
+- [Oracle Java 25 `java` command reference](https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html) — container detection and JVM memory controls.
 - [Go garbage-collector guide](https://go.dev/doc/gc-guide) — `GOMEMLIMIT`, `GOGC`, runtime memory scope and headroom guidance.
 - [PostgreSQL resource-consumption configuration](https://www.postgresql.org/docs/current/runtime-config-resource.html) — shared buffers, per-operation memory and related resource controls.
 - [Redpanda sizing guidance](https://docs.redpanda.com/streaming/current/deploy/redpanda/manual/sizing/) — production memory/core and partition-memory expectations that the constrained PoC intentionally does not meet.
 - [Nigeria Data Protection Commission resources](https://ndpc.gov.ng/resources/) — Nigeria Data Protection Act 2023 and current implementation resources.
 - [Central Bank of Nigeria AML/CFT/CPF portal](https://www.cbn.gov.ng/supervision/AML-CFT/) — current supervisory materials and institution-specific compliance inputs.
+- [CBN Revised Standards on Nigeria Uniform Bank Account Number](https://www.cbn.gov.ng/out/2020/psmd/revised%20standards%20on%20nigeria%20uniform%20bank%20account%20number%20%28nuban%29%20for%20banks%20and%20other%20financial%20institutions%20.pdf) — ten-digit customer-facing NUBAN and institution-code/check-digit validation.
+- [NIBSS Instant Payment](https://nibss-plc.com.ng/nibss-instant-payment/) — account-number-based Name Enquiry, Direct Credit/Debit and transaction-status concepts used by the simulator boundary.
+- [SWIFT IBAN Registry, release 102](https://www.swift.com/swift-resource/9606/download) — authoritative country-format registry; Nigeria has no listed ISO IBAN structure in this release.
+- [CBN Financial Markets Department Rule Book, Volume 3](https://www.cbn.gov.ng/out/2020/fmd/cbn%20rule%20book%20volume%203.pdf) — Nigerian deposit-product terminology and non-interest-finance context.
+- [CBN Guidance Notes on Credit Risk for Non-Interest Financial Institutions](https://www.cbn.gov.ng/out/2019/bsd/guidance%20notes%20on%20the%20calculation%20of%20credit%20risk%20nifis.pdf) — non-interest contract terminology and prudential context.
 
 Versioned dependency documentation is pinned with the implementation bill of materials. Settings in this document are starting hypotheses and are revalidated when runtime, database, broker or workflow versions change.
 

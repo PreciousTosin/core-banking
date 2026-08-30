@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the Java `funds-core` accounting kernel that owns books, chart-of-accounts reference data, immutable balanced journals, checked monetary arithmetic, idempotent posting, materialised balances, outbox facts, accounting periods, reversals, trial-balance proof and subledger/control-account proof.
+**Goal:** Build the Java `funds-core` accounting kernel that owns books, chart-of-accounts reference data, immutable account-address and product-version foundations, immutable balanced journals, checked monetary arithmetic, idempotent posting, materialised balances, outbox facts, accounting periods, reversals, trial-balance proof and subledger/control-account proof.
 
 **Architecture:** Implement one Quarkus JVM service around an explicit PostgreSQL transaction boundary. Domain types validate money and journal equations before persistence; PostgreSQL independently enforces per-currency balance, immutability, account/currency compatibility and period state. The posting service locks accounts canonically, resolves idempotency inside the money transaction, writes journal/postings/balances/outbox atomically and exposes proof queries without introducing provider, hold or workflow concerns.
 
@@ -17,6 +17,11 @@
 - Posted amounts are checked signed 64-bit integer minor units. Java arithmetic uses `Math.addExact`, `Math.subtractExact`, `Math.multiplyExact` and `Math.negateExact`.
 - Every journal belongs to one legal entity and one book and balances to zero independently per currency.
 - Every account has exactly one currency, account class and normal direction.
+- The ledger-account UUID is the financial identity. NUBAN and provider virtual accounts are non-financial addresses and never appear as posting account IDs or transaction idempotency keys.
+- One account may have several provider aliases; an active scoped identifier resolves to one account, and one active primary NUBAN is allowed per externally addressable customer account.
+- Nigeria has no ISO IBAN format in the cited registry. Do not generate a Nigerian IBAN.
+- The deterministic PoC default is institution code `000000`, NUBAN `0000000017`, `SIMULATOR_ONLY`; production adapters must reject it.
+- Every customer account references an immutable product version and finance principle; non-customer control accounts do not require a customer product.
 - Customer-facing balance signs are derived from normal direction; persistence never rewrites posting signs for display.
 - Ordinary postings require an `OPEN` accounting period and the active chart/policy version.
 - Closed-period corrections are linked new journals in the current open period; journals and postings are never updated or deleted.
@@ -33,18 +38,21 @@
 
 The approved specification is implemented through separate reviewable plans in delivery order:
 
-1. This plan: accounting kernel.
+1. This plan: accounting kernel plus account-identifier/product-version reference foundations.
 2. Funds control: holds, restrictions, provider-float reservation and multi-replica concurrency.
 3. Java/Go Protobuf contracts and canonical hashing fixtures.
-4. Transactional outbox relay, Redpanda transport and Go projections.
-5. Go orchestration, provider simulator, durable submission intent and outbound payout.
-6. Provider routing, capability/settlement registry and resilience state.
-7. Reconciliation, source manifests, suspense and daily proof.
-8. Multi-currency FX execution and paired-journal workflows.
-9. Identity, privileged controls, audit anchoring, backup and restore.
-10. Exact 8 GiB Compose profiles, resource fault injection and acceptance evidence.
+4. `2026-08-30-account-identifiers-and-nip-inbound-implementation.md`: account details, multi-provider aliases and simulated NIP inbound.
+5. Transactional outbox relay, Redpanda transport and Go projections.
+6. Go orchestration, provider simulator, durable submission intent and outbound payout.
+7. Provider routing, capability/settlement registry and resilience state.
+8. `2026-08-30-conventional-deposit-products-and-accrual-implementation.md`: savings/current/fixed-deposit rules and accrual lifecycle.
+9. `2026-08-30-non-interest-banking-products-implementation.md`: non-interest governance, pools and allocation.
+10. Reconciliation, source manifests, suspense and daily proof.
+11. Multi-currency FX execution and paired-journal workflows.
+12. Identity, privileged controls, audit anchoring, backup and restore.
+13. Exact 8 GiB Compose profiles, resource fault injection and acceptance evidence.
 
-This plan does not create holds, call providers, start Temporal, publish to Redpanda or implement customer/channel APIs. It does create durable outbox rows because a committed money fact without its event violates the accounting boundary.
+This plan does not issue provider aliases, simulate NIP, calculate interest/profit, create holds, call providers, start Temporal, publish to Redpanda or implement customer/channel APIs. It creates the validation types and database foundations needed by the three named follow-on plans. It does create durable outbox rows because a committed money fact without its event violates the accounting boundary.
 
 ## File Structure
 
@@ -59,13 +67,19 @@ services/funds-core/
 │   │   ├── AccountClass.java
 │   │   ├── AccountStatus.java
 │   │   ├── AccountingPeriodStatus.java
+│   │   ├── AccountIdentifier.java
+│   │   ├── AccountIdentifierScheme.java
 │   │   ├── Book.java
 │   │   ├── CurrencyCode.java
+│   │   ├── DepositProductKind.java
+│   │   ├── FinancePrinciple.java
 │   │   ├── JournalDraft.java
 │   │   ├── LedgerAccount.java
 │   │   ├── Money.java
 │   │   ├── NormalBalance.java
 │   │   ├── PostingLine.java
+│   │   ├── ProductDefinition.java
+│   │   ├── ProductVersion.java
 │   │   ├── ReversalRequest.java
 │   │   └── exception/
 │   │       ├── AccountingPeriodClosedException.java
@@ -100,6 +114,7 @@ services/funds-core/
 │       └── V004__application_roles.sql
 ├── src/test/java/com/corebanking/funds/
 │   ├── domain/MoneyTest.java
+│   ├── domain/NubanTest.java
 │   ├── application/JournalValidatorTest.java
 │   ├── application/JournalProperties.java
 │   ├── testsupport/PropertyCases.java
@@ -267,11 +282,18 @@ git commit -m "feat(funds-core): bootstrap exact money domain"
 - Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/AccountingPeriodStatus.java`
 - Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/Book.java`
 - Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/LedgerAccount.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/AccountIdentifier.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/AccountIdentifierScheme.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/DepositProductKind.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/FinancePrinciple.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/ProductDefinition.java`
+- Create: `services/funds-core/src/main/java/com/corebanking/funds/domain/ProductVersion.java`
 - Modify: `services/funds-core/src/test/java/com/corebanking/funds/domain/MoneyTest.java`
+- Test: `services/funds-core/src/test/java/com/corebanking/funds/domain/NubanTest.java`
 
 **Interfaces:**
 - Consumes: `CurrencyCode`, signed posting totals.
-- Produces: `NormalBalance.toNatural(long)`, `LedgerAccount.bookedNaturalBalance(long)` and immutable reference records.
+- Produces: `NormalBalance.toNatural(long)`, `LedgerAccount.bookedNaturalBalance(long)`, NUBAN validation/check-digit functions and immutable product/address reference records.
 
 - [ ] **Step 1: Write failing normal-direction tests**
 
@@ -284,6 +306,8 @@ git commit -m "feat(funds-core): bootstrap exact money domain"
 ```
 
 Add construction tests proving that `Book` requires legal entity, functional currency, timezone, calendar and policy version, and `LedgerAccount` requires book, currency, class, normal direction, control-account code and non-null status.
+
+In `NubanTest`, use published-algorithm fixtures and generated nine-digit serials to prove that the tenth digit validates against a six-digit institution code, a one-digit mutation fails, non-digits fail, and the synthetic pair `000000`/`0000000017` validates. Test that `AccountIdentifier` rejects a NUBAN without institution code, rejects provider virtual accounts without provider ID, and never exposes a money/balance field.
 
 - [ ] **Step 2: Run the test to verify failure**
 
@@ -311,13 +335,18 @@ Use these exact enum members:
 enum AccountClass { ASSET, LIABILITY, EQUITY, INCOME, EXPENSE }
 enum AccountStatus { OPEN, DEBIT_BLOCKED, CREDIT_BLOCKED, CLOSED }
 enum AccountingPeriodStatus { OPEN, CLOSING, CLOSED }
+enum AccountIdentifierScheme { NUBAN, PROVIDER_VIRTUAL_ACCOUNT, IBAN }
+enum DepositProductKind { SAVINGS, CURRENT, FIXED_DEPOSIT, DOMICILIARY }
+enum FinancePrinciple { CONVENTIONAL, NON_INTEREST }
 ```
 
-Implement `Book` and `LedgerAccount` as records with UUID identifiers and constructor validation. `LedgerAccount` exposes `bookedNaturalBalance(long signedTotal)` by delegating to its `NormalBalance`.
+Implement `Book`, `LedgerAccount`, `ProductDefinition`, `ProductVersion` and `AccountIdentifier` as records with UUID identifiers and constructor validation. `LedgerAccount` exposes `bookedNaturalBalance(long signedTotal)` by delegating to its `NormalBalance`. `ProductVersion` is immutable and carries product kind, finance principle, effective interval, approval reference and opaque versioned-policy JSON hash; calculation fields arrive in the follow-on product plans. `AccountIdentifier` carries scheme, normalised value, institution/provider scope, lifecycle, primary flag and routing scope, but no balance.
+
+Implement NUBAN check-digit calculation as a pure function over the six-digit institution code plus nine-digit serial using the CBN weights. Keep `IBAN` in the extensible enum but reject it until a country-specific validator exists; specifically do not treat `NG` plus a NUBAN as an IBAN.
 
 - [ ] **Step 4: Run domain tests**
 
-Run: `cd services/funds-core && ./mvnw -Dtest='MoneyTest' test`
+Run: `cd services/funds-core && ./mvnw -Dtest='MoneyTest,NubanTest' test`
 
 Expected: PASS.
 
@@ -433,7 +462,7 @@ git commit -m "feat(funds-core): validate balanced journal drafts"
 
 **Interfaces:**
 - Consumes: PostgreSQL 18.6.
-- Produces: `funds.book`, `funds.chart_version`, `funds.accounting_period`, `funds.ledger_account` and controlled enum checks.
+- Produces: `funds.book`, `funds.chart_version`, `funds.accounting_period`, `funds.product_definition`, `funds.product_version`, `funds.ledger_account`, `funds.account_identifier` and controlled enum/check-digit checks.
 
 - [ ] **Step 1: Configure real PostgreSQL tests**
 
@@ -448,7 +477,7 @@ quarkus.flyway.clean-disabled=false
 
 - [ ] **Step 2: Write failing migration assertions**
 
-Use `@QuarkusTest` and injected `AgroalDataSource`. Query `information_schema.tables` and assert all four tables exist. Attempt to insert an account with an invalid currency length, invalid normal direction and missing book; each insert must fail.
+Use `@QuarkusTest` and injected `AgroalDataSource`. Query `information_schema.tables` and assert all seven tables exist. Attempt to insert an account with an invalid currency length, invalid normal direction and missing book; each insert must fail. Also prove a customer account without a product version fails, the same scoped active identifier cannot map to two accounts, a second active primary NUBAN for one account fails, multiple provider aliases from different providers succeed, a bad NUBAN check digit fails and `SIMULATOR_ONLY` is retained as data rather than becoming routable.
 
 - [ ] **Step 3: Run the test to verify failure**
 
@@ -492,11 +521,33 @@ CREATE TABLE funds.accounting_period (
     EXCLUDE USING gist (book_id WITH =, daterange(business_date_from, business_date_to, '[]') WITH &&)
 );
 
+CREATE TABLE funds.product_definition (
+    product_id uuid PRIMARY KEY,
+    product_code text NOT NULL UNIQUE,
+    product_kind text NOT NULL CHECK (product_kind IN ('SAVINGS','CURRENT','FIXED_DEPOSIT','DOMICILIARY')),
+    finance_principle text NOT NULL CHECK (finance_principle IN ('CONVENTIONAL','NON_INTEREST'))
+);
+
+CREATE TABLE funds.product_version (
+    product_version_id uuid PRIMARY KEY,
+    product_id uuid NOT NULL REFERENCES funds.product_definition(product_id),
+    version integer NOT NULL CHECK (version > 0),
+    effective_from timestamptz NOT NULL,
+    effective_to timestamptz,
+    approval_reference text NOT NULL,
+    policy_hash char(64) NOT NULL,
+    policy_json jsonb NOT NULL,
+    UNIQUE (product_id, version),
+    CHECK (effective_to IS NULL OR effective_to > effective_from)
+);
+
 CREATE TABLE funds.ledger_account (
     account_id uuid PRIMARY KEY,
     book_id uuid NOT NULL REFERENCES funds.book(book_id),
     chart_version_id uuid NOT NULL REFERENCES funds.chart_version(chart_version_id),
     account_code text NOT NULL,
+    account_scope text NOT NULL CHECK (account_scope IN ('CUSTOMER','CONTROL','INTERNAL')),
+    product_version_id uuid REFERENCES funds.product_version(product_version_id),
     account_class text NOT NULL CHECK (account_class IN ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')),
     normal_balance text NOT NULL CHECK (normal_balance IN ('DEBIT','CREDIT')),
     currency char(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
@@ -505,11 +556,34 @@ CREATE TABLE funds.ledger_account (
     authorised_floor_minor bigint NOT NULL DEFAULT 0 CHECK (authorised_floor_minor <= 0),
     created_at timestamptz NOT NULL,
     closed_at timestamptz,
-    UNIQUE (book_id, account_code, currency)
+    UNIQUE (book_id, account_code, currency),
+    CHECK ((account_scope = 'CUSTOMER' AND product_version_id IS NOT NULL)
+        OR (account_scope <> 'CUSTOMER' AND product_version_id IS NULL))
+);
+
+CREATE TABLE funds.account_identifier (
+    account_identifier_id uuid PRIMARY KEY,
+    account_id uuid NOT NULL REFERENCES funds.ledger_account(account_id),
+    scheme text NOT NULL CHECK (scheme IN ('NUBAN','PROVIDER_VIRTUAL_ACCOUNT','IBAN')),
+    normalised_value text NOT NULL,
+    institution_code char(6),
+    provider_id uuid,
+    purpose_code text,
+    routing_scope text NOT NULL CHECK (routing_scope IN ('SIMULATOR_ONLY','INTERNAL','EXTERNAL')),
+    lifecycle_status text NOT NULL CHECK (lifecycle_status IN ('PENDING','ACTIVE','RETIRED','REVOKED')),
+    is_primary boolean NOT NULL DEFAULT false,
+    valid_from timestamptz NOT NULL,
+    valid_to timestamptz,
+    issuance_evidence_hash char(64) NOT NULL,
+    CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CHECK ((scheme = 'NUBAN' AND institution_code IS NOT NULL AND provider_id IS NULL
+            AND normalised_value ~ '^[0-9]{10}$')
+        OR (scheme = 'PROVIDER_VIRTUAL_ACCOUNT' AND provider_id IS NOT NULL)
+        OR (scheme = 'IBAN' AND false))
 );
 ```
 
-Enable `btree_gist` before the exclusion constraint. Add indexes on period lookup and account book/status. Seed only deterministic test fixtures from tests, never from the production migration.
+Enable `btree_gist` before the exclusion constraint. Add indexes on period lookup, account book/status and identifier resolution. Add an immutable SQL NUBAN validator used by a table check. Add a unique expression index for active scoped identifiers over `(scheme, coalesce(institution_code,''), coalesce(provider_id::text,''), normalised_value)` and a partial unique index enforcing one active primary NUBAN per account. Prevent external identifiers on non-customer accounts. Do not permit update/delete to rewrite identifier history; lifecycle changes append a successor/audit fact in the follow-on plan. Seed the synthetic `000000`/`0000000017` fixture only from tests, never from the production migration.
 
 - [ ] **Step 5: Run migration tests**
 
@@ -1262,10 +1336,12 @@ Expected: build succeeds; container reports Java 25 and stays within the declare
 - positive-debit/negative-credit convention;
 - exact money and overflow policy;
 - migration and application role separation;
+- identifier/address versus ledger/transaction identity, NUBAN validation and the simulator-only default;
+- product-version and finance-principle foundations, including why non-interest is not a zero-rate conventional product;
 - local test commands;
 - JVM memory flags;
-- implemented acceptance coverage: ACC-01, the accounting portion of ACC-02, ACC-19, ACC-20, ACC-24, ACC-25 configuration inputs, ACC-29 Java fixture prerequisites and ACC-32 including owner termination immediately before and after commit;
-- explicit exclusions: holds, Go contracts, event relay, providers, reconciliation, FX execution, security UI and full 8 GiB orchestration.
+- implemented acceptance coverage: ACC-01, the accounting portion of ACC-02, ACC-19, ACC-20, ACC-24, ACC-25 configuration inputs, ACC-29 Java fixture prerequisites, ACC-32 including owner termination immediately before and after commit, the foundation/constraint portion of ACC-38 and the immutable-version portion of ACC-40/ACC-42;
+- explicit exclusions: identifier issuance/resolution APIs, real or simulated NIP, account-details projection, accrual/capitalisation/maturity, non-interest allocation, holds, Go contracts, event relay, providers, reconciliation, FX execution, security UI and full 8 GiB orchestration.
 
 - [ ] **Step 6: Commit**
 
@@ -1291,6 +1367,7 @@ Expected results:
 - Maven exits zero with no failed or skipped accounting tests.
 - Generated-property tests report the fixed seed and failing case in assertion output when applicable.
 - PostgreSQL integration tests prove commit-time balance, immutability, role and period controls.
+- Reference-data integration tests prove NUBAN check digits, scoped alias cardinality, primary-NUBAN uniqueness, product-version binding and the ban on fabricated Nigerian IBANs.
 - Pre-outbox failure injection proves journal, postings, balances, control projection, idempotency and outbox roll back together.
 - Child-process termination tests prove pre-commit rollback/new-owner recovery and post-commit stored-result recovery.
 - Stateful PostgreSQL generation executes 4,096 post/retry/conflict/reverse/reject operations and checks six invariants after every operation.
@@ -1299,6 +1376,6 @@ Expected results:
 
 Before moving to the funds-control plan, request an independent review against:
 
-- architecture §§4–5, 8.1–8.3, 8.9–8.13, 9.1–9.2, 13.9, 16.1, 21.8–21.11 and 23;
+- architecture §§4–5, 8.1–8.3, 8.9–8.16, 9.1–9.2, 12.1.1, 13.7.1, 13.9, 16.1, 21.8–21.11 and 23;
 - this plan's interfaces and exclusions;
 - the exact base-to-head Git range for the accounting-kernel slice.
