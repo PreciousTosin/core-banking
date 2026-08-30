@@ -383,7 +383,7 @@ The proof reads immutable postings rather than trusting materialised balances. D
 
 Posted amounts use checked signed 64-bit integer minor units. APIs reject values outside configured product and currency maxima before arithmetic. Java uses exact integer operations that throw on overflow. Go uses explicit checked add/subtract helpers; neither language relies on wraparound. Database aggregates use a numeric type large enough to detect an application overflow rather than reproduce it.
 
-Binary floating point is forbidden for money and FX. FX rates use a fixed precision and named direction; conversions declare rounding mode and currency scale. Each conversion retains its high-precision unrounded result and booked rounded minor-unit result. A whole-minor-unit imbalance created by component allocation posts to a rounding account. Sub-minor-unit residuals cannot themselves be posted; they accumulate in a high-precision rounding control by currency and policy version and are recognised to the rounding account when they reach one minor unit. Limits are tested at zero, one minor unit, maximum allowed amount and arithmetic boundaries.
+Binary floating point is forbidden for money and FX. FX rates use a fixed precision and named direction; conversions declare rounding mode and currency scale. Each conversion retains its high-precision unrounded result and booked rounded minor-unit result. The rounded customer quote is the final booked price. Its sub-minor delta is memorandum analytics linked to the trade: it never accumulates into a later journal, changes a customer balance or creates income/loss. A whole-minor-unit imbalance created while allocating already rounded booked components posts in the same journal to a rounding gain/loss account with the FX-position account as the counter-entry. A real difference later evidenced by provider settlement is a new reconciliation fact posted between the external receivable/payable or FX-position counter-account and realised FX/rounding gain or loss. Limits are tested at zero, one minor unit, maximum allowed amount and arithmetic boundaries.
 
 ### 8.13 Fees, interest, taxes, provisions and recognition
 
@@ -501,7 +501,7 @@ An FX trade creates two separately balanced currency journals linked by one trad
 - the sold-currency journal moves value through that currency's FX position account;
 - the bought-currency journal moves value through the corresponding position account;
 - NGN base equivalents and the booked quote are retained for reporting;
-- rounding differences post to an explicit rounding account;
+- whole-minor allocation differences post between the FX-position counter-account and explicit rounding gain/loss; sub-minor quote deltas remain non-posting memorandum analytics;
 - fee and spread components are stated explicitly rather than inferred.
 
 Reversal uses the original booked rate for accounting reversal. Any economic difference caused by a later offsetting market trade is a new realised gain/loss fact, not a rewrite of the original trade.
@@ -820,7 +820,7 @@ Ada sells **USD 10.01** at a quote of **₦1,503.27 for USD 1**, with no fee. Th
 | NGN FX position | ₦15,047.73 | — |
 | Ada NGN customer liability | — | ₦15,047.73 |
 
-The sub-kobo residual ₦0.0027 is retained in the high-precision rounding control; it is not forced into a journal that can represent only kobo. When accumulated residual reaches a whole kobo, an explicit rounding-account journal recognises it under the policy version. A fee or spread would be a separately stated NGN credit with the NGN FX-position debit increased by the same amount.
+The sub-kobo delta ₦0.0027 is retained as memorandum analytics linked to this quote and booked amount. It is never accumulated into a later posting because the customer accepted ₦15,047.73 as the final price. A fee or spread would be a separately stated NGN credit with the NGN FX-position debit increased by the same amount. If later external settlement evidence differs from the booked FX position by a representable whole minor unit, reconciliation posts that evidenced difference between the external receivable/payable or FX-position account and realised FX/rounding gain or loss; it never adjusts Ada's completed trade.
 
 An accounting reversal uses the original USD 10.01 and booked ₦15,047.73 in opposite directions, so it exactly reverses the books. If the bank economically replaces the trade later at a different market rate, that replacement is a new trade and its difference posts to realised FX gain/loss. Supplying `USD per NGN` to this template, using an expired quote or creating only one currency journal is rejected.
 
@@ -1396,7 +1396,7 @@ Toxiproxy or an equivalent network fault proxy adds latency, disconnection and h
 | ACC-31 | Tamper before/after anchor, remove a manifest, restore an older database and rotate signing key | Unanchored window is visible; anchored mutation, rollback, missing manifest and invalid rotation are detected |
 | ACC-32 | Race same idempotency key with same and different hashes, then crash owner before and after commit | Same hash yields one stored result, different hash always fails, rollback elects one new owner and post-commit retry never reposts |
 | ACC-33 | Receive final inbound cash for open, debit-blocked, credit-blocked, frozen, dormant, closed and unknown destinations | External asset is recognised once; normal or restricted/unapplied/suspense liability follows §8.14; no prohibited availability results |
-| ACC-34 | Execute and reverse the USD/NGN example at expiry, rounding and numeric boundaries | Quote direction/expiry guards work, both journals commit atomically, sub-minor control reconciles and reversal uses original booked amounts |
+| ACC-34 | Execute and reverse the USD/NGN example at expiry, rounding and numeric boundaries | Quote direction/expiry guards work, both journals commit atomically, memorandum delta never posts or changes a customer balance, evidenced settlement difference uses the named counter-account and reversal uses original booked amounts |
 | ACC-35 | Start constrained Redpanda with fixed inventory and run produce/consume/replay plus restart | Broker stays within CPU/memory/partition/retention limits, preserves fsync and exposes no allocation failure; otherwise profile fails |
 | ACC-36 | Delete the broker after published rows become cleanup-eligible and rebuild every event class | Per-schema checkpoint/archive reconstructs journal, hold, transaction, attempt, reconciliation, audit and configuration events with original IDs |
 | ACC-37 | Race partial consume, release and expiry under refundable, non-refundable and prorated fee templates | Consumed + released + remaining always equals original hold; exactly one terminal state and one policy-correct journal result |
@@ -1421,7 +1421,7 @@ Generated command sequences verify:
 - source-manifest completeness and proof-version monotonicity;
 - available-balance equations for debit/credit normal direction, overdraft floors and restriction gates;
 - partial-consumption conservation under every configured fee policy;
-- FX direction, quote expiry, sub-minor accumulation and exact reversal;
+- FX direction, quote expiry, non-posting sub-minor memorandum treatment, evidenced settlement difference and exact reversal;
 - idempotency state-machine concurrency and request-hash mismatch.
 
 ### 23.3 Contract and integration tests
@@ -1507,6 +1507,10 @@ A reviewer should reject the design or implementation if any answer below is unc
 - Does the exact 8 GiB test artifact state which profile and components were active?
 - Can broker outage, OOM, disk pressure or pool exhaustion shed load without losing accepted intent?
 - Can maker-checker, direct database privilege and submission crash-window tests demonstrate the claimed controls?
+- Does externally final inbound value route safely for every restricted, closed or unknown destination?
+- Does a concurrent idempotency owner crash produce one stored result without stranding an in-progress command?
+- Can every event class be reconstructed for the defined recovery window after broker and published-row loss?
+- Do exact profile overlays prove per-container CPU, memory, PID, connection and volume limits?
 
 ---
 
