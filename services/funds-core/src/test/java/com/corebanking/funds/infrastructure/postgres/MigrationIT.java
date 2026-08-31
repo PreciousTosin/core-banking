@@ -95,6 +95,157 @@ class MigrationIT {
     }
 
     @Test
+    void installsHardenedRoleOwnershipAndExactPrivileges() throws Exception {
+        inTransaction(connection -> {
+            assertEquals(3, queryInt(connection, """
+                SELECT count(*) FROM pg_roles
+                WHERE rolname IN ('funds_migrator', 'funds_app', 'funds_proof_reader')
+                  AND NOT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+                  AND NOT rolinherit AND NOT rolreplication AND NOT rolbypassrls
+                """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_auth_members membership
+                JOIN pg_roles member ON member.oid = membership.member
+                WHERE member.rolname IN ('funds_migrator', 'funds_app', 'funds_proof_reader')
+                """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM (
+                    SELECT namespace.nspowner AS owner
+                    FROM pg_namespace namespace WHERE namespace.nspname = 'funds'
+                    UNION ALL
+                    SELECT relation.relowner
+                    FROM pg_class relation
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = 'funds' AND relation.relkind IN ('r', 'p', 'S')
+                    UNION ALL
+                    SELECT procedure.proowner
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = 'funds'
+                ) owned_object
+                WHERE owned_object.owner <> 'funds_migrator'::regrole
+                """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_trigger trigger
+                JOIN pg_class relation ON relation.oid = trigger.tgrelid
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
+                WHERE namespace.nspname = 'funds' AND NOT trigger.tgisinternal
+                  AND (procedure.proowner <> 'funds_migrator'::regrole OR NOT procedure.prosecdef
+                       OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, funds'])
+                """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM (
+                    SELECT privilege.grantee
+                    FROM pg_namespace namespace,
+                         LATERAL aclexplode(coalesce(
+                             namespace.nspacl, acldefault('n', namespace.nspowner))) privilege
+                    WHERE namespace.nspname = 'funds'
+                    UNION ALL
+                    SELECT privilege.grantee
+                    FROM pg_class relation
+                    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace,
+                         LATERAL aclexplode(coalesce(
+                             relation.relacl,
+                             acldefault(
+                                 (CASE WHEN relation.relkind = 'S' THEN 'S' ELSE 'r' END)::"char",
+                                        relation.relowner))) privilege
+                    WHERE namespace.nspname = 'funds' AND relation.relkind IN ('r', 'p', 'S')
+                    UNION ALL
+                    SELECT privilege.grantee
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace,
+                         LATERAL aclexplode(coalesce(
+                             procedure.proacl, acldefault('f', procedure.proowner))) privilege
+                    WHERE namespace.nspname = 'funds'
+                ) public_privilege
+                WHERE public_privilege.grantee = 0
+                """));
+
+            assertTrue(queryBoolean(connection,
+                "SELECT has_schema_privilege('funds_app', 'funds', 'USAGE')"));
+            assertFalse(queryBoolean(connection,
+                "SELECT has_schema_privilege('funds_app', 'funds', 'CREATE')"));
+            assertTrue(queryBoolean(connection,
+                "SELECT has_table_privilege('funds_app', 'funds.journal', 'SELECT')"));
+            assertFalse(queryBoolean(connection,
+                "SELECT has_table_privilege('funds_app', 'funds.journal', 'INSERT')"));
+            assertTrue(queryBoolean(connection, """
+                SELECT has_column_privilege('funds_app', 'funds.journal', 'journal_id', 'INSERT')
+                """));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_column_privilege(
+                    'funds_app', 'funds.journal', 'journal_sequence', 'INSERT')
+                """));
+            assertFalse(queryBoolean(connection,
+                "SELECT has_table_privilege('funds_app', 'funds.posting', 'UPDATE, DELETE')"));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_table_privilege('funds_app', 'funds.accounting_period', 'UPDATE')
+                """));
+            assertTrue(queryBoolean(connection, """
+                SELECT has_sequence_privilege(
+                    'funds_app', 'funds.journal_journal_sequence_seq', 'USAGE')
+                """));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_sequence_privilege(
+                    'funds_app', 'funds.journal_journal_sequence_seq', 'SELECT')
+                """));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_function_privilege(
+                    'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')
+                """));
+            assertTrue(queryBoolean(connection,
+                "SELECT has_table_privilege('funds_proof_reader', 'funds.posting', 'SELECT')"));
+            assertFalse(queryBoolean(connection,
+                "SELECT has_table_privilege('funds_proof_reader', 'funds.posting', 'INSERT')"));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_sequence_privilege(
+                    'funds_proof_reader', 'funds.journal_journal_sequence_seq', 'USAGE')
+                """));
+
+            execute(connection, "SET ROLE funds_migrator");
+            try {
+                execute(connection, """
+                    CREATE TABLE funds.default_acl_probe (
+                        id bigserial PRIMARY KEY
+                    )
+                    """);
+                execute(connection, """
+                    CREATE FUNCTION funds.default_acl_probe_function()
+                    RETURNS integer LANGUAGE sql AS 'SELECT 1'
+                    """);
+            } finally {
+                execute(connection, "RESET ROLE");
+            }
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_class relation,
+                     LATERAL aclexplode(coalesce(
+                         relation.relacl,
+                         acldefault(
+                             (CASE WHEN relation.relkind = 'S' THEN 'S' ELSE 'r' END)::"char",
+                             relation.relowner))) privilege
+                WHERE relation.oid IN (
+                    'funds.default_acl_probe'::regclass,
+                    'funds.default_acl_probe_id_seq'::regclass)
+                  AND privilege.grantee = 0
+                """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_proc procedure,
+                     LATERAL aclexplode(coalesce(
+                         procedure.proacl, acldefault('f', procedure.proowner))) privilege
+                WHERE procedure.oid = 'funds.default_acl_probe_function()'::regprocedure
+                  AND privilege.grantee = 0
+                """));
+        });
+    }
+
+    @Test
     void rejectsLedgerCurrencyLongerThanThreeCharacters() throws Exception {
         inTransaction(connection -> {
             insertReferenceGraph(connection);

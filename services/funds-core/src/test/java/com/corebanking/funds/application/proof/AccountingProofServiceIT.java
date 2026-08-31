@@ -87,16 +87,21 @@ class AccountingProofServiceIT {
         TrialBalanceProof before = proofService.trialBalance(BOOK, NGN, result.journalSequence());
 
         try (var connection = dataSource.getConnection()) {
-            assertTrue(queryBoolean(connection, """
-                SELECT current_user = tableowner
-                FROM pg_tables
-                WHERE schemaname = 'funds' AND tablename = 'control_account_projection'
-                """));
-            execute(connection, """
-                UPDATE funds.control_account_projection
-                SET signed_posting_total = signed_posting_total + 37
-                WHERE book_id = ? AND control_account_code = 'CUSTOMER-DEPOSITS' AND currency = 'NGN'
-                """, BOOK);
+            execute(connection, "SET ROLE funds_migrator");
+            try {
+                assertTrue(queryBoolean(connection, """
+                    SELECT current_user = tableowner
+                    FROM pg_tables
+                    WHERE schemaname = 'funds' AND tablename = 'control_account_projection'
+                    """));
+                execute(connection, """
+                    UPDATE funds.control_account_projection
+                    SET signed_posting_total = signed_posting_total + 37
+                    WHERE book_id = ? AND control_account_code = 'CUSTOMER-DEPOSITS' AND currency = 'NGN'
+                    """, BOOK);
+            } finally {
+                execute(connection, "RESET ROLE");
+            }
         }
 
         ControlAccountProof control = proofService.controlAccount(

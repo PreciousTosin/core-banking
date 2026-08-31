@@ -439,6 +439,133 @@ class LedgerConstraintIT {
         }
     }
 
+    @Test
+    void applicationRoleCannotBypassLedgerControls() throws Exception {
+        truncateAllTables();
+        try (var connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                insertReferenceGraph(connection);
+                execute(connection, "SET ROLE funds_app");
+
+                assertEquals("funds_app", queryString(connection, "SELECT current_user"));
+                assertEquals(3, queryLong(connection, "SELECT count(*) FROM funds.ledger_account"));
+                execute(connection, """
+                    INSERT INTO funds.idempotency_command
+                        (command_id, request_hash, state, created_at)
+                    VALUES ('%s', '%s', 'IN_PROGRESS', TIMESTAMPTZ '2026-01-15 10:00:00+00')
+                    """.formatted(COMMAND_ID, REQUEST_HASH));
+                insertJournal(connection, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
+                insertPosting(connection, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
+                insertPosting(connection, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+                execute(connection, """
+                    INSERT INTO funds.materialised_balance
+                        (account_id, signed_posting_total, latest_account_sequence, version)
+                    VALUES ('%s', 0, 0, 0), ('%s', 0, 0, 0)
+                    """.formatted(CUSTOMER_ACCOUNT_A, CUSTOMER_ACCOUNT_B));
+                execute(connection, """
+                    UPDATE funds.materialised_balance
+                    SET signed_posting_total = 100, latest_account_sequence = 1, version = 1
+                    WHERE account_id = '%s'
+                    """.formatted(CUSTOMER_ACCOUNT_A));
+                execute(connection, """
+                    INSERT INTO funds.control_account_projection
+                        (book_id, control_account_code, currency, signed_posting_total,
+                         latest_journal_sequence)
+                    VALUES ('%s', 'CUSTOMER-DEPOSITS', 'NGN', 0, 0)
+                    """.formatted(BOOK_ID));
+                execute(connection, """
+                    UPDATE funds.control_account_projection
+                    SET signed_posting_total = 0, latest_journal_sequence =
+                        (SELECT journal_sequence FROM funds.journal WHERE journal_id = '%s')
+                    WHERE book_id = '%s' AND control_account_code = 'CUSTOMER-DEPOSITS'
+                      AND currency = 'NGN'
+                    """.formatted(JOURNAL_ID, BOOK_ID));
+                execute(connection, """
+                    INSERT INTO funds.outbox_event
+                        (event_id, aggregate_id, aggregate_version, event_type, schema_version,
+                         payload, created_at)
+                    SELECT '%s', journal_id, journal_sequence, 'JournalPosted', 1,
+                           '{}'::jsonb, TIMESTAMPTZ '2026-01-15 10:00:00+00'
+                    FROM funds.journal WHERE journal_id = '%s'
+                    """.formatted(EVENT_ID, JOURNAL_ID));
+                execute(connection, """
+                    UPDATE funds.idempotency_command
+                    SET state = 'COMPLETED', journal_id = '%s', result_json = '{}'::jsonb,
+                        completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
+                    WHERE command_id = '%s' AND state = 'IN_PROGRESS'
+                    """.formatted(JOURNAL_ID, COMMAND_ID));
+                execute(connection, "SET CONSTRAINTS ALL IMMEDIATE");
+
+                assertSqlState(connection, "42501", "UPDATE funds.journal SET narration = 'tampered'");
+                assertSqlState(connection, "42501", "DELETE FROM funds.journal");
+                assertSqlState(connection, "42501", "UPDATE funds.posting SET signed_minor_units = 1");
+                assertSqlState(connection, "42501", "DELETE FROM funds.posting");
+                assertSqlState(connection, "42501", "ALTER TABLE funds.posting DISABLE TRIGGER ALL");
+                assertSqlState(connection, "42501", "ALTER TABLE funds.posting ADD COLUMN bypass text");
+                assertSqlState(connection, "42501", """
+                    CREATE OR REPLACE FUNCTION funds.reject_ledger_mutation()
+                    RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'
+                    """);
+                assertSqlState(connection, "42501", """
+                    ALTER FUNCTION funds.reject_ledger_mutation() RENAME TO bypass_ledger_mutation
+                    """);
+                assertSqlState(connection, "42501", """
+                    UPDATE funds.accounting_period SET status = 'CLOSED'
+                    WHERE period_id = '%s'
+                    """.formatted(PERIOD_ID));
+
+                Savepoint beforeCompletedMutation = connection.setSavepoint();
+                try {
+                    var completedMutation = assertThrows(SQLException.class, () -> execute(connection, """
+                        UPDATE funds.idempotency_command SET result_json = '{"tampered":true}'::jsonb
+                        WHERE command_id = '%s'
+                        """.formatted(COMMAND_ID)));
+                    assertEquals("55000", completedMutation.getSQLState());
+                    assertEquals(
+                        "completed_idempotency_immutable",
+                        ((PSQLException) completedMutation).getServerErrorMessage().getConstraint());
+                } finally {
+                    connection.rollback(beforeCompletedMutation);
+                }
+
+                assertEquals(0, queryLong(connection, """
+                    SELECT has_function_privilege(
+                        'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')::integer
+                    """));
+
+                execute(connection, "RESET ROLE");
+                execute(connection, "SET SESSION AUTHORIZATION funds_app");
+                assertSqlState(connection, "42501", "SET ROLE funds_migrator");
+                execute(connection, "RESET SESSION AUTHORIZATION");
+
+                execute(connection, "SET SESSION AUTHORIZATION funds_proof_reader");
+                assertEquals(0, queryLong(connection, """
+                    SELECT coalesce(sum(posting.signed_minor_units::numeric), 0)
+                    FROM funds.posting posting
+                    JOIN funds.ledger_account account ON account.account_id = posting.account_id
+                    """));
+                assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.materialised_balance"));
+                assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.control_account_projection"));
+                assertSqlState(connection, "42501", idempotencyInsert(
+                    uuid(901), REQUEST_HASH, "IN_PROGRESS", null, null, null));
+                assertSqlState(connection, "42501", "SET ROLE funds_migrator");
+            } finally {
+                try {
+                    execute(connection, "RESET SESSION AUTHORIZATION");
+                } finally {
+                    try {
+                        execute(connection, "RESET ROLE");
+                    } finally {
+                        connection.rollback();
+                    }
+                }
+            }
+        } finally {
+            truncateAllTables();
+        }
+    }
+
     private void inRollbackTransaction(SqlConsumer action) throws Exception {
         try (var connection = dataSource.getConnection()) {
             connection.setAutoCommit(false);
