@@ -39,6 +39,8 @@ readonly SYSCTL_FILE=/etc/sysctl.d/99-core-banking-poc.conf
 readonly DOCKER_DAEMON_JSON=/etc/docker/daemon.json
 readonly DOCKER_KEYRING=/etc/apt/keyrings/docker.asc
 readonly DOCKER_APT_LIST=/etc/apt/sources.list.d/docker.list
+# Docker's published apt signing key (primary fingerprint of download.docker.com/linux/ubuntu/gpg).
+readonly DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 readonly FW_CHAIN=CORE-BANKING
 
 # Minimum host shape (§21.1: 4 vCPU / 8 GiB / NVMe, 2,048 MiB OS reserve).
@@ -100,7 +102,8 @@ Options:
   --repo-dir <path>                       Checkout to deploy. Default: the checkout
                                           this script lives in, else /opt/core-banking
   --secrets-dir <path>                    Docker secret material (default: $SECRETS_DIR)
-  --wait-timeout <seconds>                'compose up --wait' timeout (default: $WAIT_TIMEOUT)
+  --wait-timeout <seconds>                'compose up --wait' timeout, 1-999999 (default:
+                                          $WAIT_TIMEOUT). 0 is rejected: Compose reads it as no timeout
   --persist-swap-off                      Also comment out swap entries in /etc/fstab
                                           (backed up first; fstype field only)
   --skip-secrets                          Development only: do not require secret material
@@ -146,7 +149,11 @@ parse_args() {
     normal|concurrency|restore) ;;
     *) die "invalid --profile '$PROFILE'; declared profiles are: normal, concurrency, restore" ;;
   esac
-  [[ $WAIT_TIMEOUT =~ ^[0-9]+$ ]] || die "--wait-timeout must be an integer number of seconds"
+  # 0 is rejected on purpose: 'compose up --wait --wait-timeout 0' is treated as
+  # "no timeout" and waits forever, which turns a stuck stack into a hung run
+  # instead of a failed one (measured on Compose v5.5.0).
+  [[ $WAIT_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] ||
+    die "--wait-timeout must be a positive integer number of seconds, 1-999999 ('0' means NO timeout to 'compose up --wait', which would hang this run instead of failing it)"
   if (( VERBOSE == 1 )); then set -x; fi
   return 0
 }
@@ -170,6 +177,34 @@ preflight_fail() {
   else
     die "$1 (pass --allow-undersized to continue anyway for non-evidence runs)"
   fi
+}
+
+cpu_model() {
+  # /proc/cpuinfo's 'model name' is x86-only; on arm64 - accepted by preflight -
+  # the file carries CPU implementer/part instead, so the §21.16 manifest would
+  # record an empty cpu_model on Graviton/Ampere. lscpu (util-linux, always
+  # present) names the core on both; the raw fields are the last resort.
+  local m
+  # '{ ...|| true; }': an absent or failing lscpu makes this ASSIGNMENT from a
+  # pipeline non-zero under pipefail, which trips the ERR trap inside the
+  # command substitution at the jq call - the fallbacks below never run and the
+  # manifest records an empty cpu_model under a spurious FAILED line.
+  m=$( { LC_ALL=C lscpu 2>/dev/null || true; } | awk -F': +' '/^Model name:/ {print $2; exit}')
+  [[ -n $m ]] || m=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)
+  [[ -n $m ]] || m=$(awk -F': +' '/^CPU implementer/ {i = $2} /^CPU part/ {p = $2}
+    END {if (i != "") print "ARM implementer " i " part " p}' /proc/cpuinfo)
+  printf '%s' "${m:-unknown}"
+}
+
+docker_root_dir() {
+  # $1 = value to use when the daemon cannot be asked. Same constraint as
+  # container_state_fields: 'docker info -f' writes a bare newline to STDOUT
+  # before it fails, so an inline '|| printf unknown' fallback yields
+  # "<newline>unknown" - an unusable path for df, and a manifest field that
+  # starts with a newline.
+  local d
+  d=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) || true
+  printf '%s' "${d:-$1}"
 }
 
 storage_probe_path() {
@@ -332,7 +367,13 @@ install_base_packages() {
 
 # --- 7. Docker Engine --------------------------------------------------
 write_file() {
-  # write_file <path> <mode>; content on stdin. Returns 0 when the file changed.
+  # write_file <path> <mode>; content on stdin. Returns 0 when the file changed,
+  # 1 when it was already current, and dies when it could not be written.
+  # Every caller tests the return value ('if', '|| true', '|| log'), and bash
+  # disables errexit AND the ERR trap for the whole of a tested command - so an
+  # unhandled 'install' failure would fall through to 'return 0' and be read as
+  # "changed". Callers must NOT pipe into this function: 'die' would then exit
+  # only the pipeline's subshell and the caller would read rc 1 as "unchanged".
   local path=$1 mode=$2 tmp
   tmp=$(mktemp)
   cat >"$tmp"
@@ -340,7 +381,7 @@ write_file() {
     rm -f "$tmp"
     return 1
   fi
-  install -D -m "$mode" "$tmp" "$path"
+  install -D -m "$mode" "$tmp" "$path" || { rm -f "$tmp"; die "cannot write $path"; }
   rm -f "$tmp"
   return 0
 }
@@ -357,6 +398,25 @@ install_docker() {
   tmp=$(mktemp)
   curl -fsSL --retry 3 --retry-delay 2 https://download.docker.com/linux/ubuntu/gpg -o "$tmp"
   [[ -s $tmp ]] || { rm -f "$tmp"; die "downloaded Docker signing key is empty"; }
+  # TLS alone authenticates the host, not the key. Pin Docker's published primary
+  # fingerprint so a mirror, proxy or captive portal cannot substitute a key that
+  # would then sign every package apt installs below. The pin is a substitution
+  # tripwire, not out-of-band trust: Docker publishes no fingerprint outside the
+  # key itself. GNUPGHOME is a throwaway directory - 'gpg --show-keys' otherwise
+  # creates /root/.gnupg on the host.
+  local fpr="" gnupghome
+  gnupghome=$(mktemp -d)
+  # '|| true': gpg exits 2 on non-key data, and under pipefail this ASSIGNMENT
+  # from a pipeline trips the ERR trap before the die below can name the real
+  # problem (a substituted key, or a captive-portal page served instead of it),
+  # leaving $tmp and $gnupghome behind.
+  fpr=$( { GNUPGHOME="$gnupghome" gpg --batch --no-options --show-keys --with-colons "$tmp" 2>/dev/null || true; } |
+    awk -F: '$1 == "fpr" {print $10; exit}')
+  rm -rf "$gnupghome"
+  [[ $fpr == "$DOCKER_KEY_FPR" ]] || {
+    rm -f "$tmp"
+    die "the Docker apt signing key from download.docker.com has fingerprint '${fpr:-<unparseable>}', not the expected $DOCKER_KEY_FPR. Refusing to trust it: apt would accept anything it signs"
+  }
   # Docker's current instructions ship the ASCII-armoured key directly; no
   # gpg --dearmor step, which was the non-idempotent part of the old script.
   install -m 0644 "$tmp" "$DOCKER_KEYRING"
@@ -367,8 +427,12 @@ install_docker() {
   rm -f /etc/apt/keyrings/docker.gpg
   rm -f /etc/apt/sources.list.d/docker.sources
 
-  printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/ubuntu %s stable\n' \
-    "$arch" "$DOCKER_KEYRING" "$codename" | write_file "$DOCKER_APT_LIST" 0644 || true
+  # Here-string, not a pipe: write_file dies on a failed install, and from a
+  # pipeline that die would exit only the subshell (see write_file).
+  local apt_line
+  printf -v apt_line 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/ubuntu %s stable' \
+    "$arch" "$DOCKER_KEYRING" "$codename"
+  write_file "$DOCKER_APT_LIST" 0644 <<<"$apt_line" || true
 
   apt_update_retry
   apt_get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -406,7 +470,9 @@ JSON
       die "$DOCKER_DAEMON_JSON is not valid JSON; fix it or move it aside and re-run (this script merges into it, it does not replace it)"
   fi
   merged=$(jq -S --argjson desired "$desired" '. * $desired' <<<"$current")
-  if printf '%s\n' "$merged" | write_file "$DOCKER_DAEMON_JSON" 0644
+  # Here-string, not a pipe (see write_file): '<<<' appends the same trailing
+  # newline printf '%s\n' did, so the idempotence compare is unchanged.
+  if write_file "$DOCKER_DAEMON_JSON" 0644 <<<"$merged"
   then
     log "daemon.json changed; restarting docker"
     systemctl restart docker
@@ -468,6 +534,11 @@ apply_docker_user_chain() {
   local ipt=$1 pub_if=$2
   "$ipt" -N DOCKER-USER 2>/dev/null || true
   "$ipt" -N "$FW_CHAIN" 2>/dev/null || true
+  # Flush-and-refill leaves the chain empty for the few milliseconds it takes to
+  # re-append the four rules below, during which DOCKER-USER returns and
+  # published ports are unfiltered. Accepted: a build-new-chain-and-swap dance
+  # needs a second chain plus a jump rewrite for a sub-second window on a host
+  # that is being re-provisioned anyway. Re-run only when that is acceptable.
   "$ipt" -F "$FW_CHAIN"
   "$ipt" -A "$FW_CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
   "$ipt" -A "$FW_CHAIN" ! -i "$pub_if" -j RETURN
@@ -495,13 +566,28 @@ configure_firewall() {
   step "Configuring ufw and the DOCKER-USER chain"
   ufw --force default deny incoming
   ufw --force default allow outgoing
-  local ssh_ports=() port
+  local ssh_ports=() allowed=() port
   mapfile -t ssh_ports < <(sshd_listen_ports)
   for port in "${ssh_ports[@]}"; do
-    [[ $port =~ ^[0-9]+$ ]] || continue
+    # Range-checked, not merely numeric: an exotic ssh.socket listener can leave
+    # a non-port token (a unix path containing ':') or an out-of-range vsock port
+    # in the list, and 'ufw allow 0/tcp' aborts the run one line before enable.
+    if ! [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+      warn "ignoring '$port' from the ssh listener probe: not a TCP port number"
+      continue
+    fi
     ufw allow "$port/tcp"
+    allowed+=("$port")
   done
-  log "ufw allows sshd port(s): ${ssh_ports[*]}"
+  # The fallback in sshd_listen_ports only fires when BOTH oracles are silent. If
+  # they spoke but every token was unusable, no SSH rule exists at all and the
+  # 'ufw --force enable' below would lock out new connections.
+  if (( ${#allowed[@]} == 0 )); then
+    warn "the ssh listener probe yielded no usable port (${ssh_ports[*]:-none}); falling back to tcp/22 so 'ufw --force enable' cannot lock this host out"
+    ufw allow 22/tcp
+    allowed=(22)
+  fi
+  log "ufw allows sshd port(s): ${allowed[*]}"
   ufw allow 80/tcp
   ufw allow 443/tcp
   ufw --force enable
@@ -607,7 +693,12 @@ mark_safe_directory() {
 detect_in_checkout() {
   # Echo the checkout root when this script is running from inside one.
   local top
-  top=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null) || return 1
+  # safe.directory is bypassed for this probe only: root reading a checkout owned
+  # by the login user is the normal 'sudo ./infrastructure/scripts/...' case, and
+  # git's dubious-ownership refusal (rc 128) is indistinguishable from "not a
+  # checkout" here - it would silently divert the run to a managed clone of
+  # origin/$BRANCH. mark_safe_directory below registers the exception properly.
+  top=$(git -c safe.directory='*' -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null) || return 1
   [[ -f "$top/infrastructure/scripts/$SCRIPT_NAME" ]] || return 1
   printf '%s' "$top"
 }
@@ -618,7 +709,8 @@ resolve_repo() {
   # An existing checkout is deployed exactly as it stands: the operator asked
   # for that tree, and silently resetting it to origin/$BRANCH would deploy
   # something other than what they are looking at (NEW-4).
-  if [[ -n $REPO_DIR && -d "$REPO_DIR/.git" ]]; then
+  # -e, not -d: in a linked worktree or a submodule .git is a 'gitdir:' FILE.
+  if [[ -n $REPO_DIR && -e "$REPO_DIR/.git" ]]; then
     REPO_DIR=$(cd -- "$REPO_DIR" && pwd)
     mark_safe_directory "$REPO_DIR"
     log "deploying the existing checkout at $REPO_DIR in place (no clone, no fetch)"
@@ -638,12 +730,18 @@ resolve_repo() {
   REPO_DIR=$(cd -- "$REPO_DIR" && pwd)
   mark_safe_directory "$REPO_DIR"
   log "cloning $GIT_REPO ($BRANCH) into $REPO_DIR"
-  if [[ -d "$REPO_DIR/.git" ]]; then
+  if [[ -e "$REPO_DIR/.git" ]]; then
     git -C "$REPO_DIR" remote set-url origin "$GIT_REPO"
     git -C "$REPO_DIR" fetch --prune origin "$BRANCH"
     git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
   else
     rmdir "$REPO_DIR" 2>/dev/null || true
+    # The rmdir above only removes it when it is empty. Naming the path here
+    # matters most when REPO_DIR fell through to the default: the operator never
+    # typed /opt/core-banking and git's own refusal would be the first mention.
+    if [[ -d $REPO_DIR ]]; then
+      die "$REPO_DIR exists, is not empty and is not a git checkout, so it cannot be used as a managed clone target. Either empty it, point --repo-dir at an existing checkout, or choose another --repo-dir"
+    fi
     git clone --branch "$BRANCH" --single-branch "$GIT_REPO" "$REPO_DIR"
   fi
   log "checkout at $(git -C "$REPO_DIR" rev-parse --short HEAD) on $BRANCH"
@@ -756,11 +854,14 @@ write_evidence_manifest() {
   err_file=$(mktemp)
   images_file=$(mktemp)
   # Both gates below run Compose from the compose directory with RELATIVE -f
-  # paths. 'config' resolves a relative 'env_file:' against the invoking
-  # process's cwd, not the project directory, so from any other cwd (typically
-  # the repo root) a perfectly startable stack fails here with the misleading
-  # "the profile overlay is not valid". The cd also keeps the hash
-  # path-independent. '--project-directory' does NOT fix this - measured.
+  # paths. Under '--no-path-resolution' (the hash gate) Compose stops resolving
+  # 'env_file:' against the project directory and reads it relative to the
+  # invoking process's cwd, so from any other cwd (typically the repo root) a
+  # perfectly startable stack fails here with the misleading "the profile
+  # overlay is not valid". '--project-directory' does NOT fix it; only the cd
+  # does - measured on Compose v5.5.0 (docker-compose-plugin, Ubuntu 24.04).
+  # Plain 'config' (the digest gate) is cwd-independent; it shares the cd only
+  # so both gates see one identical invocation shape.
   compose_dir=$(dirname -- "$COMPOSE_BASE")
   base_name=$(basename -- "$COMPOSE_BASE")
   overlay_name=$(basename -- "$COMPOSE_OVERLAY")
@@ -834,11 +935,11 @@ and re-run."
     --argjson images "$images" \
     --arg kernel "$(uname -srmo)" \
     --arg os "$os_name" \
-    --arg cpu_model "$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)" \
+    --arg cpu_model "$(cpu_model)" \
     --argjson nproc "$(nproc)" \
     --argjson mem_total_kib "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" \
-    --arg docker_root_dir "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || printf unknown)" \
-    --arg disk_avail "$(df -Ph "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || storage_probe_path)" | awk 'NR==2 {print $4}')" \
+    --arg docker_root_dir "$(docker_root_dir unknown)" \
+    --arg disk_avail "$(df -Ph "$(docker_root_dir "$(storage_probe_path)")" | awk 'NR==2 {print $4}')" \
     --arg cgroup "$([[ -f /sys/fs/cgroup/cgroup.controllers ]] && printf v2 || printf v1)" \
     --arg docker "$(docker --version)" \
     --arg compose "$(docker compose version --short 2>/dev/null || printf unknown)" \
@@ -996,8 +1097,14 @@ start_profile() {
 # --- 18. Post-check ----------------------------------------------------
 container_state_fields() {
   # '<status>|<restarting>|<restart count>|<exit code>' for one container.
-  docker inspect -f '{{.State.Status}}|{{.State.Restarting}}|{{.RestartCount}}|{{.State.ExitCode}}' "$1" 2>/dev/null ||
-    printf 'missing|false|0|0'
+  # 'docker inspect -f' writes a bare newline to STDOUT before it fails, so an
+  # inline '|| printf missing|...' fallback is APPENDED to that newline and the
+  # caller's 'read' - which takes the first line only - sees an empty record.
+  # Capture, then replace: the sentinel must be the whole value.
+  local out
+  out=$(docker inspect -f '{{.State.Status}}|{{.State.Restarting}}|{{.RestartCount}}|{{.State.ExitCode}}' "$1" 2>/dev/null) || true
+  [[ -n $out ]] || out='missing|false|0|0'
+  printf '%s' "$out"
 }
 
 post_check() {
@@ -1036,7 +1143,13 @@ post_check() {
   for name in "${names[@]}"; do
     IFS='|' read -r pstatus prestarting prestarts pcode <<<"${sample_a[$name]}"
     IFS='|' read -r status restarting restarts code <<<"$(container_state_fields "$name")"
-    if [[ $restarting == true || $prestarting == true ]]; then
+    if [[ $status == missing || $pstatus == missing ]]; then
+      # container_state_fields falls back to 'missing|false|0|0' when 'docker
+      # inspect' fails. Those placeholders match no failure case below, so
+      # without this branch a container removed (or a daemon lost) between the
+      # name listing and the sample passes the post-check silently.
+      failures+=("$name: 'docker inspect' could not read it (state $pstatus -> $status); it was removed, or dockerd became unreachable, during the post-check")
+    elif [[ $restarting == true || $prestarting == true ]]; then
       failures+=("$name: crash-looping (restarting; RestartCount $prestarts -> $restarts)")
     elif [[ $restarts =~ ^[0-9]+$ && $prestarts =~ ^[0-9]+$ ]] && (( restarts > prestarts )); then
       failures+=("$name: crash-looping (RestartCount rose $prestarts -> $restarts over ${CRASHLOOP_SAMPLE_SECONDS}s)")
