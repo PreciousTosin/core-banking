@@ -31,6 +31,14 @@ import org.junit.jupiter.api.io.TempDir;
 import org.w3c.dom.Element;
 
 class PackagingContractTest {
+    private static final String MODULE_REPOSITORY_PATH = "services/funds-core";
+    private static final Set<String> CONTRACT_INPUTS = Set.of(
+        "pom.xml",
+        "src/main/resources/application.properties",
+        "Dockerfile.jvm",
+        "README.md",
+        "docs/health-contract.md",
+        "scripts/prod-runtime-smoke.sh");
     private static final Path MODULE = resolveModuleRoot(actualCodeSource());
     private static final Map<String, String> CONTROLLED_PROPERTIES = Map.ofEntries(
         Map.entry("quarkus.datasource.db-kind", "postgresql"),
@@ -94,7 +102,7 @@ class PackagingContractTest {
         var failure = assertThrows(IllegalStateException.class,
             () -> resolveModuleRoot(decoyModule.resolve("target/test-classes").toUri()));
 
-        assertTrue(failure.getMessage().contains("tracked funds-core module"), failure::getMessage);
+        assertTrue(failure.getMessage().contains("exact Git-tracked path"), failure::getMessage);
     }
 
     @Test
@@ -107,7 +115,7 @@ class PackagingContractTest {
             Files.createSymbolicLink(decoySentinel, MODULE.resolve(sentinel));
             try {
                 var failure = assertThrows(IllegalStateException.class,
-                    () -> resolveModuleRoot(decoyModule.resolve("target/test-classes").toUri()));
+                    () -> resolveContractInput(decoyModule, sentinel));
 
                 assertTrue(failure.getMessage().contains(sentinel), failure::getMessage);
                 assertTrue(failure.getMessage().contains("non-symbolic-link regular file"), failure::getMessage);
@@ -127,19 +135,112 @@ class PackagingContractTest {
         Files.createSymbolicLink(resources, MODULE.resolve("src/main/resources"));
         try {
             var failure = assertThrows(IllegalStateException.class,
-                () -> resolveModuleRoot(decoyModule.resolve("target/test-classes").toUri()));
+                () -> resolveContractInput(decoyModule, "src/main/resources/application.properties"));
 
             assertTrue(failure.getMessage().contains("application.properties"), failure::getMessage);
-            assertTrue(failure.getMessage().contains("canonical path"), failure::getMessage);
+            assertTrue(failure.getMessage().contains("symlink-free canonical path"), failure::getMessage);
         } finally {
             Files.deleteIfExists(resources);
         }
     }
 
     @Test
-    void wrongPomIdentityFailsBeforeRepositoryValidation(@TempDir Path temp) throws Exception {
-        Path decoyModule = temp.resolve("wrong-identity");
+    void nonSentinelContractInputSymlinksFailBeforeContentOrMetadataAccess(@TempDir Path temp) throws Exception {
+        for (String relativePath : List.of(
+            "Dockerfile.jvm",
+            "README.md",
+            "docs/health-contract.md",
+            "scripts/prod-runtime-smoke.sh")) {
+            Path decoyModule = Files.createDirectory(temp.resolve(relativePath.replace('/', '-') + "-decoy"));
+            Path decoyInput = decoyModule.resolve(relativePath);
+            Files.createDirectories(decoyInput.getParent());
+            Files.createSymbolicLink(decoyInput, MODULE.resolve(relativePath));
+            try {
+                var failure = assertThrows(IllegalStateException.class,
+                    () -> {
+                        if ("scripts/prod-runtime-smoke.sh".equals(relativePath)) {
+                            isExecutableContractInput(decoyModule, relativePath);
+                        } else {
+                            read(decoyModule, relativePath);
+                        }
+                    });
+
+                assertTrue(failure.getMessage().contains(relativePath), failure::getMessage);
+                assertTrue(failure.getMessage().contains("non-symbolic-link regular file"), failure::getMessage);
+            } finally {
+                Files.deleteIfExists(decoyInput);
+            }
+        }
+    }
+
+    @Test
+    void nestedContractInputsRejectSymlinkedParentDirectoriesBeforeRepositoryValidation(@TempDir Path temp)
+        throws Exception {
+        for (String relativePath : List.of("docs/health-contract.md", "scripts/prod-runtime-smoke.sh")) {
+            Path decoyModule = Files.createDirectory(temp.resolve(relativePath.replace('/', '-') + "-parent-decoy"));
+            Path externalParent = MODULE.resolve(relativePath).getParent();
+            Path linkedParent = decoyModule.resolve(Path.of(relativePath).getParent());
+            Files.createDirectories(linkedParent.getParent());
+            Files.createSymbolicLink(linkedParent, externalParent);
+            try {
+                var failure = assertThrows(IllegalStateException.class,
+                    () -> {
+                        if ("scripts/prod-runtime-smoke.sh".equals(relativePath)) {
+                            isExecutableContractInput(decoyModule, relativePath);
+                        } else {
+                            read(decoyModule, relativePath);
+                        }
+                    });
+
+                assertTrue(failure.getMessage().contains(relativePath), failure::getMessage);
+                assertTrue(failure.getMessage().contains("symlink-free canonical path"), failure::getMessage);
+            } finally {
+                Files.deleteIfExists(linkedParent);
+            }
+        }
+    }
+
+    @Test
+    void exactTrackedContractPathIsAcceptedInAnIsolatedRepository(@TempDir Path temp) throws Exception {
+        Path repository = Files.createDirectory(temp.resolve("tracked-repository"));
+        Path module = repository.resolve("services/funds-core");
+        Path dockerfile = writeContractFixture(module, "Dockerfile.jvm", "FROM scratch\n");
+        initializeTrackedRepository(repository, "services/funds-core/Dockerfile.jvm");
+
+        assertEquals(dockerfile.toRealPath(), resolveContractInput(module, "Dockerfile.jvm"));
+    }
+
+    @Test
+    void untrackedContractPathFailsClosedInAnIsolatedRepository(@TempDir Path temp) throws Exception {
+        Path repository = Files.createDirectory(temp.resolve("untracked-repository"));
+        Path module = repository.resolve("services/funds-core");
+        writeContractFixture(module, "Dockerfile.jvm", "FROM scratch\n");
+        writeContractFixture(module, "README.md", "untracked\n");
+        initializeTrackedRepository(repository, "services/funds-core/Dockerfile.jvm");
+
+        var failure = assertThrows(IllegalStateException.class,
+            () -> resolveContractInput(module, "README.md"));
+
+        assertTrue(failure.getMessage().contains("README.md"), failure::getMessage);
+        assertTrue(failure.getMessage().contains("exact Git-tracked path"), failure::getMessage);
+    }
+
+    @Test
+    void nonExactRelativeContractPathIsRejectedBeforeFilesystemAccess(@TempDir Path temp) {
+        var failure = assertThrows(IllegalStateException.class,
+            () -> resolveContractInput(temp, "./Dockerfile.jvm"));
+
+        assertTrue(failure.getMessage().contains("exact repository-relative spelling"), failure::getMessage);
+    }
+
+    @Test
+    void wrongTrackedPomIdentityFailsClosed(@TempDir Path temp) throws Exception {
+        Path repository = Files.createDirectory(temp.resolve("wrong-identity-repository"));
+        Path decoyModule = repository.resolve(MODULE_REPOSITORY_PATH);
         writeDecoyModule(decoyModule, "example.decoy", "funds-core");
+        initializeTrackedRepository(repository,
+            "services/funds-core/pom.xml",
+            "services/funds-core/src/main/resources/application.properties");
 
         var failure = assertThrows(IllegalStateException.class,
             () -> resolveModuleRoot(decoyModule.resolve("target/test-classes").toUri()));
@@ -148,9 +249,13 @@ class PackagingContractTest {
     }
 
     @Test
-    void duplicatePomIdentityFailsBeforeRepositoryValidation(@TempDir Path temp) throws Exception {
-        Path decoyModule = temp.resolve("duplicate-identity");
+    void duplicateTrackedPomIdentityFailsClosed(@TempDir Path temp) throws Exception {
+        Path repository = Files.createDirectory(temp.resolve("duplicate-identity-repository"));
+        Path decoyModule = repository.resolve(MODULE_REPOSITORY_PATH);
         writeDecoyModule(decoyModule, "com.corebanking", "funds-core");
+        initializeTrackedRepository(repository,
+            "services/funds-core/pom.xml",
+            "services/funds-core/src/main/resources/application.properties");
         Path pom = decoyModule.resolve("pom.xml");
         Files.writeString(pom, Files.readString(pom).replace(
             "<artifactId>funds-core</artifactId>",
@@ -164,7 +269,7 @@ class PackagingContractTest {
 
     @Test
     void productionConfigurationHasOneEffectiveAssignmentForEveryBound() throws Exception {
-        String source = read("src/main/resources/application.properties");
+        String source = read(MODULE, "src/main/resources/application.properties");
         var properties = new Properties();
         properties.load(new StringReader(source));
         var assignments = assignmentCounts(source);
@@ -179,7 +284,7 @@ class PackagingContractTest {
 
     @Test
     void semanticAssignmentCountingDetectsEscapedAndContinuedDuplicateKeys() throws IOException {
-        String source = read("src/main/resources/application.properties");
+        String source = read(MODULE, "src/main/resources/application.properties");
         String escapedDuplicate = source + "\nquarkus.datasource.jdbc.max\\u002dsize=8\n";
         String continuedDuplicate = source + "\nquarkus.datasource.jdbc.max\\\n-size=8\n";
 
@@ -189,12 +294,12 @@ class PackagingContractTest {
 
     @Test
     void pomBindsExactlyOneQuarkusBuildGoal() throws Exception {
-        assertPomContract(read("pom.xml"));
+        assertPomContract(read(MODULE, "pom.xml"));
     }
 
     @Test
     void nestedPomConfigurationGoalsDoNotCountAsLifecycleBindings() throws Exception {
-        String pom = read("pom.xml");
+        String pom = read(MODULE, "pom.xml");
         String mutated = pom.replace("<extensions>true</extensions>", """
             <extensions>true</extensions>
             <configuration>
@@ -226,7 +331,7 @@ class PackagingContractTest {
 
     @Test
     void dockerfileIsTheCompletePinnedNonRootRuntimeContract() throws IOException {
-        List<String> directives = read("Dockerfile.jvm").lines()
+        List<String> directives = read(MODULE, "Dockerfile.jvm").lines()
             .map(String::trim)
             .filter(line -> !line.isEmpty() && !line.startsWith("#"))
             .toList();
@@ -246,8 +351,8 @@ class PackagingContractTest {
 
     @Test
     void documentationHasUniqueRequiredSectionsCoverageAndExclusions() throws IOException {
-        String readme = read("README.md");
-        String health = read("docs/health-contract.md");
+        String readme = read(MODULE, "README.md");
+        String health = read(MODULE, "docs/health-contract.md");
 
         assertUniqueHeadings(readme, Set.of("Reading the accounting model", "Identity and product foundations",
             "Database roles and startup", "Build and verification", "Memory boundary",
@@ -275,10 +380,8 @@ class PackagingContractTest {
 
     @Test
     void documentedRuntimeSmokeIsExecutable() throws IOException {
-        Path smoke = MODULE.resolve("scripts/prod-runtime-smoke.sh");
-        assertTrue(Files.isRegularFile(smoke));
-        assertTrue(Files.isExecutable(smoke));
-        assertEquals(1, section(read("README.md"), "Build and verification").lines()
+        assertTrue(isExecutableContractInput(MODULE, "scripts/prod-runtime-smoke.sh"));
+        assertEquals(1, section(read(MODULE, "README.md"), "Build and verification").lines()
             .filter(line -> line.equals("./scripts/prod-runtime-smoke.sh core-banking/funds-core:accounting-kernel"))
             .count());
     }
@@ -345,8 +448,72 @@ class PackagingContractTest {
         return markdown.substring(start, end < 0 ? markdown.length() : end);
     }
 
-    private static String read(String relativePath) throws IOException {
-        return Files.readString(MODULE.resolve(relativePath));
+    private static String read(Path module, String relativePath) throws IOException {
+        return Files.readString(resolveContractInput(module, relativePath), StandardCharsets.UTF_8);
+    }
+
+    private static boolean isExecutableContractInput(Path module, String relativePath) {
+        return Files.isExecutable(resolveContractInput(module, relativePath));
+    }
+
+    private static Path resolveContractInput(Path module, String relativePath) {
+        if (!CONTRACT_INPUTS.contains(relativePath)) {
+            throw new IllegalStateException("Contract input must use its exact repository-relative spelling");
+        }
+
+        Path relative = Path.of(relativePath);
+        String normalizedRelative = relative.normalize().toString().replace('\\', '/');
+        if (relative.isAbsolute() || !relativePath.equals(normalizedRelative)) {
+            throw new IllegalStateException("Contract input must use its exact repository-relative spelling");
+        }
+
+        Path lexicalModule = module.toAbsolutePath().normalize();
+        final Path canonicalModule;
+        try {
+            canonicalModule = lexicalModule.toRealPath();
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalStateException("Contract module must be a canonical filesystem directory");
+        }
+        if (!canonicalModule.equals(lexicalModule)
+            || Files.isSymbolicLink(lexicalModule)
+            || !Files.isDirectory(lexicalModule, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalStateException("Contract module must be a symlink-free canonical filesystem directory");
+        }
+
+        Path candidate = lexicalModule.resolve(relative).normalize();
+        if (!candidate.startsWith(lexicalModule)) {
+            throw new IllegalStateException(relativePath + " must remain beneath the canonical module root");
+        }
+
+        Path current = lexicalModule;
+        for (Path segment : relative) {
+            current = current.resolve(segment);
+            if (Files.isSymbolicLink(current)) {
+                if (current.equals(candidate)) {
+                    throw new IllegalStateException(relativePath
+                        + " must be a non-symbolic-link regular file");
+                }
+                throw new IllegalStateException(relativePath
+                    + " must have a symlink-free canonical path beneath the module root");
+            }
+        }
+        if (!Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalStateException(relativePath + " must be a non-symbolic-link regular file");
+        }
+
+        final Path canonicalInput;
+        try {
+            canonicalInput = candidate.toRealPath();
+        } catch (IOException e) {
+            throw new IllegalStateException(relativePath + " could not be canonicalized");
+        }
+        if (!canonicalInput.equals(candidate) || !canonicalInput.startsWith(canonicalModule)) {
+            throw new IllegalStateException(relativePath
+                + " must have a symlink-free canonical path beneath the module root");
+        }
+
+        requireExactTrackedContractPath(canonicalModule, canonicalInput, relativePath);
+        return canonicalInput;
     }
 
     private static URI actualCodeSource() {
@@ -361,7 +528,7 @@ class PackagingContractTest {
         Path codeSource = Path.of(actualCodeSource()).toRealPath();
         String repositoryOutput = runBoundedGit(codeSource, "rev-parse", "--show-toplevel");
         if (repositoryOutput.lines().count() != 1) {
-            throw new IllegalStateException("Git returned an ambiguous repository root: " + repositoryOutput);
+            throw new IllegalStateException("Git returned an ambiguous repository root");
         }
         Path repository = Path.of(repositoryOutput).toRealPath();
         String trackedPom = runBoundedGit(repository, "ls-files", "--error-unmatch", "--",
@@ -395,17 +562,16 @@ class PackagingContractTest {
                 process = processBuilder.start();
                 if (!process.waitFor(5, TimeUnit.SECONDS)) {
                     terminateProcess(process);
-                    throw new IllegalStateException("Git command exceeded five seconds: "
-                        + String.join(" ", command) + "; output: "
-                        + readBoundedProcessOutput(outputFile.path()));
+                    throw new IllegalStateException("Git trust command exceeded five seconds");
                 }
                 long outputSize = Files.size(outputFile.path());
-                String output = readBoundedProcessOutput(outputFile.path());
-                if (process.exitValue() != 0 || outputSize > 16_384) {
-                    throw new IllegalStateException("Git command failed (exit " + process.exitValue() + "): "
-                        + String.join(" ", command) + "; output: " + output);
+                if (outputSize > 16_384) {
+                    throw new IllegalStateException("Git trust command output exceeded the 16384-byte read cap");
                 }
-                return output;
+                if (process.exitValue() != 0) {
+                    throw new IllegalStateException("Git trust command failed with exit " + process.exitValue());
+                }
+                return readBoundedProcessOutput(outputFile.path());
             } catch (InterruptedException e) {
                 if (process != null) {
                     try {
@@ -415,7 +581,7 @@ class PackagingContractTest {
                     }
                 }
                 Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted while waiting for Git: " + String.join(" ", command), e);
+                throw new IllegalStateException("Interrupted while waiting for Git trust validation", e);
             }
         }
     }
@@ -451,52 +617,76 @@ class PackagingContractTest {
         Files.writeString(module.resolve("src/main/resources/application.properties"), "decoy=true\n");
     }
 
+    private static Path writeContractFixture(Path module, String relativePath, String content) throws IOException {
+        Path fixture = module.resolve(relativePath);
+        Files.createDirectories(fixture.getParent());
+        Files.writeString(fixture, content);
+        return fixture;
+    }
+
+    private static void initializeTrackedRepository(Path repository, String... trackedPaths) throws IOException {
+        runBoundedGit(repository, "init", "--quiet");
+        var arguments = new ArrayList<>(List.of("add", "--"));
+        arguments.addAll(List.of(trackedPaths));
+        runBoundedGit(repository, arguments.toArray(String[]::new));
+    }
+
     private static Path resolveModuleRoot(URI codeSource) {
         Path testClasses;
         try {
             testClasses = Path.of(codeSource).toRealPath();
         } catch (IOException | RuntimeException e) {
-            throw new IllegalStateException("Packaging-test code source is not a canonical filesystem path", e);
+            throw new IllegalStateException("Packaging-test code source is not a canonical filesystem path");
         }
         Path target = testClasses.getParent();
         if (!"test-classes".equals(fileName(testClasses)) || target == null || !"target".equals(fileName(target))) {
-            throw new IllegalStateException("Unexpected packaging-test code-source layout: " + testClasses);
+            throw new IllegalStateException("Unexpected packaging-test code-source layout");
         }
         Path module;
         try {
             module = target.getParent() == null ? null : target.getParent().toRealPath();
         } catch (IOException e) {
-            throw new IllegalStateException("Packaging-test module root is not canonical", e);
+            throw new IllegalStateException("Packaging-test module root is not canonical");
         }
         if (module == null) {
             throw new IllegalStateException("Packaging-test code source did not resolve the funds-core module");
         }
 
-        Path pom = requireCanonicalSentinel(module, "pom.xml");
-        Path applicationProperties = requireCanonicalSentinel(module,
-            "src/main/resources/application.properties");
+        Path pom = resolveContractInput(module, "pom.xml");
+        resolveContractInput(module, "src/main/resources/application.properties");
         requireFundsCorePomIdentity(pom);
-        requireTrackedFundsCoreModule(module, pom, applicationProperties);
         return module;
     }
 
-    private static Path requireCanonicalSentinel(Path module, String relativePath) {
-        Path candidate = module.resolve(relativePath).toAbsolutePath().normalize();
-        if (!candidate.startsWith(module)
-            || Files.isSymbolicLink(candidate)
-            || !Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)) {
-            throw new IllegalStateException(relativePath
-                + " must be a non-symbolic-link regular file beneath the canonical module root");
-        }
+    private static void requireExactTrackedContractPath(
+        Path canonicalModule,
+        Path canonicalInput,
+        String relativePath
+    ) {
         try {
-            Path canonical = candidate.toRealPath();
-            if (!canonical.equals(candidate) || !canonical.startsWith(module)) {
-                throw new IllegalStateException(relativePath
-                    + " must have a canonical path beneath the canonical module root");
+            String repositoryOutput = runBoundedGit(canonicalModule, "rev-parse", "--show-toplevel");
+            if (repositoryOutput.lines().count() != 1) {
+                throw new IllegalStateException("Git returned an ambiguous repository root");
             }
-            return canonical;
-        } catch (IOException e) {
-            throw new IllegalStateException(relativePath + " could not be canonicalized", e);
+            Path repository = Path.of(repositoryOutput).toRealPath();
+            Path expectedModule = repository.resolve(MODULE_REPOSITORY_PATH).toRealPath();
+            if (!expectedModule.equals(canonicalModule) || !canonicalModule.startsWith(repository)) {
+                throw new IllegalStateException("Module is not at the required repository path");
+            }
+
+            String expectedTrackedPath = MODULE_REPOSITORY_PATH + "/" + relativePath;
+            String actualTrackedPath = repository.relativize(canonicalInput).toString().replace('\\', '/');
+            if (!expectedTrackedPath.equals(actualTrackedPath)) {
+                throw new IllegalStateException("Contract input has the wrong repository path");
+            }
+            String trackedPath = runBoundedGit(repository,
+                "ls-files", "--error-unmatch", "--", expectedTrackedPath);
+            if (!expectedTrackedPath.equals(trackedPath)) {
+                throw new IllegalStateException("Git returned an unexpected tracked path");
+            }
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalStateException(relativePath
+                + " must be the exact Git-tracked path in services/funds-core");
         }
     }
 
@@ -524,38 +714,7 @@ class PackagingContractTest {
         } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
-            throw new IllegalStateException("pom.xml must be a parseable com.corebanking:funds-core project", e);
-        }
-    }
-
-    private static void requireTrackedFundsCoreModule(Path module, Path pom, Path applicationProperties) {
-        try {
-            String repositoryOutput = runBoundedGit(module, "rev-parse", "--show-toplevel");
-            if (repositoryOutput.lines().count() != 1) {
-                throw new IllegalStateException("Git returned an ambiguous repository root");
-            }
-            Path repository = Path.of(repositoryOutput).toRealPath();
-            Path expectedModule = repository.resolve("services/funds-core").toRealPath();
-            if (!expectedModule.equals(module)) {
-                throw new IllegalStateException("Module is not at services/funds-core in its Git worktree");
-            }
-            requireTrackedPath(repository, pom, "services/funds-core/pom.xml");
-            requireTrackedPath(repository, applicationProperties,
-                "services/funds-core/src/main/resources/application.properties");
-        } catch (Exception e) {
-            throw new IllegalStateException("Packaging-test code source is not the tracked funds-core module", e);
-        }
-    }
-
-    private static void requireTrackedPath(Path repository, Path canonicalFile, String expectedRelativePath)
-        throws IOException {
-        String actualRelativePath = repository.relativize(canonicalFile).toString().replace('\\', '/');
-        if (!expectedRelativePath.equals(actualRelativePath)) {
-            throw new IllegalStateException("Canonical sentinel has the wrong repository path: " + actualRelativePath);
-        }
-        String trackedPath = runBoundedGit(repository, "ls-files", "--error-unmatch", "--", expectedRelativePath);
-        if (!expectedRelativePath.equals(trackedPath)) {
-            throw new IllegalStateException("Git returned an unexpected tracked path: " + trackedPath);
+            throw new IllegalStateException("pom.xml must be a parseable com.corebanking:funds-core project");
         }
     }
 
