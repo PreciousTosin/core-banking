@@ -201,3 +201,62 @@ The final Maven output contained no `WARN`/`WARNING` lines, and the Surefire fai
 rg -n 'try \(ExecutorService|executor\.close\(' src/test/java/com/corebanking/funds/application/PostingConcurrencyIT.java
 rg -n 'Thread\.sleep|pg_sleep|CyclicBarrier' src/test/java/com/corebanking/funds/application/PostingConcurrencyIT.java
 ```
+
+## Review fix round 2: preserve primary failures during cleanup
+
+Both executor lifecycles now capture a primary `Exception` or `Error` from the test body before entering `finally`. The bounded cleanup helper receives that throwable. If cancellation, `shutdownNow()`, or bounded termination then fails, cleanup is attached to the original throwable with `addSuppressed`; cleanup is thrown directly only when the body had no failure. The `InterruptedException` branch still restores interrupt status before constructing the cleanup assertion, whether that assertion is direct or suppressed.
+
+This is applied consistently to the reverse-order 100-journal executor and the same-key race executor. Future retention, cancellation, immediate shutdown, and the 10-second termination bound from fix round 1 remain unchanged.
+
+### Fix-round-2 RED evidence
+
+The dual-failure lifecycle assertion was added first. Before the primary-aware overload existed, focused compilation failed as intended:
+
+```text
+[ERROR] PostingConcurrencyIT.java:[272,21] method shutdownExecutor cannot be applied to given types
+  required: ExecutorService,List<? extends Future<?>>,String
+  found:    ExecutorService,List<Object>,String,Throwable
+  reason: actual and formal argument lists differ in length
+[INFO] BUILD FAILURE
+```
+
+### Dual-failure lifecycle proof
+
+The new bounded test throws a specific `IllegalStateException("primary body failure")` from the body while an executor proxy makes `awaitTermination` report an immediate cleanup timeout. It proves:
+
+- the exact original throwable object remains primary;
+- its original message is unchanged;
+- exactly one cleanup failure is suppressed;
+- the suppressed failure is the expected `AssertionError` with the executor-specific timeout message.
+
+The proxy returns the timeout result immediately and delegates `shutdownNow()` to a real executor, so the assertion exercises the same timeout-failure branch without spending 10 seconds; the production 10-second bound remains unchanged. Its own fallback termination is separately bounded. Mutation review: removing primary capture, omitting the fourth cleanup argument, or directly rethrowing cleanup replaces the expected `IllegalStateException` and fails the test; omitting `addSuppressed` or changing the cleanup message fails the suppressed-failure assertions.
+
+### Fix-round-2 focused GREEN evidence
+
+Command:
+
+```bash
+cd services/funds-core
+newgrp docker -c 'for run in 1 2 3 4 5; do env JAVA_HOME=/tmp/core-banking-mise/installs/java/25.0.2 PATH=/tmp/core-banking-mise/installs/java/25.0.2/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin ./mvnw -Dmaven.repo.local=/tmp/core-banking-m2 -Dtest=PostingConcurrencyIT test || exit 1; done'
+```
+
+Result: five consecutive `BUILD SUCCESS` runs, each reporting:
+
+```text
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+```
+
+All five runs used `postgres:18.6-bookworm`; Flyway reported PostgreSQL 18.6 in every run.
+
+### Fix-round-2 full-suite and scan evidence
+
+The full suite ran after the five focused passes with Java 25.0.2, Maven 3.9.16, and PostgreSQL 18.6:
+
+```text
+Tests run: 98, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+LedgerConstraintIT PostgreSQL server_version=18.6 (Debian 18.6-1.pgdg12+2)
+MigrationIT PostgreSQL server_version=18.6 (Debian 18.6-1.pgdg12+2)
+```
+
+The final Maven output had no `WARN`/`WARNING` lines. Surefire failure/warning, whitespace, sleep/barrier, and `ExecutorService.close()` lifecycle scans returned no matches; `git diff --check` was clean.

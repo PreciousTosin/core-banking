@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.corebanking.funds.domain.CurrencyCode;
@@ -137,6 +139,7 @@ class PostingConcurrencyIT {
         List<UUID> expectedCommands = new ArrayList<>(100);
         List<Future<?>> futures = new ArrayList<>(100);
         ExecutorService executor = Executors.newFixedThreadPool(2);
+        Throwable primaryFailure = null;
 
         try {
             for (int pair = 0; pair < 50; pair++) {
@@ -166,8 +169,14 @@ class PostingConcurrencyIT {
                 first.get(30, SECONDS);
                 second.get(30, SECONDS);
             }
+        } catch (Exception failure) {
+            primaryFailure = failure;
+            throw failure;
+        } catch (Error failure) {
+            primaryFailure = failure;
+            throw failure;
         } finally {
-            shutdownExecutor(executor, futures, "reverse-order executor");
+            shutdownExecutor(executor, futures, "reverse-order executor", primaryFailure);
         }
 
         List<UUID> canonicalAccounts = List.of(ACCOUNT_A, ACCOUNT_B).stream()
@@ -246,6 +255,51 @@ class PostingConcurrencyIT {
         }
     }
 
+    @Test
+    void cleanupFailureIsSuppressedWhenBodyAlreadyFailed() throws Exception {
+        IllegalStateException expectedPrimary = new IllegalStateException("primary body failure");
+        ExecutorService delegate = Executors.newSingleThreadExecutor();
+        ExecutorService executor = (ExecutorService) Proxy.newProxyInstance(
+            PostingConcurrencyIT.class.getClassLoader(),
+            new Class<?>[] {ExecutorService.class},
+            (proxy, method, arguments) -> {
+                if ("awaitTermination".equals(method.getName())) {
+                    return false;
+                }
+                return invoke(delegate, method, arguments);
+            });
+
+        try {
+            IllegalStateException primary = assertThrows(IllegalStateException.class, () -> {
+                Throwable primaryFailure = null;
+                try {
+                    throw expectedPrimary;
+                } catch (RuntimeException failure) {
+                    primaryFailure = failure;
+                    throw failure;
+                } finally {
+                    shutdownExecutor(executor, List.of(), "dual-failure executor", primaryFailure);
+                }
+            });
+            assertAll(
+                () -> assertSame(expectedPrimary, primary),
+                () -> assertEquals("primary body failure", primary.getMessage()),
+                () -> assertEquals(1, primary.getSuppressed().length),
+                () -> assertInstanceOf(AssertionError.class, primary.getSuppressed()[0]),
+                () -> assertEquals(
+                    "dual-failure executor did not terminate within 10 seconds",
+                    primary.getSuppressed()[0].getMessage()));
+        } finally {
+            delegate.shutdownNow();
+            try {
+                assertTrue(delegate.awaitTermination(10, SECONDS), "dual-failure delegate did not terminate");
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            }
+        }
+    }
+
     private List<Outcome> race(PostingCommand left, PostingCommand right) throws Exception {
         var observer = new FirstWriterGate(left.commandId());
         var observedDataSource = new ObservedDataSource(dataSource, 2);
@@ -254,6 +308,7 @@ class PostingConcurrencyIT {
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(2);
         List<Future<?>> futures = new ArrayList<>(2);
+        Throwable primaryFailure = null;
         try {
             Future<PostingResult> leftFuture = executor.submit(() -> postAfterStart(service, left, ready, start));
             futures.add(leftFuture);
@@ -275,9 +330,15 @@ class PostingConcurrencyIT {
 
             observer.releaseWinner();
             return List.of(outcome(leftFuture), outcome(rightFuture));
+        } catch (Exception failure) {
+            primaryFailure = failure;
+            throw failure;
+        } catch (Error failure) {
+            primaryFailure = failure;
+            throw failure;
         } finally {
             observer.releaseWinner();
-            shutdownExecutor(executor, futures, "race executor");
+            shutdownExecutor(executor, futures, "race executor", primaryFailure);
         }
     }
 
@@ -286,19 +347,37 @@ class PostingConcurrencyIT {
         List<? extends Future<?>> futures,
         String description
     ) {
-        for (Future<?> future : futures) {
-            if (!future.isDone()) {
-                future.cancel(true);
-            }
-        }
-        executor.shutdownNow();
+        shutdownExecutor(executor, futures, description, null);
+    }
+
+    private static void shutdownExecutor(
+        ExecutorService executor,
+        List<? extends Future<?>> futures,
+        String description,
+        Throwable primaryFailure
+    ) {
         try {
-            if (!executor.awaitTermination(10, SECONDS)) {
-                throw new AssertionError(description + " did not terminate within 10 seconds");
+            for (Future<?> future : futures) {
+                if (!future.isDone()) {
+                    future.cancel(true);
+                }
             }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError(description + " cleanup was interrupted", interrupted);
+            executor.shutdownNow();
+            try {
+                if (!executor.awaitTermination(10, SECONDS)) {
+                    throw new AssertionError(description + " did not terminate within 10 seconds");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(description + " cleanup was interrupted", interrupted);
+            }
+        } catch (RuntimeException | Error cleanupFailure) {
+            if (primaryFailure == null) {
+                throw cleanupFailure;
+            }
+            if (cleanupFailure != primaryFailure) {
+                primaryFailure.addSuppressed(cleanupFailure);
+            }
         }
     }
 
