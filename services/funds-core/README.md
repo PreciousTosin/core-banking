@@ -59,7 +59,7 @@ The target VM has 8 GiB RAM, but that is an evidence-suite budget across version
 
 The Dockerfile pins `eclipse-temurin:25-jre` to registry manifest `sha256:f9e65324a37f28209ce7dd0e5149a7aa954520ed936fb87813cf6ded2400a112`, resolved from Docker Hub by the local Docker registry client on 2026-08-31 for `linux/amd64`. The constrained smoke identifies that reviewed image as Temurin Java 25.0.4. The tag communicates the supported major version; the digest makes rebuilds reproducible. It does not provide automatic security-patch uptake.
 
-To refresh, explicitly pull the Java 25 JRE tag for the target platform, inspect and record its registry digest and Java patch version, review the upstream image/security change, update the Dockerfile plus semantic contract together, rebuild without relying on the old tag cache, then rerun the clean Maven gate, image inspection, constrained Java smoke and all three production-runtime probes. Commit the new digest, review date, platform and evidence as one reviewed change.
+To refresh, explicitly pull the Java 25 JRE tag for the target platform, inspect and record its registry digest and Java patch version, review the upstream image/security change, update the Dockerfile plus semantic contract together, rebuild without relying on the old tag cache, then rerun the clean Maven gate, image inspection, constrained Java smoke and all four production-runtime probes. Commit the new digest, review date, platform and evidence as one reviewed change.
 
 ## Acceptance coverage and limits
 

@@ -3,7 +3,6 @@ package com.corebanking.funds;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -25,7 +24,7 @@ import org.junit.jupiter.api.Test;
 import org.w3c.dom.Element;
 
 class PackagingContractTest {
-    private static final Path MODULE = Path.of(System.getProperty("funds.core.basedir")).toAbsolutePath().normalize();
+    private static final Path MODULE = resolveModuleRoot();
     private static final Map<String, String> CONTROLLED_PROPERTIES = Map.ofEntries(
         Map.entry("quarkus.datasource.db-kind", "postgresql"),
         Map.entry("quarkus.datasource.jdbc.min-size", "2"),
@@ -41,10 +40,21 @@ class PackagingContractTest {
         Map.entry("%prod.quarkus.datasource.password", "${FUNDS_APP_DB_PASSWORD}"));
 
     @Test
-    void modulePathIsSuppliedByMavenProjectBasedir() {
-        String basedir = System.getProperty("funds.core.basedir");
-        assertNotNull(basedir);
-        assertEquals(Path.of(basedir).toAbsolutePath().normalize(), MODULE);
+    void modulePathIgnoresCallerSuppliedBasedirOverride() throws IOException {
+        Path crafted = Files.createTempDirectory("funds-core-false-basedir-");
+        String original = System.getProperty("funds.core.basedir");
+        System.setProperty("funds.core.basedir", crafted.toString());
+        try {
+            assertEquals(MODULE, resolveModuleRoot());
+            assertFalse(MODULE.startsWith(crafted));
+        } finally {
+            if (original == null) {
+                System.clearProperty("funds.core.basedir");
+            } else {
+                System.setProperty("funds.core.basedir", original);
+            }
+            Files.delete(crafted);
+        }
     }
 
     @Test
@@ -153,7 +163,9 @@ class PackagingContractTest {
         assertEquals(expectedExclusions, new HashSet<>(exclusions));
         assertEquals(expectedExclusions.size(), exclusions.size(), "each exclusion must occur exactly once");
         assertTrue(section(readme, "Database roles and startup").contains("fail closed before readiness can be UP"));
-        assertTrue(section(readme, "Base-image review and refresh").contains("sha256:f9e65324"));
+        String baseImage = section(readme, "Base-image review and refresh");
+        assertTrue(baseImage.contains("sha256:f9e65324"));
+        assertEquals(1, baseImage.split(Pattern.quote("all four production-runtime probes"), -1).length - 1);
     }
 
     @Test
@@ -230,6 +242,31 @@ class PackagingContractTest {
 
     private static String read(String relativePath) throws IOException {
         return Files.readString(MODULE.resolve(relativePath));
+    }
+
+    private static Path resolveModuleRoot() {
+        try {
+            Path testClasses = Path.of(PackagingContractTest.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI())
+                .toAbsolutePath().normalize();
+            Path target = testClasses.getParent();
+            if (!"test-classes".equals(fileName(testClasses)) || target == null || !"target".equals(fileName(target))) {
+                throw new IllegalStateException("Unexpected packaging-test code-source layout: " + testClasses);
+            }
+            Path module = target.getParent();
+            if (module == null
+                || !Files.isRegularFile(module.resolve("pom.xml"))
+                || !Files.isRegularFile(module.resolve("src/main/resources/application.properties"))) {
+                throw new IllegalStateException("Packaging-test code source did not resolve the funds-core module");
+            }
+            return module;
+        } catch (java.net.URISyntaxException e) {
+            throw new IllegalStateException("Packaging-test code source is not a filesystem URI", e);
+        }
+    }
+
+    private static String fileName(Path path) {
+        return path.getFileName() == null ? "" : path.getFileName().toString();
     }
 
     private static final class CountingProperties extends Properties {
