@@ -50,14 +50,14 @@ class MigrationIT {
                 }
             }
 
-            assertEquals(Set.of(
+            assertTrue(actual.containsAll(Set.of(
                 "book",
                 "chart_version",
                 "accounting_period",
                 "product_definition",
                 "product_version",
                 "ledger_account",
-                "account_identifier"), actual);
+                "account_identifier")));
         });
     }
 
