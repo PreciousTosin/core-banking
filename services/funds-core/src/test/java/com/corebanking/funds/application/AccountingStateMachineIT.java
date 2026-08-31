@@ -2,6 +2,7 @@ package com.corebanking.funds.application;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
@@ -60,6 +61,68 @@ class AccountingStateMachineIT {
         }
         assertEquals(SEED_COUNT * OPERATIONS_PER_SEED, executed);
         assertDatabaseCounts(totals, "complete deterministic run");
+    }
+
+    @Test
+    void reversalComparisonRejectsDimensionMismatch() throws SQLException {
+        long seed = BASE_SEED;
+        Fixture fixture = seedFixture(seed);
+        seedFixture(fixture, 0);
+        var model = new ReferenceLedgerModel(fixture.accountControls());
+        var service = TestPostingStack.create(dataSource, PostingTransactionObserver.noop()).postingService();
+
+        PostingCommand original = commandFor(
+            seed,
+            0,
+            new GeneratedLedgerOperation.Post(deterministicUuid(seed, 0, 200), 100),
+            fixture,
+            model);
+        model.apply(original, service.post(original));
+
+        PostingCommand validReversal = commandFor(
+            seed,
+            1,
+            new GeneratedLedgerOperation.Reverse(
+                deterministicUuid(seed, 1, 200),
+                original.journal().journalId()),
+            fixture,
+            model);
+        var alteredLines = new ArrayList<>(validReversal.journal().postings());
+        PostingLine first = alteredLines.getFirst();
+        alteredLines.set(0, new PostingLine(
+            first.postingId(),
+            first.accountId(),
+            first.currency(),
+            first.signedMinorUnits(),
+            first.accountSequence(),
+            Map.of("operation", "dimension-mismatch", "seed", Long.toUnsignedString(seed))));
+        PostingCommand alteredReversal = command(copyWithPostings(validReversal.journal(), alteredLines));
+        model.apply(alteredReversal, service.post(alteredReversal));
+
+        AssertionError mismatch = assertThrows(AssertionError.class, () -> {
+            try (Connection connection = dataSource.getConnection()) {
+                assertReversalsAndHashes(connection, model);
+            }
+        });
+        assertTrue(mismatch.getMessage().contains("dimensions"), mismatch::getMessage);
+    }
+
+    private static JournalDraft copyWithPostings(JournalDraft journal, List<PostingLine> postings) {
+        return new JournalDraft(
+            journal.journalId(),
+            journal.commandId(),
+            journal.correlationId(),
+            journal.businessTransactionId(),
+            journal.legalEntityId(),
+            journal.bookId(),
+            journal.periodId(),
+            journal.transactionType(),
+            journal.narration(),
+            journal.bookingTime(),
+            journal.valueDate(),
+            journal.reversalOfJournalId(),
+            journal.policyVersion(),
+            postings);
     }
 
     private int runSeed(long seed, Fixture fixture, RunTotals totals) throws SQLException {
@@ -606,7 +669,8 @@ class AccountingStateMachineIT {
             if (journal.reversalOfJournalId() != null) {
                 var expected = lineMultiset(model.journal(journal.reversalOfJournalId()).lines(), true);
                 var actual = databaseLineMultiset(connection, journal.journalId());
-                assertEquals(expected, actual, "reversal lines must be exact negations");
+                assertEquals(expected, actual,
+                    "reversal lines must be exact negations with identical dimensions");
             }
         }
     }
@@ -618,27 +682,64 @@ class AccountingStateMachineIT {
         var values = new HashMap<LineValue, Integer>();
         for (var line : lines) {
             long amount = negate ? Math.negateExact(line.signedMinorUnits()) : line.signedMinorUnits();
-            values.merge(new LineValue(line.accountId(), line.currency(), amount), 1, Integer::sum);
+            values.merge(new LineValue(
+                line.accountId(),
+                line.currency(),
+                amount,
+                stringDimensions(line.dimensions())), 1, Integer::sum);
         }
         return Map.copyOf(values);
     }
 
+    private static Map<String, DimensionValue> stringDimensions(Map<String, String> dimensions) {
+        var typed = new LinkedHashMap<String, DimensionValue>();
+        dimensions.entrySet().stream()
+            .sorted(Map.Entry.comparingByKey())
+            .forEach(entry -> typed.put(entry.getKey(), new DimensionValue("string", entry.getValue())));
+        return Map.copyOf(typed);
+    }
+
     private static Map<LineValue, Integer> databaseLineMultiset(Connection connection, UUID journalId)
         throws SQLException {
-        var values = new HashMap<LineValue, Integer>();
+        var postings = new LinkedHashMap<UUID, DatabaseLine>();
         try (PreparedStatement statement = connection.prepareStatement("""
-            SELECT account_id, currency, signed_minor_units
-            FROM funds.posting WHERE journal_id = ?
+            SELECT posting.posting_id, posting.account_id, posting.currency,
+                   posting.signed_minor_units, dimension.key AS dimension_key,
+                   jsonb_typeof(dimension.value) AS dimension_type,
+                   dimension.value #>> '{}' AS dimension_value
+            FROM funds.posting posting
+            LEFT JOIN LATERAL jsonb_each(posting.dimensions) dimension ON true
+            WHERE posting.journal_id = ?
+            ORDER BY posting.posting_id, dimension.key
             """)) {
             statement.setObject(1, journalId);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
-                    values.merge(new LineValue(
-                        rows.getObject("account_id", UUID.class),
-                        CurrencyCode.of(rows.getString("currency")),
-                        rows.getLong("signed_minor_units")), 1, Integer::sum);
+                    UUID postingId = rows.getObject("posting_id", UUID.class);
+                    DatabaseLine line = postings.get(postingId);
+                    if (line == null) {
+                        line = new DatabaseLine(
+                            rows.getObject("account_id", UUID.class),
+                            CurrencyCode.of(rows.getString("currency")),
+                            rows.getLong("signed_minor_units"));
+                        postings.put(postingId, line);
+                    }
+                    String dimensionKey = rows.getString("dimension_key");
+                    if (dimensionKey != null) {
+                        line.dimensions().put(dimensionKey, new DimensionValue(
+                            rows.getString("dimension_type"),
+                            rows.getString("dimension_value")));
+                    }
                 }
             }
+        }
+        var values = new HashMap<LineValue, Integer>();
+        for (DatabaseLine line : postings.values()) {
+            values.merge(new LineValue(
+                line.accountId(),
+                line.currency(),
+                line.signedMinorUnits(),
+                Map.copyOf(line.dimensions())), 1, Integer::sum);
         }
         return Map.copyOf(values);
     }
@@ -699,7 +800,25 @@ class AccountingStateMachineIT {
 
     private record DatabaseCounts(long journals, long postings, long idempotency, long outbox) {}
 
-    private record LineValue(UUID accountId, CurrencyCode currency, long signedMinorUnits) {}
+    private record LineValue(
+        UUID accountId,
+        CurrencyCode currency,
+        long signedMinorUnits,
+        Map<String, DimensionValue> dimensions
+    ) {}
+
+    private record DimensionValue(String jsonType, String textValue) {}
+
+    private record DatabaseLine(
+        UUID accountId,
+        CurrencyCode currency,
+        long signedMinorUnits,
+        Map<String, DimensionValue> dimensions
+    ) {
+        private DatabaseLine(UUID accountId, CurrencyCode currency, long signedMinorUnits) {
+            this(accountId, currency, signedMinorUnits, new LinkedHashMap<>());
+        }
+    }
 
     private static final class RunTotals {
         private long journals;
