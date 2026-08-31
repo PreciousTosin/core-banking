@@ -282,6 +282,7 @@ class ReversalServiceIT {
             PostingSnapshot correction = reversal.get(index);
             assertAll(
                 () -> assertNotEquals(source.postingId(), correction.postingId()),
+                () -> assertNotEquals(source.journalId(), correction.journalId()),
                 () -> assertEquals(source.accountId(), correction.accountId()),
                 () -> assertEquals(source.currency(), correction.currency()),
                 () -> assertEquals(Math.negateExact(source.signedMinorUnits()), correction.signedMinorUnits()),
@@ -293,7 +294,7 @@ class ReversalServiceIT {
     private JournalSnapshot journalSnapshot(UUID journalId) throws SQLException {
         try (var connection = dataSource.getConnection();
              var statement = connection.prepareStatement("""
-                 SELECT command_id, correlation_id, business_transaction_id, legal_entity_id,
+                 SELECT journal_sequence, command_id, correlation_id, business_transaction_id, legal_entity_id,
                         book_id, period_id, transaction_type, narration, booking_time, value_date,
                         reversal_of_journal_id, policy_version, canonical_hash
                  FROM funds.journal
@@ -304,6 +305,7 @@ class ReversalServiceIT {
                 assertTrue(rows.next());
                 return new JournalSnapshot(
                     journalId,
+                    rows.getLong("journal_sequence"),
                     rows.getObject("command_id", UUID.class),
                     rows.getObject("correlation_id", UUID.class),
                     rows.getObject("business_transaction_id", UUID.class),
@@ -325,7 +327,7 @@ class ReversalServiceIT {
     private static List<PostingSnapshot> postingSnapshots(Connection connection, UUID journalId)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
-            SELECT posting_id, account_id, currency, signed_minor_units, account_sequence,
+            SELECT posting_id, journal_id, account_id, currency, signed_minor_units, account_sequence,
                    dimensions::text AS dimensions_json
             FROM funds.posting
             WHERE journal_id = ?
@@ -337,6 +339,7 @@ class ReversalServiceIT {
                 while (rows.next()) {
                     postings.add(new PostingSnapshot(
                         rows.getObject("posting_id", UUID.class),
+                        rows.getObject("journal_id", UUID.class),
                         rows.getObject("account_id", UUID.class),
                         rows.getString("currency"),
                         rows.getLong("signed_minor_units"),
@@ -375,6 +378,7 @@ class ReversalServiceIT {
 
     private record JournalSnapshot(
         UUID journalId,
+        long journalSequence,
         UUID commandId,
         UUID correlationId,
         UUID businessTransactionId,
@@ -392,6 +396,7 @@ class ReversalServiceIT {
 
     private record PostingSnapshot(
         UUID postingId,
+        UUID journalId,
         UUID accountId,
         String currency,
         long signedMinorUnits,
