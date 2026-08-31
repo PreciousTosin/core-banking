@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-edge
+  namespace: core-banking-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-edge
+  template:
+    metadata:
+      labels:
+        app: api-edge
+    spec:
+      containers:
+        - name: api-edge
+          image: registry.example.com/core-banking/api-edge:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Xms256m -Xmx512m"
+            - name: LOG_LEVEL
+              value: "INFO"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1024Mi
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: funds-core
+  namespace: core-banking-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: funds-core
+  template:
+    metadata:
+      labels:
+        app: funds-core
+    spec:
+      containers:
+        - name: funds-core
+          image: registry.example.com/core-banking/funds-core:latest
+          ports:
+            - containerPort: 8081
+          env:
+            - name: JAVA_OPTS
+              value: "-Xms256m -Xmx512m"
+          resources:
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+            requests:
+              cpu: "1"
+              memory: 1024Mi

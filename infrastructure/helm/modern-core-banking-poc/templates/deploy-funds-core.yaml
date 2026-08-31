@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: funds-core
+  labels:
+    app: funds-core
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.replicaCounts.fundsCore }}
+  selector:
+    matchLabels:
+      app: funds-core
+  template:
+    metadata:
+      labels:
+        app: funds-core
+    spec:
+      containers:
+        - name: funds-core
+          image: {{- include "mcb.image.fundsCore" . | quote -}}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+          resources:
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+          env:
+            - name: JAVA_OPTS
+              value: "-Xms256m -Xmx512m"

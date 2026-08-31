@@ -1,0 +1,38 @@
+## Default values for modern-core-banking-poc Helm chart
+replicaCounts:
+  apiEdge: 1
+  fundsCore: 1
+
+image:
+  apiEdge:
+    repository: registry.example.com/core-banking/api-edge
+    tag: latest
+  fundsCore:
+    repository: registry.example.com/core-banking/funds-core
+    tag: latest
+
+service:
+  apiEdge:
+    type: ClusterIP
+    port: 80
+  fundsCore:
+    type: ClusterIP
+    port: 8081
+
+ingress:
+  enabled: true
+  annotations: {}
+  host: api.example.com
+  tlsSecret: api-tls-secret
+
+resources:
+  limits:
+    cpu: 1
+    memory: 1024Mi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+namespace: core-banking-poc
+
+## Optional: abilities to enable/disable data plane components in future

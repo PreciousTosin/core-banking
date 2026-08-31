@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-edge
+  labels:
+    app: api-edge
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.replicaCounts.apiEdge }}
+  selector:
+    matchLabels:
+      app: api-edge
+  template:
+    metadata:
+      labels:
+        app: api-edge
+    spec:
+      containers:
+        - name: api-edge
+          image: {{- include "mcb.image.apiEdge" . | quote -}}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Xms256m -Xmx512m"
+            - name: LOG_LEVEL
+              value: "INFO"

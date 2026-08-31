@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: core-banking-ingress
+  namespace: core-banking-poc
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-edge-svc
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-tls-secret

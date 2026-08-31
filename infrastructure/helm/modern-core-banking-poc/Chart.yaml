@@ -1,0 +1,7 @@
+apiVersion: v2
+name: modern-core-banking-poc
+description: Helm chart for the Modern Core Banking PoC (single cluster on Kubernetes)
+type: application
+version: 0.2.0
+appVersion: 1.1.0
+dependencies: []
