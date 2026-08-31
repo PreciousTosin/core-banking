@@ -66,7 +66,10 @@
                         <include>**/*Properties.java</include>
                         <include>**/*IT.java</include>
                     </includes>
-                    <systemPropertyVariables><java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager></systemPropertyVariables>
+                    <systemPropertyVariables>
+                        <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                        <funds.core.basedir>${project.basedir}</funds.core.basedir>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
         </plugins>

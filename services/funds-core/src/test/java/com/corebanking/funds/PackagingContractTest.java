@@ -2,6 +2,8 @@ package com.corebanking.funds;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -18,11 +20,12 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Pattern;
 import javax.xml.parsers.DocumentBuilderFactory;
+import org.xml.sax.InputSource;
 import org.junit.jupiter.api.Test;
 import org.w3c.dom.Element;
 
 class PackagingContractTest {
-    private static final Path MODULE = Path.of("").toAbsolutePath();
+    private static final Path MODULE = Path.of(System.getProperty("funds.core.basedir")).toAbsolutePath().normalize();
     private static final Map<String, String> CONTROLLED_PROPERTIES = Map.ofEntries(
         Map.entry("quarkus.datasource.db-kind", "postgresql"),
         Map.entry("quarkus.datasource.jdbc.min-size", "2"),
@@ -38,52 +41,72 @@ class PackagingContractTest {
         Map.entry("%prod.quarkus.datasource.password", "${FUNDS_APP_DB_PASSWORD}"));
 
     @Test
+    void modulePathIsSuppliedByMavenProjectBasedir() {
+        String basedir = System.getProperty("funds.core.basedir");
+        assertNotNull(basedir);
+        assertEquals(Path.of(basedir).toAbsolutePath().normalize(), MODULE);
+    }
+
+    @Test
     void productionConfigurationHasOneEffectiveAssignmentForEveryBound() throws Exception {
         String source = read("src/main/resources/application.properties");
         var properties = new Properties();
         properties.load(new StringReader(source));
+        var assignments = assignmentCounts(source);
 
         CONTROLLED_PROPERTIES.forEach((key, expected) -> {
             assertEquals(expected, properties.getProperty(key), key);
-            assertEquals(1, assignmentCounts(source).getOrDefault(key, 0), key + " must have one active assignment");
+            assertEquals(1, assignments.getOrDefault(key, 0), key + " must have one active assignment");
         });
         assertFalse(properties.values().stream().anyMatch(value -> value.toString().contains("jdbc:postgresql://")),
             "production JDBC endpoint must not be embedded");
     }
 
     @Test
+    void semanticAssignmentCountingDetectsEscapedAndContinuedDuplicateKeys() throws IOException {
+        String source = read("src/main/resources/application.properties");
+        String escapedDuplicate = source + "\nquarkus.datasource.jdbc.max\\u002dsize=8\n";
+        String continuedDuplicate = source + "\nquarkus.datasource.jdbc.max\\\n-size=8\n";
+
+        assertEquals(2, assignmentCounts(escapedDuplicate).get("quarkus.datasource.jdbc.max-size"));
+        assertEquals(2, assignmentCounts(continuedDuplicate).get("quarkus.datasource.jdbc.max-size"));
+    }
+
+    @Test
     void pomBindsExactlyOneQuarkusBuildGoal() throws Exception {
+        assertPomContract(read("pom.xml"));
+    }
+
+    @Test
+    void nestedPomConfigurationGoalsDoNotCountAsLifecycleBindings() throws Exception {
+        String pom = read("pom.xml");
+        String mutated = pom.replace("<extensions>true</extensions>", """
+            <extensions>true</extensions>
+            <configuration>
+                <execution><goals><goal>build</goal></goals></execution>
+            </configuration>""");
+        assertDoesNotThrow(() -> assertPomContract(mutated));
+    }
+
+    private static void assertPomContract(String source) throws Exception {
         var factory = DocumentBuilderFactory.newInstance();
         factory.setNamespaceAware(true);
-        var document = factory.newDocumentBuilder().parse(MODULE.resolve("pom.xml").toFile());
-        var plugins = document.getElementsByTagNameNS("*", "plugin");
-        int quarkusPlugins = 0;
-        int executions = 0;
-        int totalGoals = 0;
-        int buildGoals = 0;
-        for (int index = 0; index < plugins.getLength(); index++) {
-            var plugin = (Element) plugins.item(index);
-            if (!"quarkus-maven-plugin".equals(directChildText(plugin, "artifactId"))) {
-                continue;
-            }
-            quarkusPlugins++;
-            assertEquals("io.quarkus", directChildText(plugin, "groupId"));
-            var executionNodes = plugin.getElementsByTagNameNS("*", "execution");
-            executions += executionNodes.getLength();
-            for (int executionIndex = 0; executionIndex < executionNodes.getLength(); executionIndex++) {
-                var goals = ((Element) executionNodes.item(executionIndex)).getElementsByTagNameNS("*", "goal");
-                totalGoals += goals.getLength();
-                for (int goalIndex = 0; goalIndex < goals.getLength(); goalIndex++) {
-                    if ("build".equals(goals.item(goalIndex).getTextContent().trim())) {
-                        buildGoals++;
-                    }
-                }
-            }
-        }
-        assertEquals(1, quarkusPlugins);
-        assertEquals(1, executions);
-        assertEquals(1, totalGoals);
-        assertEquals(1, buildGoals);
+        var document = factory.newDocumentBuilder().parse(new InputSource(new StringReader(source)));
+        var project = document.getDocumentElement();
+        var build = singleDirectChild(project, "build");
+        var plugins = singleDirectChild(build, "plugins");
+        var quarkusPlugins = directChildren(plugins, "plugin").stream()
+            .filter(plugin -> "io.quarkus".equals(directChildText(plugin, "groupId")))
+            .filter(plugin -> "quarkus-maven-plugin".equals(directChildText(plugin, "artifactId")))
+            .toList();
+        assertEquals(1, quarkusPlugins.size());
+        var executions = singleDirectChild(quarkusPlugins.getFirst(), "executions");
+        var execution = directChildren(executions, "execution");
+        assertEquals(1, execution.size());
+        var goals = singleDirectChild(execution.getFirst(), "goals");
+        var goal = directChildren(goals, "goal");
+        assertEquals(1, goal.size());
+        assertEquals("build", goal.getFirst().getTextContent().trim());
     }
 
     @Test
@@ -143,13 +166,10 @@ class PackagingContractTest {
             .count());
     }
 
-    private static Map<String, Integer> assignmentCounts(String source) {
-        var counts = new HashMap<String, Integer>();
-        source.lines().map(String::trim).filter(line -> !line.isEmpty() && !line.startsWith("#") && !line.startsWith("!"))
-            .forEach(line -> CONTROLLED_PROPERTIES.keySet().stream()
-                .filter(key -> line.matches(Pattern.quote(key) + "(?:\\s*[:=]\\s*|\\s+).+"))
-                .forEach(key -> counts.merge(key, 1, Integer::sum)));
-        return counts;
+    private static Map<String, Integer> assignmentCounts(String source) throws IOException {
+        var properties = new CountingProperties();
+        properties.load(new StringReader(source));
+        return properties.counts;
     }
 
     private static String directChildText(Element parent, String localName) {
@@ -159,6 +179,22 @@ class PackagingContractTest {
             }
         }
         return null;
+    }
+
+    private static Element singleDirectChild(Element parent, String localName) {
+        var children = directChildren(parent, localName);
+        assertEquals(1, children.size(), localName + " direct-child count");
+        return children.getFirst();
+    }
+
+    private static List<Element> directChildren(Element parent, String localName) {
+        var result = new ArrayList<Element>();
+        for (var child = parent.getFirstChild(); child != null; child = child.getNextSibling()) {
+            if (child instanceof Element element && localName.equals(element.getLocalName())) {
+                result.add(element);
+            }
+        }
+        return result;
     }
 
     private static void assertUniqueHeadings(String markdown, Set<String> expected) {
@@ -194,5 +230,15 @@ class PackagingContractTest {
 
     private static String read(String relativePath) throws IOException {
         return Files.readString(MODULE.resolve(relativePath));
+    }
+
+    private static final class CountingProperties extends Properties {
+        private final Map<String, Integer> counts = new HashMap<>();
+
+        @Override
+        public synchronized Object put(Object key, Object value) {
+            counts.merge(key.toString(), 1, Integer::sum);
+            return super.put(key, value);
+        }
     }
 }
