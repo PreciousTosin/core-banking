@@ -98,6 +98,73 @@ class LedgerConstraintIT {
     }
 
     @Test
+    void rejectsBookLegalEntityChangeAfterJournalCommit() throws Exception {
+        withCommittedJournal(connection -> assertSqlState(connection, "55000", """
+            UPDATE funds.book
+            SET legal_entity_id = '00000000-0000-0000-0000-000000000099'
+            WHERE book_id = '%s'
+            """.formatted(BOOK_ID)));
+    }
+
+    @Test
+    void rejectsAccountCurrencyChangeAfterJournalCommit() throws Exception {
+        withCommittedJournal(connection -> assertSqlState(connection, "55000", """
+            UPDATE funds.ledger_account SET currency = 'USD' WHERE account_id = '%s'
+            """.formatted(CUSTOMER_ACCOUNT_A)));
+    }
+
+    @Test
+    void rejectsAccountControlMappingChangeAfterJournalCommit() throws Exception {
+        withCommittedJournal(connection -> assertSqlState(connection, "55000", """
+            UPDATE funds.ledger_account
+            SET control_account_code = 'REWRITTEN-CONTROL'
+            WHERE account_id = '%s'
+            """.formatted(CUSTOMER_ACCOUNT_A)));
+    }
+
+    @Test
+    void rejectsAccountChartVersionChangeAfterJournalCommit() throws Exception {
+        withCommittedJournal(connection -> {
+            insertAlternateChartForMainBook(connection);
+
+            assertSqlState(connection, "55000", """
+                UPDATE funds.ledger_account SET chart_version_id = '%s' WHERE account_id = '%s'
+                """.formatted(uuid(24), CUSTOMER_ACCOUNT_A));
+        });
+    }
+
+    @Test
+    void rejectsCoherentAccountBookAndChartMoveAfterJournalCommit() throws Exception {
+        withCommittedJournal(connection -> {
+            insertSecondBookAccount(connection);
+
+            assertSqlState(connection, "55000", """
+                UPDATE funds.ledger_account
+                SET book_id = '%s', chart_version_id = '%s'
+                WHERE account_id = '%s'
+                """.formatted(SECOND_BOOK_ID, SECOND_CHART_VERSION_ID, CUSTOMER_ACCOUNT_A));
+        });
+    }
+
+    @Test
+    void allowsOperationalAccountStateChangeAfterJournalCommit() throws Exception {
+        withCommittedJournal(connection -> {
+            execute(connection, """
+                UPDATE funds.ledger_account
+                SET status = 'CLOSED', closed_at = TIMESTAMPTZ '2026-01-31 23:59:59+00'
+                WHERE account_id = '%s'
+                """.formatted(CUSTOMER_ACCOUNT_A));
+
+            assertEquals(1, queryLong(connection, """
+                SELECT count(*) FROM funds.ledger_account
+                WHERE account_id = '%s'
+                  AND status = 'CLOSED'
+                  AND closed_at = TIMESTAMPTZ '2026-01-31 23:59:59+00'
+                """.formatted(CUSTOMER_ACCOUNT_A)));
+        });
+    }
+
+    @Test
     void rejectsCommittedJournalUpdateAsImmutable() throws Exception {
         withCommittedJournal(connection -> assertSqlState(connection, "55000", """
             UPDATE funds.journal SET narration = 'changed' WHERE journal_id = '%s'
@@ -348,6 +415,14 @@ class LedgerConstraintIT {
         execute(connection, ledgerAccountInsert(
             SECOND_ACCOUNT_ID, SECOND_BOOK_ID, SECOND_CHART_VERSION_ID, "SECOND-BOOK", "INTERNAL",
             null, "ASSET", "DEBIT", "NGN", "SECOND-CONTROL"));
+    }
+
+    private static void insertAlternateChartForMainBook(Connection connection) throws SQLException {
+        execute(connection, """
+            INSERT INTO funds.chart_version
+                (chart_version_id, book_id, version, status, activated_at)
+            VALUES ('%s', '%s', 2, 'ACTIVE', TIMESTAMPTZ '2026-02-01 00:00:00+00')
+            """.formatted(uuid(24), BOOK_ID));
     }
 
     private static void insertInProgressCommand(Connection connection, UUID commandId, String requestHash)
