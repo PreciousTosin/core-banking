@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
+import com.corebanking.funds.domain.ReversalRequest;
 import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
@@ -19,6 +20,7 @@ import com.corebanking.funds.infrastructure.postgres.JdbcLedgerRepository;
 import com.corebanking.funds.infrastructure.postgres.LedgerRepository;
 import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
 import com.corebanking.funds.infrastructure.postgres.SqlState;
+import io.agroal.api.AgroalDataSource;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import java.io.PrintWriter;
@@ -42,6 +44,7 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.ds.PGSimpleDataSource;
 
 @QuarkusTest
 class PostingServiceIT {
@@ -333,6 +336,61 @@ class PostingServiceIT {
                 recordingDataSource.connections().get(2).events()),
             () -> assertEquals(1, recordingDataSource.commitCount()),
             () -> assertEquals(2, recordingDataSource.rollbackCount()));
+    }
+
+    @Test
+    void postsAndReversesThroughFreshConnectionsRestrictedToFundsApp() throws SQLException {
+        String loginRole = "funds_app_path_" + UUID.randomUUID().toString().replace("-", "");
+        String password = "task12-role-path-password";
+        execute("CREATE ROLE %s LOGIN PASSWORD '%s'".formatted(loginRole, password));
+        execute("GRANT funds_app TO " + loginRole);
+        try {
+            var roleDataSource = fundsAppDataSource(loginRole, password);
+            var repository = new ScriptedLedgerRepository(
+                new JdbcLedgerRepository(),
+                1,
+                () -> new LedgerPersistenceException(new SQLException("serialization", "40001")));
+            var rolePostingService = postingService(roleDataSource, repository, (commandId, attempt) -> {});
+            var roleReversalService = new ReversalService(roleDataSource, rolePostingService);
+            var command = exampleACommand(COMMAND_ID, JOURNAL_ID);
+
+            PostingResult posted = rolePostingService.post(command);
+            PostingResult reversed = roleReversalService.reverse(new ReversalRequest(
+                uuid(40),
+                "b".repeat(64),
+                posted.journalId(),
+                uuid(41),
+                uuid(42),
+                PERIOD_ID,
+                Instant.parse("2026-01-16T10:00:00Z"),
+                LocalDate.of(2026, 1, 16),
+                "Least-privilege reversal"));
+
+            try (var connection = dataSource.getConnection()) {
+                assertAll(
+                    () -> assertEquals(3, repository.commands().size()),
+                    () -> assertEquals(4, roleDataSource.identities().size()),
+                    () -> assertTrue(roleDataSource.identities().stream()
+                        .allMatch(identity -> loginRole.equals(identity.sessionUser()))),
+                    () -> assertTrue(roleDataSource.identities().stream()
+                        .allMatch(identity -> "funds_app".equals(identity.currentRole()))),
+                    () -> assertTrue(roleDataSource.identities().stream()
+                        .noneMatch(ConnectionIdentity::canSetMigrator)),
+                    () -> assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.journal")),
+                    () -> assertEquals(4, queryLong(connection, "SELECT count(*) FROM funds.posting")),
+                    () -> assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.outbox_event")),
+                    () -> assertEquals(0, balance(connection, PROVIDER_ASSET)),
+                    () -> assertEquals(0, balance(connection, CUSTOMER_LIABILITY)),
+                    () -> assertEquals(0, controlTotal(connection, "PROVIDER-CASH")),
+                    () -> assertEquals(0, controlTotal(connection, "CUSTOMER-DEPOSITS")),
+                    () -> assertEquals(reversed.journalId(), queryUuid(connection, """
+                        SELECT journal_id FROM funds.idempotency_command
+                        WHERE command_id = '%s' AND state = 'COMPLETED'
+                        """.formatted(uuid(40)))));
+            }
+        } finally {
+            execute("DROP ROLE " + loginRole);
+        }
     }
 
     @Test
@@ -752,6 +810,26 @@ class PostingServiceIT {
         }
     }
 
+    private static UUID queryUuid(Connection connection, String sql) throws SQLException {
+        try (Statement statement = connection.createStatement(); ResultSet rows = statement.executeQuery(sql)) {
+            assertTrue(rows.next());
+            return rows.getObject(1, UUID.class);
+        }
+    }
+
+    private FundsAppDataSource fundsAppDataSource(String username, String password) throws SQLException {
+        AgroalDataSource agroal = dataSource.unwrap(AgroalDataSource.class);
+        var factory = agroal
+            .getConfiguration()
+            .connectionPoolConfiguration()
+            .connectionFactoryConfiguration();
+        var roleDataSource = new FundsAppDataSource();
+        roleDataSource.setURL(factory.jdbcUrl());
+        roleDataSource.setUser(username);
+        roleDataSource.setPassword(password);
+        return roleDataSource;
+    }
+
     private static UUID uuid(long value) {
         return new UUID(0, value);
     }
@@ -911,6 +989,46 @@ class PostingServiceIT {
             return delegate.isWrapperFor(iface);
         }
     }
+
+    private static final class FundsAppDataSource extends PGSimpleDataSource {
+        private final List<ConnectionIdentity> identities = new ArrayList<>();
+
+        @Override
+        public Connection getConnection() throws SQLException {
+            return assumeRole(super.getConnection());
+        }
+
+        private Connection assumeRole(Connection connection) throws SQLException {
+            try {
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute("SET ROLE funds_app");
+                }
+                try (Statement statement = connection.createStatement();
+                     ResultSet rows = statement.executeQuery("""
+                         SELECT session_user, current_user,
+                                pg_has_role(session_user, 'funds_migrator', 'SET')
+                         """)) {
+                    assertTrue(rows.next());
+                    identities.add(new ConnectionIdentity(
+                        rows.getString(1), rows.getString(2), rows.getBoolean(3)));
+                }
+                return connection;
+            } catch (SQLException | RuntimeException failure) {
+                try {
+                    connection.close();
+                } catch (SQLException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
+            }
+        }
+
+        private List<ConnectionIdentity> identities() {
+            return List.copyOf(identities);
+        }
+    }
+
+    private record ConnectionIdentity(String sessionUser, String currentRole, boolean canSetMigrator) {}
 
     private static final class ConnectionTrace {
         private final Connection delegate;

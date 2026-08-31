@@ -200,9 +200,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
         throws SQLException {
         try (var statement = connection.prepareStatement("""
             SELECT legal_entity_id, accounting_policy_version
-            FROM funds.book
-            WHERE book_id = ?
-            FOR SHARE
+            FROM funds.lock_book_for_posting(?)
             """)) {
             statement.setObject(1, journal.bookId());
             try (var rows = statement.executeQuery()) {
@@ -220,9 +218,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
 
         try (var statement = connection.prepareStatement("""
             SELECT book_id, business_date_from, business_date_to, status
-            FROM funds.accounting_period
-            WHERE period_id = ?
-            FOR SHARE
+            FROM funds.lock_period_for_posting(?)
             """)) {
             statement.setObject(1, journal.periodId());
             try (var rows = statement.executeQuery()) {
@@ -290,13 +286,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
         UUID accountId
     ) throws SQLException {
         try (var statement = connection.prepareStatement("""
-            SELECT account.book_id, account.currency, account.control_account_code,
-                   account.status, chart.status AS chart_status
-            FROM funds.ledger_account account
-            JOIN funds.chart_version chart ON chart.chart_version_id = account.chart_version_id
-            WHERE account.account_id = ?
-            FOR UPDATE OF account
-            FOR SHARE OF chart
+            SELECT book_id, currency, control_account_code, status, chart_status
+            FROM funds.lock_account_for_posting(?)
             """)) {
             statement.setObject(1, accountId);
             try (var rows = statement.executeQuery()) {

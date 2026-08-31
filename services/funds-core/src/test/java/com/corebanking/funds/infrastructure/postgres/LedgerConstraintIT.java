@@ -450,6 +450,13 @@ class LedgerConstraintIT {
 
                 assertEquals("funds_app", queryString(connection, "SELECT current_user"));
                 assertEquals(3, queryLong(connection, "SELECT count(*) FROM funds.ledger_account"));
+                assertEquals(0, queryLong(connection,
+                    "SELECT count(*) FROM funds.lock_book_for_posting(NULL)"));
+                assertEquals(0, queryLong(connection, """
+                    SELECT count(*)
+                    FROM funds.lock_account_for_posting(
+                        'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid)
+                    """));
                 execute(connection, """
                     INSERT INTO funds.idempotency_command
                         (command_id, request_hash, state, created_at)
@@ -497,6 +504,31 @@ class LedgerConstraintIT {
                     """.formatted(JOURNAL_ID, COMMAND_ID));
                 execute(connection, "SET CONSTRAINTS ALL IMMEDIATE");
 
+                long allocatedSequence = queryLong(connection,
+                    "SELECT nextval('funds.journal_journal_sequence_seq')");
+                assertEquals(allocatedSequence, queryLong(connection,
+                    "SELECT currval('funds.journal_journal_sequence_seq')"));
+                assertSqlState(connection, "42501", """
+                    SELECT setval('funds.journal_journal_sequence_seq', 900, false)
+                    """);
+                assertSqlState(connection, "42501",
+                    "SELECT last_value FROM funds.journal_journal_sequence_seq");
+
+                assertSqlState(connection, "42501", """
+                    INSERT INTO funds.outbox_event
+                        (event_id, aggregate_id, aggregate_version, event_type, schema_version,
+                         payload, created_at, published_at)
+                    VALUES ('%s', '%s', 901, 'ForbiddenPublishedAt', 1, '{}'::jsonb,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """.formatted(uuid(902), JOURNAL_ID));
+                assertSqlState(connection, "42501", """
+                    INSERT INTO funds.outbox_event
+                        (event_id, aggregate_id, aggregate_version, event_type, schema_version,
+                         payload, created_at, publish_attempts)
+                    VALUES ('%s', '%s', 902, 'ForbiddenPublishAttempts', 1, '{}'::jsonb,
+                            CURRENT_TIMESTAMP, 1)
+                    """.formatted(uuid(903), JOURNAL_ID));
+
                 assertSqlState(connection, "42501", "UPDATE funds.journal SET narration = 'tampered'");
                 assertSqlState(connection, "42501", "DELETE FROM funds.journal");
                 assertSqlState(connection, "42501", "UPDATE funds.posting SET signed_minor_units = 1");
@@ -538,6 +570,27 @@ class LedgerConstraintIT {
                 execute(connection, "SET SESSION AUTHORIZATION funds_app");
                 assertSqlState(connection, "42501", "SET ROLE funds_migrator");
                 execute(connection, "RESET SESSION AUTHORIZATION");
+
+                execute(connection, "SET ROLE funds_migrator");
+                assertConstraintViolation(connection, "55000", "completed_idempotency_immutable", """
+                    UPDATE funds.idempotency_command SET result_json = '{"ownerTamper":true}'::jsonb
+                    WHERE command_id = '%s'
+                    """.formatted(COMMAND_ID));
+                assertConstraintViolation(connection, "55000", "completed_idempotency_immutable", """
+                    DELETE FROM funds.idempotency_command WHERE command_id = '%s'
+                    """.formatted(COMMAND_ID));
+                execute(connection, """
+                    INSERT INTO funds.idempotency_command
+                        (command_id, request_hash, state, created_at)
+                    VALUES ('%s', '%s', 'IN_PROGRESS', CURRENT_TIMESTAMP)
+                    """.formatted(uuid(904), REQUEST_HASH));
+                execute(connection, """
+                    DELETE FROM funds.idempotency_command WHERE command_id = '%s'
+                    """.formatted(uuid(904)));
+                assertEquals(0, queryLong(connection, """
+                    SELECT count(*) FROM funds.idempotency_command WHERE command_id = '%s'
+                    """.formatted(uuid(904))));
+                execute(connection, "RESET ROLE");
 
                 execute(connection, "SET SESSION AUTHORIZATION funds_proof_reader");
                 assertEquals(0, queryLong(connection, """
@@ -933,6 +986,22 @@ class LedgerConstraintIT {
         try {
             var error = assertThrows(SQLException.class, () -> execute(connection, sql));
             assertEquals(expectedSqlState, error.getSQLState());
+        } finally {
+            connection.rollback(beforeViolation);
+        }
+    }
+
+    private static void assertConstraintViolation(
+        Connection connection,
+        String expectedSqlState,
+        String expectedConstraint,
+        String sql
+    ) throws SQLException {
+        Savepoint beforeViolation = connection.setSavepoint();
+        try {
+            var error = assertThrows(PSQLException.class, () -> execute(connection, sql));
+            assertEquals(expectedSqlState, error.getSQLState());
+            assertEquals(expectedConstraint, error.getServerErrorMessage().getConstraint());
         } finally {
             connection.rollback(beforeViolation);
         }

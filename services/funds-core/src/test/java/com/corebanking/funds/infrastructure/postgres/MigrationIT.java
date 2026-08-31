@@ -2,12 +2,14 @@ package com.corebanking.funds.infrastructure.postgres;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agroal.api.AgroalDataSource;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -129,13 +131,25 @@ class MigrationIT {
                 """));
             assertEquals(0, queryInt(connection, """
                 SELECT count(*)
-                FROM pg_trigger trigger
-                JOIN pg_class relation ON relation.oid = trigger.tgrelid
-                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-                JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
-                WHERE namespace.nspname = 'funds' AND NOT trigger.tgisinternal
-                  AND (procedure.proowner <> 'funds_migrator'::regrole OR NOT procedure.prosecdef
-                       OR procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, funds'])
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = 'funds'
+                  AND procedure.prosecdef IS DISTINCT FROM (
+                      procedure.proname IN (
+                          'enforce_external_identifier_customer_scope',
+                          'enforce_journal_reference_consistency',
+                          'enforce_posting_reference_consistency',
+                          'reject_posting_to_completed_journal',
+                          'lock_book_for_posting',
+                          'lock_period_for_posting',
+                          'lock_account_for_posting'))
+                """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = 'funds'
+                  AND procedure.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, funds']
                 """));
             assertEquals(0, queryInt(connection, """
                 SELECT count(*)
@@ -195,8 +209,61 @@ class MigrationIT {
                     'funds_app', 'funds.journal_journal_sequence_seq', 'SELECT')
                 """));
             assertFalse(queryBoolean(connection, """
+                SELECT has_sequence_privilege(
+                    'funds_app', 'funds.journal_journal_sequence_seq', 'UPDATE')
+                """));
+            assertFalse(queryBoolean(connection, """
                 SELECT has_function_privilege(
                     'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')
+                """));
+            assertEquals(3, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = 'funds'
+                  AND has_function_privilege('funds_app', procedure.oid, 'EXECUTE')
+                """));
+            assertEquals(
+                "lock_account_for_posting,lock_book_for_posting,lock_period_for_posting",
+                queryString(connection, """
+                    SELECT string_agg(procedure.proname, ',' ORDER BY procedure.proname)
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = 'funds'
+                      AND has_function_privilege('funds_app', procedure.oid, 'EXECUTE')
+                    """));
+            assertEquals(3, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                JOIN pg_language language ON language.oid = procedure.prolang
+                WHERE namespace.nspname = 'funds'
+                  AND procedure.proname IN (
+                      'lock_book_for_posting',
+                      'lock_period_for_posting',
+                      'lock_account_for_posting')
+                  AND procedure.proisstrict
+                  AND procedure.prosecdef
+                  AND language.lanname = 'sql'
+                  AND procedure.prosrc ~ '^[[:space:]]*SELECT[[:space:]]'
+                  AND position(';' IN procedure.prosrc) = 0
+                """));
+            assertEquals(
+                "aggregate_id,aggregate_version,created_at,event_id,event_type,payload,schema_version",
+                queryString(connection, """
+                    SELECT string_agg(privilege.column_name, ',' ORDER BY privilege.column_name)
+                    FROM information_schema.column_privileges privilege
+                    WHERE privilege.table_schema = 'funds'
+                      AND privilege.table_name = 'outbox_event'
+                      AND privilege.grantee = 'funds_app'
+                      AND privilege.privilege_type = 'INSERT'
+                    """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = 'funds'
+                  AND has_function_privilege('funds_proof_reader', procedure.oid, 'EXECUTE')
                 """));
             assertTrue(queryBoolean(connection,
                 "SELECT has_table_privilege('funds_proof_reader', 'funds.posting', 'SELECT')"));
@@ -242,7 +309,47 @@ class MigrationIT {
                 WHERE procedure.oid = 'funds.default_acl_probe_function()'::regprocedure
                   AND privilege.grantee = 0
                 """));
+            assertEquals(0, queryInt(connection, """
+                SELECT count(*)
+                FROM (
+                    SELECT relation.relowner AS owner
+                    FROM pg_class relation
+                    WHERE relation.oid IN (
+                        'funds.default_acl_probe'::regclass,
+                        'funds.default_acl_probe_id_seq'::regclass)
+                    UNION ALL
+                    SELECT procedure.proowner
+                    FROM pg_proc procedure
+                    WHERE procedure.oid = 'funds.default_acl_probe_function()'::regprocedure
+                ) future_object
+                WHERE future_object.owner <> 'funds_migrator'::regrole
+                """));
+            execute(connection, "SET ROLE funds_migrator");
+            try {
+                execute(connection, "DROP FUNCTION funds.default_acl_probe_function()");
+                execute(connection, "DROP TABLE funds.default_acl_probe");
+            } finally {
+                execute(connection, "RESET ROLE");
+            }
         });
+    }
+
+    @Test
+    void roleBootstrapIsFailClosedAndNeverAltersExistingClusterRoles() throws Exception {
+        try (var input = MigrationIT.class.getResourceAsStream(
+            "/db/migration/V004__application_roles.sql")) {
+            assertNotNull(input);
+            String migration = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+            assertEquals(3, migration.lines()
+                .map(String::strip)
+                .filter(line -> line.matches(
+                    "CREATE ROLE funds_(migrator|app|proof_reader).*"))
+                .count());
+            assertFalse(migration.contains("IF NOT EXISTS"));
+            assertFalse(migration.contains("ALTER ROLE funds_"));
+            assertFalse(migration.contains("pg_auth_members"));
+            assertFalse(migration.contains("REVOKE %I FROM %I"));
+        }
     }
 
     @Test

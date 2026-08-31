@@ -1,41 +1,9 @@
-DO $roles$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'funds_migrator') THEN
-        CREATE ROLE funds_migrator NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'funds_app') THEN
-        CREATE ROLE funds_app NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'funds_proof_reader') THEN
-        CREATE ROLE funds_proof_reader NOLOGIN;
-    END IF;
-END
-$roles$;
-
-ALTER ROLE funds_migrator WITH
+CREATE ROLE funds_migrator WITH
     NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
-ALTER ROLE funds_app WITH
+CREATE ROLE funds_app WITH
     NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
-ALTER ROLE funds_proof_reader WITH
+CREATE ROLE funds_proof_reader WITH
     NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
-
--- None of the capability roles may inherit another role. Deployment login roles
--- may be made members of exactly funds_app or funds_proof_reader outside Flyway.
-DO $memberships$
-DECLARE
-    membership record;
-BEGIN
-    FOR membership IN
-        SELECT granted.rolname AS granted_role, member.rolname AS member_role
-        FROM pg_auth_members auth
-        JOIN pg_roles granted ON granted.oid = auth.roleid
-        JOIN pg_roles member ON member.oid = auth.member
-        WHERE member.rolname IN ('funds_migrator', 'funds_app', 'funds_proof_reader')
-    LOOP
-        EXECUTE format('REVOKE %I FROM %I', membership.granted_role, membership.member_role);
-    END LOOP;
-END
-$memberships$;
 
 CREATE FUNCTION funds.reject_completed_idempotency_mutation()
 RETURNS trigger
@@ -48,42 +16,100 @@ BEGIN
                   CONSTRAINT = 'completed_idempotency_immutable';
     END IF;
 
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+
     RETURN NEW;
 END
 $function$;
 
 CREATE TRIGGER completed_idempotency_immutable
-BEFORE UPDATE ON funds.idempotency_command
+BEFORE UPDATE OR DELETE ON funds.idempotency_command
 FOR EACH ROW
 EXECUTE FUNCTION funds.reject_completed_idempotency_mutation();
 
--- Trigger guards must be able to take their internal SHARE/UPDATE locks without
--- granting the application role broad UPDATE rights on reference or journal
--- tables. They execute as the tightly owned migrator role with a fixed path.
+CREATE FUNCTION funds.lock_book_for_posting(p_book_id uuid)
+RETURNS TABLE (legal_entity_id uuid, accounting_policy_version integer)
+LANGUAGE sql
+STRICT
+SECURITY DEFINER
+SET search_path = pg_catalog, funds
+AS $function$
+    SELECT book.legal_entity_id, book.accounting_policy_version
+    FROM funds.book book
+    WHERE book.book_id = p_book_id
+    FOR SHARE OF book
+$function$;
+
+CREATE FUNCTION funds.lock_period_for_posting(p_period_id uuid)
+RETURNS TABLE (
+    book_id uuid,
+    business_date_from date,
+    business_date_to date,
+    status text
+)
+LANGUAGE sql
+STRICT
+SECURITY DEFINER
+SET search_path = pg_catalog, funds
+AS $function$
+    SELECT period.book_id, period.business_date_from, period.business_date_to, period.status
+    FROM funds.accounting_period period
+    WHERE period.period_id = p_period_id
+    FOR SHARE OF period
+$function$;
+
+CREATE FUNCTION funds.lock_account_for_posting(p_account_id uuid)
+RETURNS TABLE (
+    book_id uuid,
+    currency character(3),
+    control_account_code text,
+    status text,
+    chart_status text
+)
+LANGUAGE sql
+STRICT
+SECURITY DEFINER
+SET search_path = pg_catalog, funds
+AS $function$
+    SELECT account.book_id, account.currency, account.control_account_code,
+           account.status, chart.status AS chart_status
+    FROM funds.ledger_account account
+    JOIN funds.chart_version chart ON chart.chart_version_id = account.chart_version_id
+    WHERE account.account_id = p_account_id
+    FOR UPDATE OF account
+    FOR SHARE OF chart
+$function$;
+
+-- Every funds routine has a deterministic safe path. Only the routines that
+-- must read/lock tables unavailable to their caller execute with owner rights.
+ALTER FUNCTION funds.is_valid_nuban(text, text)
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.reject_product_version_mutation()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_ledger_account_reference_immutability()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_external_identifier_customer_scope()
     SECURITY DEFINER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.reject_account_identifier_mutation()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_journal_reference_consistency()
     SECURITY DEFINER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_posting_reference_consistency()
     SECURITY DEFINER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_journal_balance()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.reject_ledger_mutation()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_book_identity_immutability()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.enforce_ledger_account_identity_immutability()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.reject_posting_to_completed_journal()
     SECURITY DEFINER SET search_path = pg_catalog, funds;
 ALTER FUNCTION funds.reject_completed_idempotency_mutation()
-    SECURITY DEFINER SET search_path = pg_catalog, funds;
+    SECURITY INVOKER SET search_path = pg_catalog, funds;
 
 REVOKE ALL ON SCHEMA funds FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA funds FROM PUBLIC;
@@ -208,9 +234,12 @@ GRANT UPDATE (signed_posting_total, latest_journal_sequence)
     ON funds.control_account_projection TO funds_app;
 GRANT INSERT (
     event_id, aggregate_id, aggregate_version, event_type, schema_version,
-    payload, created_at, published_at, publish_attempts
+    payload, created_at
 ) ON funds.outbox_event TO funds_app;
 
 GRANT USAGE ON SEQUENCE funds.journal_journal_sequence_seq TO funds_app;
+GRANT EXECUTE ON FUNCTION funds.lock_book_for_posting(uuid) TO funds_app;
+GRANT EXECUTE ON FUNCTION funds.lock_period_for_posting(uuid) TO funds_app;
+GRANT EXECUTE ON FUNCTION funds.lock_account_for_posting(uuid) TO funds_app;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA funds TO funds_proof_reader;

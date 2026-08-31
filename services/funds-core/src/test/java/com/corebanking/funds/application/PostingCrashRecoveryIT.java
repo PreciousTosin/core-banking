@@ -2721,8 +2721,7 @@ class PostingCrashRecoveryIT {
         }
 
         private PreparedStatement observedStatement(PreparedStatement statement, String sql) {
-            boolean blocksOnFixture = sql.contains("FROM funds.ledger_account account")
-                && sql.contains("FOR UPDATE OF account");
+            boolean blocksOnFixture = sql.contains("FROM funds.lock_account_for_posting(");
             return (PreparedStatement) Proxy.newProxyInstance(
                 PreparedStatement.class.getClassLoader(),
                 new Class<?>[]{PreparedStatement.class},

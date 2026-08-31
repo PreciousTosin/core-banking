@@ -831,7 +831,7 @@ class PostingConcurrencyIT {
         abstract void record(ConnectionTrace trace, UUID accountId);
 
         private static LockKind from(String sql) {
-            if (sql.contains("FROM funds.ledger_account account") && sql.contains("FOR UPDATE OF account")) {
+            if (sql.contains("FROM funds.lock_account_for_posting(")) {
                 return ACCOUNT;
             }
             if (sql.contains("FROM funds.materialised_balance") && sql.contains("FOR UPDATE")) {
