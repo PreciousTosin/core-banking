@@ -11,12 +11,21 @@ import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
 import com.corebanking.funds.domain.ReversalRequest;
 import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
+import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
+import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -24,6 +33,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -67,11 +80,11 @@ class ReversalServiceIT {
         PostingResult first = reversalService.reverse(reversalRequest(
             REVERSAL_COMMAND_ID,
             ORIGINAL_JOURNAL_ID,
-            "b".repeat(64)));
+            hash("main-reversal")));
         PostingResult replay = reversalService.reverse(reversalRequest(
             REVERSAL_COMMAND_ID,
             ORIGINAL_JOURNAL_ID,
-            "b".repeat(64)));
+            hash("main-reversal")));
 
         JournalSnapshot reversal = journalSnapshot(first.journalId());
         JournalSnapshot originalAfter = journalSnapshot(ORIGINAL_JOURNAL_ID);
@@ -100,7 +113,7 @@ class ReversalServiceIT {
         closeOriginalAndOpenNextPeriod();
         ReversalRequest outsideCurrentPeriod = new ReversalRequest(
             REVERSAL_COMMAND_ID,
-            "c".repeat(64),
+            hash("outside-current-period"),
             ORIGINAL_JOURNAL_ID,
             TestPostingStack.uuid(212),
             TestPostingStack.uuid(213),
@@ -138,14 +151,14 @@ class ReversalServiceIT {
         PostingResult firstReversal = reversalService.reverse(reversalRequest(
             REVERSAL_COMMAND_ID,
             ORIGINAL_JOURNAL_ID,
-            "d".repeat(64)));
+            hash("first-reversal")));
         DatabaseCounts before = databaseCounts();
 
         assertThrows(
             InvalidJournalException.class,
             () -> reversalService.reverse(new ReversalRequest(
                 TestPostingStack.uuid(220),
-                "e".repeat(64),
+                hash("reversal-chain"),
                 firstReversal.journalId(),
                 TestPostingStack.uuid(221),
                 TestPostingStack.uuid(222),
@@ -161,27 +174,7 @@ class ReversalServiceIT {
     void longMinimumNegationIsRejectedAtomically() throws SQLException {
         UUID thirdAccount = TestPostingStack.uuid(209);
         seedThirdAccountAndZeroProjections(thirdAccount);
-        PostingCommand extreme = command(new JournalDraft(
-            ORIGINAL_JOURNAL_ID,
-            ORIGINAL_COMMAND_ID,
-            TestPostingStack.uuid(202),
-            TestPostingStack.uuid(203),
-            TestPostingStack.LEGAL_ENTITY_ID,
-            TestPostingStack.BOOK_ID,
-            TestPostingStack.PERIOD_ID,
-            "EXTREME_BALANCED",
-            "Balanced journal containing Long.MIN_VALUE",
-            Instant.parse("2026-01-20T10:00:00Z"),
-            LocalDate.of(2026, 1, 20),
-            null,
-            1,
-            List.of(
-                new PostingLine(TestPostingStack.uuid(204), TestPostingStack.PROVIDER_ASSET,
-                    NGN, Long.MIN_VALUE, 0, Map.of("case", "minimum")),
-                new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
-                    NGN, Long.MAX_VALUE, 0, Map.of("case", "maximum")),
-                new PostingLine(TestPostingStack.uuid(206), thirdAccount,
-                    NGN, 1, 0, Map.of("case", "unit")))));
+        PostingCommand extreme = extremeCommand(thirdAccount);
         postingService.post(extreme);
         closeOriginalAndOpenNextPeriod();
         JournalSnapshot originalBefore = journalSnapshot(ORIGINAL_JOURNAL_ID);
@@ -192,7 +185,7 @@ class ReversalServiceIT {
             () -> reversalService.reverse(reversalRequest(
                 REVERSAL_COMMAND_ID,
                 ORIGINAL_JOURNAL_ID,
-                "f".repeat(64))));
+                hash("minimum-overflow"))));
 
         assertAll(
             () -> assertEquals(originalBefore, journalSnapshot(ORIGINAL_JOURNAL_ID)),
@@ -200,6 +193,315 @@ class ReversalServiceIT {
             () -> assertEquals(0, queryLong("""
                 SELECT count(*) FROM funds.idempotency_command WHERE command_id = ?
                 """, REVERSAL_COMMAND_ID)));
+    }
+
+    @Test
+    void completedCommandPreflightWinsBeforeOverflowNegation() throws SQLException {
+        UUID thirdAccount = TestPostingStack.uuid(209);
+        seedThirdAccountAndZeroProjections(thirdAccount);
+        PostingCommand alreadyCompleted = exampleA(REVERSAL_COMMAND_ID, TestPostingStack.uuid(240));
+        PostingResult stored = postingService.post(alreadyCompleted);
+        postingService.post(extremeCommand(thirdAccount));
+        closeOriginalAndOpenNextPeriod();
+        DatabaseCounts before = databaseCounts();
+
+        PostingResult replay = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            alreadyCompleted.requestHash()));
+        assertThrows(
+            IdempotencyConflictException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                ORIGINAL_JOURNAL_ID,
+                hash("overflowing-original-conflict"))));
+
+        assertAll(
+            () -> assertEquals(stored, replay),
+            () -> assertEquals(before, databaseCounts()));
+    }
+
+    @Test
+    void usesCurrentBookPolicyForCorrectionInsteadOfHistoricalPolicy() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        execute("UPDATE funds.book SET accounting_policy_version = 2 WHERE book_id = ?",
+            TestPostingStack.BOOK_ID);
+
+        PostingResult result = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            hash("current-policy")));
+
+        assertAll(
+            () -> assertEquals(2, queryLong(
+                "SELECT policy_version FROM funds.journal WHERE journal_id = ?",
+                result.journalId())),
+            () -> assertEquals(2, queryLong(
+                "SELECT accounting_policy_version FROM funds.book WHERE book_id = ?",
+                TestPostingStack.BOOK_ID)));
+    }
+
+    @Test
+    void completedCommandPreflightWinsBeforeInvalidOriginalLookup() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        String digest = hash("preflight-result");
+        PostingResult stored = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            digest));
+        DatabaseCounts before = databaseCounts();
+
+        PostingResult replay = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            TestPostingStack.uuid(999_999),
+            digest));
+        assertThrows(
+            IdempotencyConflictException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                TestPostingStack.uuid(999_999),
+                hash("different-preflight-result"))));
+        assertThrows(
+            IdempotencyConflictException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                stored.journalId(),
+                hash("different-chain-result"))));
+
+        assertAll(
+            () -> assertEquals(stored, replay),
+            () -> assertEquals(before, databaseCounts()));
+    }
+
+    @Test
+    void originalMustBelongToACompletedCommand() throws SQLException {
+        insertIncompleteOriginal();
+        closeOriginalAndOpenNextPeriod();
+
+        assertThrows(
+            InvalidJournalException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                ORIGINAL_JOURNAL_ID,
+                hash("incomplete-original"))));
+
+        assertEquals(0, queryLong(
+            "SELECT count(*) FROM funds.idempotency_command WHERE command_id = ?",
+            REVERSAL_COMMAND_ID));
+    }
+
+    @Test
+    void rejectsJournalAbovePocPostingLimitWithoutWritingCorrection() throws SQLException {
+        var postings = new ArrayList<PostingLine>();
+        int pairs = ReversalService.MAX_POSTINGS_PER_JOURNAL / 2 + 1;
+        for (int pair = 0; pair < pairs; pair++) {
+            postings.add(new PostingLine(
+                TestPostingStack.uuid(10_000L + pair * 2L),
+                TestPostingStack.PROVIDER_ASSET,
+                NGN,
+                1,
+                0,
+                Map.of()));
+            postings.add(new PostingLine(
+                TestPostingStack.uuid(10_001L + pair * 2L),
+                TestPostingStack.CUSTOMER_LIABILITY,
+                NGN,
+                -1,
+                0,
+                Map.of()));
+        }
+        postingService.post(command(originalJournal(postings)));
+        closeOriginalAndOpenNextPeriod();
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(
+            InvalidJournalException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                ORIGINAL_JOURNAL_ID,
+                hash("posting-limit"))));
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void rejectsPostingAbovePocDimensionLimitWithoutWritingCorrection() throws SQLException {
+        var dimensions = new java.util.LinkedHashMap<String, String>();
+        for (int index = 0; index <= ReversalService.MAX_DIMENSIONS_PER_POSTING; index++) {
+            dimensions.put("dimension-" + index, "value-" + index);
+        }
+        postingService.post(command(originalJournal(List.of(
+            new PostingLine(TestPostingStack.uuid(204), TestPostingStack.PROVIDER_ASSET,
+                NGN, 1, 0, dimensions),
+            new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
+                NGN, -1, 0, Map.of())))));
+        closeOriginalAndOpenNextPeriod();
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(
+            InvalidJournalException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                ORIGINAL_JOURNAL_ID,
+                hash("dimension-limit"))));
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void requestRequiresLowercaseSha256AndUtf8BoundedReason() throws SQLException {
+        String exactBoundary = "é".repeat(256);
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        ReversalRequest exactRequest = new ReversalRequest(
+            REVERSAL_COMMAND_ID, hash("boundary"), ORIGINAL_JOURNAL_ID,
+            TestPostingStack.uuid(212), TestPostingStack.uuid(213), NEXT_PERIOD_ID,
+            REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, exactBoundary);
+        PostingResult accepted = reversalService.reverse(exactRequest);
+
+        assertAll(
+            () -> assertEquals(512, queryLong(
+                "SELECT octet_length(narration) FROM funds.journal WHERE journal_id = ?",
+                accepted.journalId())),
+            () -> assertThrows(IllegalArgumentException.class, () -> new ReversalRequest(
+                REVERSAL_COMMAND_ID, "g".repeat(64), ORIGINAL_JOURNAL_ID,
+                TestPostingStack.uuid(212), TestPostingStack.uuid(213), NEXT_PERIOD_ID,
+                REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, "reason")),
+            () -> assertThrows(IllegalArgumentException.class, () -> new ReversalRequest(
+                REVERSAL_COMMAND_ID, hash("upper").toUpperCase(java.util.Locale.ROOT),
+                ORIGINAL_JOURNAL_ID, TestPostingStack.uuid(212), TestPostingStack.uuid(213),
+                NEXT_PERIOD_ID, REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, "reason")),
+            () -> assertThrows(IllegalArgumentException.class, () -> new ReversalRequest(
+                REVERSAL_COMMAND_ID, hash("too-long-reason"), ORIGINAL_JOURNAL_ID,
+                TestPostingStack.uuid(212), TestPostingStack.uuid(213), NEXT_PERIOD_ID,
+                REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, exactBoundary + "a")));
+    }
+
+    @Test
+    void originalHeaderAndPostingsComeFromOneRepeatableReadSnapshot() throws Exception {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        var headerRead = new CountDownLatch(1);
+        var appendCommitted = new CountDownLatch(1);
+        var mutationFailure = new AtomicReference<Throwable>();
+        DataSource interleaving = interleavingDataSource(dataSource, headerRead, appendCommitted);
+        Thread mutator = Thread.startVirtualThread(() -> {
+            try {
+                assertTrue(headerRead.await(5, TimeUnit.SECONDS));
+                appendBalancedLinesToOriginal();
+            } catch (Throwable failure) {
+                mutationFailure.set(failure);
+            } finally {
+                appendCommitted.countDown();
+            }
+        });
+
+        PostingResult result = new ReversalService(interleaving, postingService).reverse(
+            reversalRequest(REVERSAL_COMMAND_ID, ORIGINAL_JOURNAL_ID, hash("coherent-snapshot")));
+        mutator.join(TimeUnit.SECONDS.toMillis(5));
+
+        assertAll(
+            () -> assertTrue(!mutator.isAlive(), "mutator must terminate"),
+            () -> assertEquals(null, mutationFailure.get()),
+            () -> assertEquals(4, queryLong(
+                "SELECT count(*) FROM funds.posting WHERE journal_id = ?",
+                ORIGINAL_JOURNAL_ID)),
+            () -> assertEquals(2, journalSnapshot(result.journalId()).postings().size()),
+            () -> assertEquals(
+                List.of(-100_000L, 100_000L),
+                journalSnapshot(result.journalId()).postings().stream()
+                    .map(PostingSnapshot::signedMinorUnits).sorted().toList()));
+    }
+
+    @Test
+    void everyReadHasFiniteTimeoutAndFailureRollsBackAndRestoresConnection() {
+        var timeoutSet = new AtomicBoolean();
+        var events = new ArrayList<String>();
+        DataSource timingOut = timingOutDataSource(dataSource, timeoutSet, events);
+        ReversalService service = new ReversalService(timingOut, postingService);
+
+        assertThrows(
+            LedgerPersistenceException.class,
+            () -> service.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                ORIGINAL_JOURNAL_ID,
+                hash("query-timeout"))));
+
+        assertAll(
+            () -> assertTrue(timeoutSet.get()),
+            () -> assertTrue(events.contains("autoCommit:false")),
+            () -> assertTrue(events.contains("readOnly:true")),
+            () -> assertTrue(events.contains("isolation:" + Connection.TRANSACTION_REPEATABLE_READ)),
+            () -> assertTrue(events.contains("rollback")),
+            () -> assertTrue(events.contains("readOnly:false")),
+            () -> assertTrue(events.contains("autoCommit:true")),
+            () -> assertEquals("close", events.getLast()));
+    }
+
+    @Test
+    void everyReversalReadSetsTimeoutBeforeExecution() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        var prepared = new java.util.concurrent.atomic.AtomicInteger();
+        var executed = new java.util.concurrent.atomic.AtomicInteger();
+        DataSource recording = timeoutRecordingDataSource(dataSource, prepared, executed);
+
+        new ReversalService(recording, postingService).reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            hash("all-query-timeouts")));
+
+        assertAll(
+            () -> assertEquals(4, prepared.get()),
+            () -> assertEquals(prepared.get(), executed.get()));
+    }
+
+    @Test
+    void matchingInProgressCommandContinuesButDifferentHashConflictsFirst() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        String digest = hash("visible-in-progress");
+        execute("""
+            INSERT INTO funds.idempotency_command (command_id, request_hash, state, created_at)
+            VALUES (?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)
+            """, REVERSAL_COMMAND_ID, digest);
+
+        assertThrows(
+            IdempotencyConflictException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                TestPostingStack.uuid(999_999),
+                hash("visible-in-progress-conflict"))));
+        PostingResult result = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            digest));
+
+        assertAll(
+            () -> assertEquals(2, count("funds.journal")),
+            () -> assertEquals(1, queryLong("""
+                SELECT count(*) FROM funds.idempotency_command
+                WHERE command_id = ? AND state = 'COMPLETED' AND journal_id = ?
+                """, REVERSAL_COMMAND_ID, result.journalId())));
+    }
+
+    @Test
+    void rejectsPostCompletionPostingAppendThatBreaksCanonicalFact() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        appendBalancedLinesToOriginal();
+        closeOriginalAndOpenNextPeriod();
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(
+            InvalidJournalException.class,
+            () -> reversalService.reverse(reversalRequest(
+                REVERSAL_COMMAND_ID,
+                ORIGINAL_JOURNAL_ID,
+                hash("canonical-mismatch"))));
+
+        assertEquals(before, databaseCounts());
     }
 
     private PostingCommand exampleA(UUID commandId, UUID journalId) {
@@ -222,6 +524,48 @@ class ReversalServiceIT {
                     NGN, 100_000, 0, Map.of("rail", "provider", "route", "nibss")),
                 new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
                     NGN, -100_000, 0, Map.of("customer", "example-a")))));
+    }
+
+    private JournalDraft originalJournal(List<PostingLine> postings) {
+        return new JournalDraft(
+            ORIGINAL_JOURNAL_ID,
+            ORIGINAL_COMMAND_ID,
+            TestPostingStack.uuid(202),
+            TestPostingStack.uuid(203),
+            TestPostingStack.LEGAL_ENTITY_ID,
+            TestPostingStack.BOOK_ID,
+            TestPostingStack.PERIOD_ID,
+            "LIMIT_FIXTURE",
+            "POC bounded-reversal fixture",
+            Instant.parse("2026-01-15T10:00:00Z"),
+            LocalDate.of(2026, 1, 15),
+            null,
+            1,
+            postings);
+    }
+
+    private PostingCommand extremeCommand(UUID thirdAccount) {
+        return command(new JournalDraft(
+            ORIGINAL_JOURNAL_ID,
+            ORIGINAL_COMMAND_ID,
+            TestPostingStack.uuid(202),
+            TestPostingStack.uuid(203),
+            TestPostingStack.LEGAL_ENTITY_ID,
+            TestPostingStack.BOOK_ID,
+            TestPostingStack.PERIOD_ID,
+            "EXTREME_BALANCED",
+            "Balanced journal containing Long.MIN_VALUE",
+            Instant.parse("2026-01-20T10:00:00Z"),
+            LocalDate.of(2026, 1, 20),
+            null,
+            1,
+            List.of(
+                new PostingLine(TestPostingStack.uuid(214), TestPostingStack.PROVIDER_ASSET,
+                    NGN, Long.MIN_VALUE, 0, Map.of("case", "minimum")),
+                new PostingLine(TestPostingStack.uuid(215), TestPostingStack.CUSTOMER_LIABILITY,
+                    NGN, Long.MAX_VALUE, 0, Map.of("case", "maximum")),
+                new PostingLine(TestPostingStack.uuid(216), thirdAccount,
+                    NGN, 1, 0, Map.of("case", "unit")))));
     }
 
     private static PostingCommand command(JournalDraft journal) {
@@ -273,6 +617,230 @@ class ReversalServiceIT {
                 """);
             TestPostingStack.execute(connection, "DELETE FROM funds.control_account_projection");
         }
+    }
+
+    private void insertIncompleteOriginal() throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                TestPostingStack.execute(connection, """
+                    INSERT INTO funds.idempotency_command
+                        (command_id, request_hash, state, created_at)
+                    VALUES (?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)
+                    """, ORIGINAL_COMMAND_ID, hash("incomplete-command"));
+                TestPostingStack.execute(connection, """
+                    INSERT INTO funds.journal
+                        (journal_id, command_id, correlation_id, business_transaction_id,
+                         legal_entity_id, book_id, period_id, transaction_type, narration,
+                         booking_time, value_date, policy_version, canonical_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'INCOMPLETE_FIXTURE', 'Incomplete command fixture',
+                            TIMESTAMPTZ '2026-01-15 10:00:00+00', DATE '2026-01-15', 1, ?)
+                    """, ORIGINAL_JOURNAL_ID, ORIGINAL_COMMAND_ID, TestPostingStack.uuid(202),
+                    TestPostingStack.uuid(203), TestPostingStack.LEGAL_ENTITY_ID,
+                    TestPostingStack.BOOK_ID, TestPostingStack.PERIOD_ID, hash("incomplete-journal"));
+                TestPostingStack.execute(connection, """
+                    INSERT INTO funds.posting
+                        (posting_id, journal_id, account_id, currency, signed_minor_units,
+                         account_sequence, dimensions)
+                    VALUES (?, ?, ?, 'NGN', 1, 1, '{}'::jsonb),
+                           (?, ?, ?, 'NGN', -1, 1, '{}'::jsonb)
+                    """, TestPostingStack.uuid(204), ORIGINAL_JOURNAL_ID,
+                    TestPostingStack.PROVIDER_ASSET, TestPostingStack.uuid(205),
+                    ORIGINAL_JOURNAL_ID, TestPostingStack.CUSTOMER_LIABILITY);
+                connection.commit();
+            } catch (Throwable failure) {
+                connection.rollback();
+                throw failure;
+            }
+        }
+    }
+
+    private void appendBalancedLinesToOriginal() throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                TestPostingStack.execute(connection, """
+                    INSERT INTO funds.posting
+                        (posting_id, journal_id, account_id, currency, signed_minor_units,
+                         account_sequence, dimensions)
+                    VALUES (?, ?, ?, 'NGN', 7, 5, '{"mutation":"provider"}'::jsonb),
+                           (?, ?, ?, 'NGN', -7, 7, '{"mutation":"customer"}'::jsonb)
+                    """, TestPostingStack.uuid(230), ORIGINAL_JOURNAL_ID,
+                    TestPostingStack.PROVIDER_ASSET, TestPostingStack.uuid(231),
+                    ORIGINAL_JOURNAL_ID, TestPostingStack.CUSTOMER_LIABILITY);
+                TestPostingStack.execute(connection, """
+                    UPDATE funds.materialised_balance
+                    SET signed_posting_total = signed_posting_total + 7,
+                        latest_account_sequence = 5, version = version + 1
+                    WHERE account_id = ?
+                    """, TestPostingStack.PROVIDER_ASSET);
+                TestPostingStack.execute(connection, """
+                    UPDATE funds.materialised_balance
+                    SET signed_posting_total = signed_posting_total - 7,
+                        latest_account_sequence = 7, version = version + 1
+                    WHERE account_id = ?
+                    """, TestPostingStack.CUSTOMER_LIABILITY);
+                TestPostingStack.execute(connection, """
+                    UPDATE funds.control_account_projection
+                    SET signed_posting_total = signed_posting_total + 7
+                    WHERE book_id = ? AND control_account_code = ? AND currency = 'NGN'
+                    """, TestPostingStack.BOOK_ID, TestPostingStack.PROVIDER_CONTROL);
+                TestPostingStack.execute(connection, """
+                    UPDATE funds.control_account_projection
+                    SET signed_posting_total = signed_posting_total - 7
+                    WHERE book_id = ? AND control_account_code = ? AND currency = 'NGN'
+                    """, TestPostingStack.BOOK_ID, TestPostingStack.CUSTOMER_CONTROL);
+                connection.commit();
+            } catch (Throwable failure) {
+                connection.rollback();
+                throw failure;
+            }
+        }
+    }
+
+    private static DataSource interleavingDataSource(
+        DataSource delegate,
+        CountDownLatch headerRead,
+        CountDownLatch appendCommitted
+    ) {
+        var triggered = new AtomicBoolean();
+        return proxy(DataSource.class, delegate, (method, args) -> {
+            if (!method.getName().equals("getConnection")) {
+                return invoke(delegate, method, args);
+            }
+            Connection connection = (Connection) invoke(delegate, method, args);
+            return proxy(Connection.class, connection, (connectionMethod, connectionArgs) -> {
+                if (!connectionMethod.getName().equals("prepareStatement")) {
+                    return invoke(connection, connectionMethod, connectionArgs);
+                }
+                String sql = (String) connectionArgs[0];
+                PreparedStatement statement = (PreparedStatement) invoke(
+                    connection,
+                    connectionMethod,
+                    connectionArgs);
+                if (!sql.contains("FROM funds.journal")) {
+                    return statement;
+                }
+                return proxy(PreparedStatement.class, statement, (statementMethod, statementArgs) -> {
+                    Object value = invoke(statement, statementMethod, statementArgs);
+                    if (!statementMethod.getName().equals("executeQuery") || !triggered.compareAndSet(false, true)) {
+                        return value;
+                    }
+                    java.sql.ResultSet rows = (java.sql.ResultSet) value;
+                    return proxy(java.sql.ResultSet.class, rows, (rowsMethod, rowsArgs) -> {
+                        if (rowsMethod.getName().equals("close")) {
+                            Object closed = invoke(rows, rowsMethod, rowsArgs);
+                            headerRead.countDown();
+                            if (!appendCommitted.await(5, TimeUnit.SECONDS)) {
+                                throw new SQLException("timed out waiting for concurrent append");
+                            }
+                            return closed;
+                        }
+                        return invoke(rows, rowsMethod, rowsArgs);
+                    });
+                });
+            });
+        });
+    }
+
+    private static DataSource timingOutDataSource(
+        DataSource delegate,
+        AtomicBoolean timeoutSet,
+        List<String> events
+    ) {
+        return proxy(DataSource.class, delegate, (method, args) -> {
+            if (!method.getName().equals("getConnection")) {
+                return invoke(delegate, method, args);
+            }
+            Connection connection = (Connection) invoke(delegate, method, args);
+            return proxy(Connection.class, connection, (connectionMethod, connectionArgs) -> {
+                switch (connectionMethod.getName()) {
+                    case "setAutoCommit" -> events.add("autoCommit:" + connectionArgs[0]);
+                    case "setReadOnly" -> events.add("readOnly:" + connectionArgs[0]);
+                    case "setTransactionIsolation" -> events.add("isolation:" + connectionArgs[0]);
+                    case "rollback", "commit", "close" -> events.add(connectionMethod.getName());
+                    default -> { }
+                }
+                if (!connectionMethod.getName().equals("prepareStatement")) {
+                    return invoke(connection, connectionMethod, connectionArgs);
+                }
+                PreparedStatement statement = (PreparedStatement) invoke(
+                    connection,
+                    connectionMethod,
+                    connectionArgs);
+                return proxy(PreparedStatement.class, statement, (statementMethod, statementArgs) -> {
+                    if (statementMethod.getName().equals("setQueryTimeout")) {
+                        timeoutSet.set((int) statementArgs[0] > 0);
+                        return invoke(statement, statementMethod, statementArgs);
+                    }
+                    if (statementMethod.getName().equals("executeQuery")) {
+                        if (!timeoutSet.get()) {
+                            throw new AssertionError("query executed without a finite JDBC timeout");
+                        }
+                        throw new SQLTimeoutException("injected deterministic timeout", "57014");
+                    }
+                    return invoke(statement, statementMethod, statementArgs);
+                });
+            });
+        });
+    }
+
+    private static DataSource timeoutRecordingDataSource(
+        DataSource delegate,
+        java.util.concurrent.atomic.AtomicInteger prepared,
+        java.util.concurrent.atomic.AtomicInteger executed
+    ) {
+        return proxy(DataSource.class, delegate, (method, args) -> {
+            if (!method.getName().equals("getConnection")) {
+                return invoke(delegate, method, args);
+            }
+            Connection connection = (Connection) invoke(delegate, method, args);
+            return proxy(Connection.class, connection, (connectionMethod, connectionArgs) -> {
+                if (!connectionMethod.getName().equals("prepareStatement")) {
+                    return invoke(connection, connectionMethod, connectionArgs);
+                }
+                prepared.incrementAndGet();
+                PreparedStatement statement = (PreparedStatement) invoke(
+                    connection,
+                    connectionMethod,
+                    connectionArgs);
+                var timeoutSet = new AtomicBoolean();
+                return proxy(PreparedStatement.class, statement, (statementMethod, statementArgs) -> {
+                    if (statementMethod.getName().equals("setQueryTimeout")) {
+                        timeoutSet.set((int) statementArgs[0] > 0);
+                    }
+                    if (statementMethod.getName().equals("executeQuery")) {
+                        if (!timeoutSet.get()) {
+                            throw new AssertionError("query executed without a finite JDBC timeout");
+                        }
+                        executed.incrementAndGet();
+                    }
+                    return invoke(statement, statementMethod, statementArgs);
+                });
+            });
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T proxy(Class<T> type, T delegate, ProxyCall call) {
+        return (T) Proxy.newProxyInstance(
+            type.getClassLoader(),
+            new Class<?>[] {type},
+            (ignored, method, args) -> call.invoke(method, args == null ? new Object[0] : args));
+    }
+
+    private static Object invoke(Object target, java.lang.reflect.Method method, Object[] args)
+        throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException failure) {
+            throw failure.getCause();
+        }
+    }
+
+    @FunctionalInterface
+    private interface ProxyCall {
+        Object invoke(java.lang.reflect.Method method, Object[] args) throws Throwable;
     }
 
     private static void assertExactNegations(List<PostingSnapshot> original, List<PostingSnapshot> reversal) {
@@ -373,6 +941,21 @@ class ReversalServiceIT {
                 rows.next();
                 return rows.getLong(1);
             }
+        }
+    }
+
+    private void execute(String sql, Object... values) throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            TestPostingStack.execute(connection, sql, values);
+        }
+    }
+
+    private static String hash(String value) {
+        try {
+            return java.util.HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException(impossible);
         }
     }
 

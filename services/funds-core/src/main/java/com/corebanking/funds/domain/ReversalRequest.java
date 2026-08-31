@@ -1,5 +1,6 @@
 package com.corebanking.funds.domain;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Objects;
@@ -28,11 +29,15 @@ public record ReversalRequest(
         bookingTime = Objects.requireNonNull(bookingTime, "bookingTime");
         valueDate = Objects.requireNonNull(valueDate, "valueDate");
         reason = Objects.requireNonNull(reason, "reason");
-        if (requestHash.length() != 64) {
-            throw new IllegalArgumentException("requestHash must contain exactly 64 characters");
+        if (!requestHash.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException(
+                "requestHash must be a lowercase 64-character SHA-256 hexadecimal digest");
         }
         if (reason.isBlank()) {
             throw new IllegalArgumentException("reason must not be blank");
+        }
+        if (reason.getBytes(StandardCharsets.UTF_8).length > 512) {
+            throw new IllegalArgumentException("reason must not exceed 512 UTF-8 bytes");
         }
     }
 }
