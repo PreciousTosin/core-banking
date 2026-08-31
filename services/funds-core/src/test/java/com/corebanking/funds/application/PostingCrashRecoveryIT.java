@@ -18,7 +18,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintWriter;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -36,15 +39,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -53,6 +57,7 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.postgresql.ds.PGSimpleDataSource;
 
 @QuarkusTest
@@ -63,6 +68,9 @@ class PostingCrashRecoveryIT {
 
     @Inject
     DataSource dataSource;
+
+    @TempDir
+    Path tempDirectory;
 
     private CrashProbe rows;
     private DatabaseCredentials credentials;
@@ -209,6 +217,29 @@ class PostingCrashRecoveryIT {
     }
 
     @Test
+    void cleanupFailureRestoresInterruptAndRetainsPrimaryAndSuppressedDiagnostics() {
+        var executor = new InterruptingCleanupExecutor();
+        Thread.interrupted();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class, () -> runBounded(
+                Duration.ofSeconds(1),
+                "interrupting cleanup failure",
+                () -> null,
+                () -> null,
+                () -> new AssertionError("release diagnostic"),
+                executor));
+
+            assertAll(
+                () -> assertTrue(executor.isTerminated()),
+                () -> assertTrue(Thread.currentThread().isInterrupted()),
+                () -> assertTrue(throwableTreeContains(failure, "executor shutdown failed")),
+                () -> assertTrue(throwableTreeContains(failure, "release diagnostic")));
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
     void lateJdbcConnectionIsClosedWhenTimeoutWinsAcquisitionRace() {
         var lateDataSource = new InterruptReturningDataSource();
 
@@ -227,33 +258,117 @@ class PostingCrashRecoveryIT {
     }
 
     @Test
-    void workerCleanupSharesOneDeterministicDeadlineAndBoundsStreamClose() throws Exception {
+    void realRepositoryRetryClosesAndClearsTheFailedAttemptBeforeOpeningTheNextConnection() throws Exception {
+        UUID commandId = TestPostingStack.uuid(60);
+        PostingCommand command = CrashPostingWorker.command(commandId);
+        CrashSnapshot before = rows.snapshot(commandId);
+        var retryDataSource = new SerializationFailureOnceDataSource(boundedDataSource);
+
+        PostingResult result = runJdbcBounded(
+            PROCESS_TIMEOUT,
+            "tracked real-repository retry",
+            retryDataSource,
+            resources -> TestPostingStack
+                .create(resources.trackingDataSource(), PostingTransactionObserver.noop())
+                .postingService()
+                .post(command));
+
+        CrashSnapshot after = rows.snapshot(commandId);
+        assertAll(
+            () -> assertTrue(retryDataSource.serializationFailureInjected.get()),
+            () -> assertEquals(2, retryDataSource.acquiredConnections.get()),
+            () -> assertEquals(2, retryDataSource.physicalConnections.size()),
+            () -> assertTrue(retryDataSource.physicalConnections.stream().allMatch(connection -> {
+                try {
+                    return connection.isClosed();
+                } catch (SQLException failure) {
+                    throw new AssertionError("failed to inspect retry connection", failure);
+                }
+            })));
+        assertOneCompletedEffect(command, result, before, after);
+    }
+
+    @Test
+    void boundedCancellationCancelsTheBlockingRealRepositoryStatementAndAbortsItsConnection() throws Exception {
+        UUID commandId = TestPostingStack.uuid(61);
+        PostingCommand command = CrashPostingWorker.command(commandId);
+        CrashSnapshot before = rows.snapshot(commandId);
+        PGSimpleDataSource slowDataSource = timeoutDataSource(credentials);
+        slowDataSource.setSocketTimeout(5);
+        slowDataSource.setQueryTimeout(5);
+        slowDataSource.setOptions("-c statement_timeout=5000 -c lock_timeout=5000");
+        var observedDataSource = new BlockingStatementObservationDataSource(slowDataSource);
+
+        runJdbcBounded(
+            PROCESS_TIMEOUT,
+            "blocking repository fixture",
+            boundedDataSource,
+            holderResources -> holderResources.withConnection(holder -> {
+                holder.setAutoCommit(false);
+                try (var tracked = holderResources.prepare(holder, """
+                    SELECT account_id
+                    FROM funds.ledger_account
+                    WHERE account_id IN (?, ?)
+                    ORDER BY account_id
+                    FOR UPDATE
+                    """)) {
+                    var statement = tracked.statement();
+                    statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
+                    statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
+                    try (var result = statement.executeQuery()) {
+                        assertTrue(result.next());
+                        assertTrue(result.next());
+                    }
+                }
+
+                AssertionError failure = assertThrows(AssertionError.class, () -> runJdbcBounded(
+                    Duration.ofSeconds(2),
+                    "blocking real-repository cancellation",
+                    observedDataSource,
+                    resources -> TestPostingStack
+                        .create(resources.trackingDataSource(), PostingTransactionObserver.noop())
+                        .postingService()
+                        .post(command)));
+
+                assertAll(
+                    () -> assertTrue(failure.getMessage().contains("blocking real-repository cancellation")),
+                    () -> assertEquals(0, observedDataSource.blockingStatementStarted.getCount()),
+                    () -> assertTrue(observedDataSource.statementCancelled.get()),
+                    () -> assertTrue(observedDataSource.connectionAborted.get()),
+                    () -> assertTrue(observedDataSource.connectionClosed.get()),
+                    () -> assertEquals(before, rows.snapshot(commandId)));
+                holder.rollback();
+                return null;
+            }));
+    }
+
+    @Test
+    void workerUsesOneDeterministicDeadlineForProcessWaitOutputReadAndFileDeletion() {
         var clock = new MutableNanoClock();
-        var input = new StubbornInputStream();
-        var process = new SlowTerminationProcess(input);
-        var waits = new RecordingTimedWaits(clock, input);
+        var process = new DeterministicExitProcess();
+        var waits = new RecordingTimedWaits(clock);
+        var files = new RecordingWorkerFiles(process);
+        Path outputFile = tempDirectory.resolve("deterministic-worker-output.log");
         var worker = new WorkerHandle(
             process,
             CrashPostingWorker.CrashPoint.BEFORE_COMMIT,
+            outputFile,
             Duration.ofNanos(100),
             clock::nanoTime,
-            waits);
-        try {
-            AssertionError failure = assertThrows(AssertionError.class, worker::close);
-            assertAll(
-                () -> assertTrue(process.destroyed.get()),
-                () -> assertTrue(failure.getMessage().contains("survived forced destruction")),
-                () -> assertTrue(throwableTreeContains(failure, "output close did not finish")),
-                () -> assertTrue(throwableTreeContains(failure, "output reader survived")),
-                () -> assertEquals(0, input.closeStarted.getCount()),
-                () -> assertEquals(0, input.closeInterrupted.getCount()),
-                () -> assertEquals(List.of(100L, 40L, 20L, 20L), waits.observedBudgets));
-        } finally {
-            input.release();
-            if (!worker.outputReader.join(Duration.ofSeconds(1))) {
-                throw new AssertionError("cleanup-test output reader did not terminate");
-            }
-        }
+            waits,
+            files);
+
+        WorkerExit exit = worker.awaitExit();
+        worker.close();
+
+        assertAll(
+            () -> assertEquals(91, exit.exitCode()),
+            () -> assertEquals("REACHED:BEFORE_COMMIT\n", exit.output()),
+            () -> assertTrue(files.readAfterExit.get()),
+            () -> assertTrue(files.deleted.get()),
+            () -> assertEquals(outputFile, files.readPath.get()),
+            () -> assertEquals(outputFile, files.deletedPath.get()),
+            () -> assertEquals(List.of(90L, 60L, 50L), waits.observedBudgets));
     }
 
     @Test
@@ -328,6 +443,7 @@ class PostingCrashRecoveryIT {
     }
 
     private WorkerHandle startWorker(CrashPostingWorker.CrashPoint point, UUID commandId) throws IOException {
+        Path outputFile = Files.createTempFile(tempDirectory, "crash-posting-" + point + '-', ".log");
         var builder = new ProcessBuilder(
             Path.of(System.getProperty("java.home"), "bin", "java").toString(),
             "-cp",
@@ -335,11 +451,21 @@ class PostingCrashRecoveryIT {
             CrashPostingWorker.class.getName(),
             commandId.toString(),
             point.name())
-            .redirectErrorStream(true);
+            .redirectErrorStream(true)
+            .redirectOutput(outputFile.toFile());
         builder.environment().put("CB_TEST_JDBC_URL", credentials.jdbcUrl());
         builder.environment().put("CB_TEST_DB_USER", credentials.username());
         builder.environment().put("CB_TEST_DB_PASSWORD", credentials.password());
-        return new WorkerHandle(builder.start(), point);
+        try {
+            return new WorkerHandle(builder.start(), point, outputFile);
+        } catch (IOException startFailure) {
+            try {
+                Files.deleteIfExists(outputFile);
+            } catch (IOException deleteFailure) {
+                startFailure.addSuppressed(deleteFailure);
+            }
+            throw startFailure;
+        }
     }
 
     private static DatabaseCredentials databaseCredentials(DataSource dataSource) throws SQLException {
@@ -539,10 +665,27 @@ class PostingCrashRecoveryIT {
         Supplier<AssertionError> cancellation,
         Supplier<AssertionError> releaseVerification
     ) throws Exception {
-        Deadline deadline = Deadline.after(timeout, System::nanoTime);
-        long cleanupReserve = Math.min(SECONDS.toNanos(3), Math.max(1, timeout.toNanos() / 4));
         ExecutorService executor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("bounded-" + description.replace(' ', '-')).factory());
+        return runBounded(
+            timeout,
+            description,
+            operation,
+            cancellation,
+            releaseVerification,
+            executor);
+    }
+
+    private static <T> T runBounded(
+        Duration timeout,
+        String description,
+        Callable<T> operation,
+        Supplier<AssertionError> cancellation,
+        Supplier<AssertionError> releaseVerification,
+        ExecutorService executor
+    ) throws Exception {
+        Deadline deadline = Deadline.after(timeout, System::nanoTime);
+        long cleanupReserve = Math.min(SECONDS.toNanos(3), Math.max(1, timeout.toNanos() / 4));
         Future<T> future = executor.submit(operation);
         Throwable primaryFailure = null;
         boolean restoreInterrupt = false;
@@ -569,26 +712,33 @@ class PostingCrashRecoveryIT {
             primaryFailure = failure;
             throw failure;
         } finally {
-            restoreInterrupt |= shutdownBounded(
+            CleanupOutcome cleanup = shutdownBounded(
                 executor,
                 future,
                 description,
                 deadline,
-                primaryFailure,
                 cancellation,
                 releaseVerification);
+            restoreInterrupt |= cleanup.restoreInterrupt();
             if (restoreInterrupt) {
                 Thread.currentThread().interrupt();
+            }
+            if (cleanup.failure() != null) {
+                if (primaryFailure == null) {
+                    throw cleanup.failure();
+                }
+                if (cleanup.failure() != primaryFailure) {
+                    primaryFailure.addSuppressed(cleanup.failure());
+                }
             }
         }
     }
 
-    private static boolean shutdownBounded(
+    private static CleanupOutcome shutdownBounded(
         ExecutorService executor,
         Future<?> future,
         String description,
         Deadline deadline,
-        Throwable primaryFailure,
         Supplier<AssertionError> cancellation,
         Supplier<AssertionError> releaseVerification
     ) {
@@ -645,15 +795,8 @@ class PostingCrashRecoveryIT {
                 cleanupFailure,
                 new AssertionError(description + " resource-release verification failed", failure));
         }
-        if (cleanupFailure != null) {
-            if (primaryFailure == null) {
-                throw cleanupFailure;
-            }
-            if (cleanupFailure != primaryFailure) {
-                primaryFailure.addSuppressed(cleanupFailure);
-            }
-        }
-        return restoreInterrupt;
+        restoreInterrupt |= Thread.interrupted();
+        return new CleanupOutcome(restoreInterrupt, cleanupFailure);
     }
 
     private static <T> T runJdbcBounded(
@@ -692,6 +835,8 @@ class PostingCrashRecoveryIT {
     private record DatabaseCredentials(String jdbcUrl, String username, String password) {}
 
     private record SessionTimeouts(String statementTimeout, String lockTimeout) {}
+
+    private record CleanupOutcome(boolean restoreInterrupt, AssertionError failure) {}
 
     private record WorkerExit(int exitCode, String output) {}
 
@@ -797,13 +942,14 @@ class PostingCrashRecoveryIT {
         }
 
         private Connection acquireConnection() throws SQLException {
-            Connection connection = dataSource.getConnection();
+            Connection delegate = dataSource.getConnection();
             if (cancelled.get()) {
-                abortAndClose(connection);
+                abortAndClose(delegate);
                 throw new SQLTimeoutException(description + " acquired a connection after cancellation");
             }
+            Connection connection = trackedConnection(delegate);
             if (!activeConnection.compareAndSet(null, connection)) {
-                abortAndClose(connection);
+                abortAndClose(delegate);
                 throw new IllegalStateException(description + " opened concurrent JDBC connections");
             }
             if (cancelled.get()) {
@@ -816,19 +962,61 @@ class PostingCrashRecoveryIT {
         private TrackedStatement prepare(Connection connection, String sql) throws SQLException {
             PreparedStatement statement = connection.prepareStatement(sql);
             statement.setQueryTimeout(1);
+            return new TrackedStatement(this, statement);
+        }
+
+        private Connection trackedConnection(Connection delegate) {
+            return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, arguments) -> {
+                    if ("close".equals(method.getName()) || "abort".equals(method.getName())) {
+                        try {
+                            return invoke(delegate, method, arguments);
+                        } finally {
+                            activeConnection.compareAndSet((Connection) proxy, null);
+                        }
+                    }
+                    Object result = invoke(delegate, method, arguments);
+                    if (("prepareStatement".equals(method.getName()) || "createStatement".equals(method.getName()))
+                        && result instanceof Statement statement) {
+                        return trackedStatement(statement);
+                    }
+                    return result;
+                });
+        }
+
+        private Statement trackedStatement(Statement delegate) throws SQLException {
             if (cancelled.get()) {
-                closeStatement(statement);
+                delegate.close();
                 throw new SQLTimeoutException(description + " prepared a statement after cancellation");
             }
+            Class<?> statementType = delegate instanceof PreparedStatement
+                ? PreparedStatement.class
+                : Statement.class;
+            Statement statement = (Statement) Proxy.newProxyInstance(
+                statementType.getClassLoader(),
+                new Class<?>[]{statementType},
+                (proxy, method, arguments) -> {
+                    if ("close".equals(method.getName())) {
+                        try {
+                            return invoke(delegate, method, arguments);
+                        } finally {
+                            activeStatement.compareAndSet((Statement) proxy, null);
+                        }
+                    }
+                    return invoke(delegate, method, arguments);
+                });
             if (!activeStatement.compareAndSet(null, statement)) {
-                closeStatement(statement);
+                delegate.close();
                 throw new IllegalStateException(description + " opened concurrent JDBC statements");
             }
             if (cancelled.get()) {
                 cancelStatement(statement);
+                closeStatement(statement);
                 throw new SQLTimeoutException(description + " statement preparation lost the cancellation race");
             }
-            return new TrackedStatement(this, statement);
+            return statement;
         }
 
         private AssertionError cancelActive() {
@@ -1356,10 +1544,7 @@ class PostingCrashRecoveryIT {
     private interface TimedWaits {
         boolean waitFor(Process process, long remainingNanos) throws InterruptedException;
 
-        <T> T get(Future<T> future, long remainingNanos)
-            throws InterruptedException, ExecutionException, TimeoutException;
-
-        boolean join(Thread thread, long remainingNanos) throws InterruptedException;
+        <T> T call(Callable<T> operation, long remainingNanos, String description) throws Exception;
     }
 
     private enum SystemTimedWaits implements TimedWaits {
@@ -1371,52 +1556,77 @@ class PostingCrashRecoveryIT {
         }
 
         @Override
-        public <T> T get(Future<T> future, long remainingNanos)
-            throws InterruptedException, ExecutionException, TimeoutException {
-            return future.get(remainingNanos, NANOSECONDS);
+        public <T> T call(Callable<T> operation, long remainingNanos, String description) throws Exception {
+            return runBounded(Duration.ofNanos(Math.max(1, remainingNanos)), description, operation);
+        }
+    }
+
+    private interface WorkerFiles {
+        String read(Path path) throws IOException;
+
+        void delete(Path path) throws IOException;
+    }
+
+    private enum SystemWorkerFiles implements WorkerFiles {
+        INSTANCE;
+
+        @Override
+        public String read(Path path) throws IOException {
+            return Files.readString(path, UTF_8);
         }
 
         @Override
-        public boolean join(Thread thread, long remainingNanos) throws InterruptedException {
-            return thread.join(Duration.ofNanos(remainingNanos));
+        public void delete(Path path) throws IOException {
+            Files.deleteIfExists(path);
+            if (Files.exists(path)) {
+                throw new IOException("worker output file still exists after deletion: " + path.getFileName());
+            }
         }
     }
 
     private static final class WorkerHandle implements AutoCloseable {
         private final Process process;
         private final CrashPostingWorker.CrashPoint point;
-        private final FutureTask<String> outputRead;
-        private final Thread outputReader;
-        private final Duration timeout;
-        private final LongSupplier nanoTime;
+        private final Path outputFile;
         private final TimedWaits timedWaits;
+        private final WorkerFiles files;
+        private final Deadline deadline;
+        private final long deletionReserve;
 
-        private WorkerHandle(Process process, CrashPostingWorker.CrashPoint point) {
-            this(process, point, PROCESS_TIMEOUT, System::nanoTime, SystemTimedWaits.INSTANCE);
+        private WorkerHandle(Process process, CrashPostingWorker.CrashPoint point, Path outputFile) {
+            this(
+                process,
+                point,
+                outputFile,
+                PROCESS_TIMEOUT,
+                System::nanoTime,
+                SystemTimedWaits.INSTANCE,
+                SystemWorkerFiles.INSTANCE);
         }
 
         private WorkerHandle(
             Process process,
             CrashPostingWorker.CrashPoint point,
+            Path outputFile,
             Duration timeout,
             LongSupplier nanoTime,
-            TimedWaits timedWaits
+            TimedWaits timedWaits,
+            WorkerFiles files
         ) {
             this.process = process;
             this.point = point;
-            this.timeout = timeout;
-            this.nanoTime = nanoTime;
+            this.outputFile = outputFile;
             this.timedWaits = timedWaits;
-            this.outputRead = new FutureTask<>(() -> new String(process.getInputStream().readAllBytes(), UTF_8));
-            this.outputReader = Thread.ofVirtual()
-                .name("crash-posting-worker-output-" + point)
-                .start(outputRead);
+            this.files = files;
+            this.deadline = Deadline.after(timeout, nanoTime);
+            this.deletionReserve = Math.min(
+                SECONDS.toNanos(1),
+                Math.max(1, timeout.toNanos() / 10));
         }
 
         private WorkerExit awaitExit() {
-            Deadline deadline = Deadline.after(timeout, nanoTime);
             try {
-                if (!timedWaits.waitFor(process, deadline.remainingNanos())) {
+                if (!timedWaits.waitFor(process, budgetBeforeDeletion())) {
                     throw new AssertionError("crash worker did not exit within 10 seconds at " + point);
                 }
             } catch (InterruptedException interrupted) {
@@ -1427,27 +1637,27 @@ class PostingCrashRecoveryIT {
             try {
                 return new WorkerExit(
                     process.exitValue(),
-                    timedWaits.get(outputRead, Math.max(1, deadline.remainingNanos())));
+                    timedWaits.call(
+                        () -> files.read(outputFile),
+                        budgetBeforeDeletion(),
+                        "crash-worker output-file read at " + point));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                throw new AssertionError("crash worker output read was interrupted at " + point, interrupted);
-            } catch (ExecutionException failure) {
-                throw new AssertionError("crash worker output read failed at " + point, failure.getCause());
-            } catch (TimeoutException failure) {
-                throw new AssertionError("crash worker output was not drained within 10 seconds at " + point, failure);
+                throw new AssertionError("crash worker output-file read was interrupted at " + point, interrupted);
+            } catch (Exception failure) {
+                throw new AssertionError("crash worker output-file read failed at " + point, failure);
             }
         }
 
         @Override
         public void close() {
-            Deadline deadline = Deadline.after(timeout, nanoTime);
             AssertionError cleanupFailure = null;
             boolean restoreInterrupt = Thread.interrupted();
             if (process.isAlive()) {
                 process.destroyForcibly();
                 boolean waitComplete = false;
                 while (!waitComplete && deadline.hasRemaining()) {
-                    long remaining = deadline.remainingNanos();
+                    long remaining = Math.max(1, deadline.remainingNanos() / 2);
                     try {
                         if (!timedWaits.waitFor(process, remaining)) {
                             cleanupFailure = append(
@@ -1466,66 +1676,30 @@ class PostingCrashRecoveryIT {
                 }
             }
 
-            var inputClose = new FutureTask<Void>(() -> {
-                process.getInputStream().close();
-                return null;
-            });
-            Thread inputCloser = Thread.ofVirtual()
-                .name("crash-posting-worker-input-close-" + point)
-                .start(inputClose);
-            boolean inputCloseWaitComplete = false;
-            while (!inputCloseWaitComplete && deadline.hasRemaining()) {
+            boolean deleteComplete = false;
+            while (!deleteComplete && deadline.hasRemaining()) {
                 try {
-                    timedWaits.get(inputClose, deadline.remainingNanos());
-                    inputCloseWaitComplete = true;
+                    timedWaits.call(
+                        () -> {
+                            files.delete(outputFile);
+                            return null;
+                        },
+                        deadline.remainingNanos(),
+                        "crash-worker output-file deletion at " + point);
+                    deleteComplete = true;
                 } catch (InterruptedException interrupted) {
                     restoreInterrupt = true;
-                } catch (TimeoutException timeoutFailure) {
+                } catch (Exception | Error failure) {
                     cleanupFailure = append(
                         cleanupFailure,
-                        new AssertionError("crash-worker output close did not finish within cleanup bound at " + point));
+                        new AssertionError("crash-worker output-file deletion failed at " + point, failure));
                     break;
-                } catch (ExecutionException failure) {
-                    cleanupFailure = append(
-                        cleanupFailure,
-                        new AssertionError("crash-worker output close failed at " + point, failure.getCause()));
-                    inputCloseWaitComplete = true;
                 }
             }
-            if (!inputCloseWaitComplete && !inputClose.isDone()) {
-                inputClose.cancel(true);
-                inputCloser.interrupt();
-            }
-            boolean inputCloserJoined = !inputCloser.isAlive();
-            while (!inputCloserJoined && deadline.hasRemaining()) {
-                try {
-                    inputCloserJoined = timedWaits.join(inputCloser, deadline.remainingNanos());
-                } catch (InterruptedException interrupted) {
-                    restoreInterrupt = true;
-                }
-            }
-            if (!inputCloserJoined) {
+            if (!deleteComplete) {
                 cleanupFailure = append(
                     cleanupFailure,
-                    new AssertionError("crash-worker output close task survived cleanup at " + point));
-            }
-
-            if (outputReader.isAlive()) {
-                outputRead.cancel(true);
-                outputReader.interrupt();
-                boolean readerJoined = false;
-                while (!readerJoined && deadline.hasRemaining()) {
-                    try {
-                        readerJoined = timedWaits.join(outputReader, deadline.remainingNanos());
-                    } catch (InterruptedException interrupted) {
-                        restoreInterrupt = true;
-                    }
-                }
-                if (!readerJoined) {
-                    cleanupFailure = append(
-                        cleanupFailure,
-                        new AssertionError("crash-worker output reader survived cleanup at " + point));
-                }
+                    new AssertionError("crash-worker output file survived cleanup at " + point));
             }
             if (restoreInterrupt) {
                 Thread.currentThread().interrupt();
@@ -1533,6 +1707,10 @@ class PostingCrashRecoveryIT {
             if (cleanupFailure != null) {
                 throw cleanupFailure;
             }
+        }
+
+        private long budgetBeforeDeletion() {
+            return Math.max(1, deadline.remainingNanos() - deletionReserve);
         }
 
         private static AssertionError append(AssertionError existing, AssertionError next) {
@@ -1576,49 +1754,8 @@ class PostingCrashRecoveryIT {
         }
     }
 
-    private static final class StubbornInputStream extends InputStream {
-        private final CountDownLatch released = new CountDownLatch(1);
-        private final CountDownLatch closeStarted = new CountDownLatch(1);
-        private final CountDownLatch closeInterrupted = new CountDownLatch(1);
-        private final CountDownLatch closeReleased = new CountDownLatch(1);
-
-        @Override
-        public int read() {
-            while (released.getCount() != 0) {
-                try {
-                    released.await();
-                } catch (InterruptedException ignored) {
-                    // Deliberately resist interruption to pressure-test the combined cleanup deadline.
-                }
-            }
-            return -1;
-        }
-
-        @Override
-        public void close() throws IOException {
-            closeStarted.countDown();
-            try {
-                closeReleased.await();
-            } catch (InterruptedException interrupted) {
-                closeInterrupted.countDown();
-                Thread.currentThread().interrupt();
-                throw new IOException("close interrupted", interrupted);
-            }
-        }
-
-        private void release() {
-            closeReleased.countDown();
-            released.countDown();
-        }
-    }
-
-    private static final class SlowTerminationProcess extends Process {
-        private final InputStream input;
-        private final AtomicBoolean destroyed = new AtomicBoolean();
-
-        private SlowTerminationProcess(InputStream input) {
-            this.input = input;
-        }
+    private static final class DeterministicExitProcess extends Process {
+        private final AtomicBoolean exited = new AtomicBoolean();
 
         @Override
         public OutputStream getOutputStream() {
@@ -1627,7 +1764,7 @@ class PostingCrashRecoveryIT {
 
         @Override
         public InputStream getInputStream() {
-            return input;
+            return InputStream.nullInputStream();
         }
 
         @Override
@@ -1647,23 +1784,24 @@ class PostingCrashRecoveryIT {
 
         @Override
         public int exitValue() {
-            throw new IllegalThreadStateException("process is still alive");
+            if (!exited.get()) {
+                throw new IllegalThreadStateException("process is still alive");
+            }
+            return 91;
         }
 
         @Override
-        public void destroy() {
-            destroyed.set(true);
-        }
+        public void destroy() {}
 
         @Override
         public Process destroyForcibly() {
-            destroyed.set(true);
+            exited.set(true);
             return this;
         }
 
         @Override
         public boolean isAlive() {
-            return true;
+            return !exited.get();
         }
     }
 
@@ -1681,39 +1819,52 @@ class PostingCrashRecoveryIT {
 
     private static final class RecordingTimedWaits implements TimedWaits {
         private final MutableNanoClock clock;
-        private final StubbornInputStream input;
         private final List<Long> observedBudgets = new ArrayList<>();
 
-        private RecordingTimedWaits(MutableNanoClock clock, StubbornInputStream input) {
+        private RecordingTimedWaits(MutableNanoClock clock) {
             this.clock = clock;
-            this.input = input;
         }
 
         @Override
         public boolean waitFor(Process process, long remainingNanos) {
             observedBudgets.add(remainingNanos);
-            clock.advance(60);
-            return false;
+            clock.advance(30);
+            ((DeterministicExitProcess) process).exited.set(true);
+            return true;
         }
 
         @Override
-        public <T> T get(Future<T> future, long remainingNanos)
-            throws InterruptedException, ExecutionException, TimeoutException {
+        public <T> T call(Callable<T> operation, long remainingNanos, String description) throws Exception {
             observedBudgets.add(remainingNanos);
-            assertTrue(input.closeStarted.await(1, SECONDS));
-            clock.advance(20);
-            throw new TimeoutException("deterministic close timeout");
-        }
-
-        @Override
-        public boolean join(Thread thread, long remainingNanos) throws InterruptedException {
-            observedBudgets.add(remainingNanos);
-            if (thread.getName().contains("input-close")) {
-                assertTrue(input.closeInterrupted.await(1, SECONDS));
-                return thread.join(Duration.ofSeconds(1));
+            if (description.contains("read")) {
+                clock.advance(20);
             }
-            clock.advance(remainingNanos);
-            return false;
+            return operation.call();
+        }
+    }
+
+    private static final class RecordingWorkerFiles implements WorkerFiles {
+        private final Process process;
+        private final AtomicBoolean readAfterExit = new AtomicBoolean();
+        private final AtomicBoolean deleted = new AtomicBoolean();
+        private final AtomicReference<Path> readPath = new AtomicReference<>();
+        private final AtomicReference<Path> deletedPath = new AtomicReference<>();
+
+        private RecordingWorkerFiles(Process process) {
+            this.process = process;
+        }
+
+        @Override
+        public String read(Path path) {
+            readPath.set(path);
+            readAfterExit.set(!process.isAlive());
+            return "REACHED:BEFORE_COMMIT\n";
+        }
+
+        @Override
+        public void delete(Path path) {
+            deletedPath.set(path);
+            deleted.set(true);
         }
     }
 
@@ -1764,6 +1915,228 @@ class PostingCrashRecoveryIT {
                 return '\0';
             }
             return 0;
+        }
+    }
+
+    private static final class InterruptingCleanupExecutor extends AbstractExecutorService {
+        private final AtomicBoolean shutdown = new AtomicBoolean();
+        private final AtomicBoolean terminated = new AtomicBoolean();
+
+        @Override
+        public void shutdown() {
+            shutdown.set(true);
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdown.set(true);
+            throw new IllegalStateException("shutdown diagnostic");
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdown.get();
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return terminated.get();
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit)
+            throws InterruptedException {
+            terminated.set(true);
+            Thread.currentThread().interrupt();
+            Thread.interrupted();
+            throw new InterruptedException("deterministic cleanup interruption");
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            command.run();
+        }
+    }
+
+    private static final class SerializationFailureOnceDataSource implements DataSource {
+        private final DataSource delegate;
+        private final AtomicBoolean serializationFailureInjected = new AtomicBoolean();
+        private final AtomicInteger acquiredConnections = new AtomicInteger();
+        private final List<Connection> physicalConnections = new ArrayList<>();
+
+        private SerializationFailureOnceDataSource(DataSource delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Connection getConnection() throws SQLException {
+            Connection physical = delegate.getConnection();
+            physicalConnections.add(physical);
+            acquiredConnections.incrementAndGet();
+            return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, arguments) -> {
+                    Object result = invoke(physical, method, arguments);
+                    if ("prepareStatement".equals(method.getName())
+                        && result instanceof PreparedStatement statement) {
+                        return serializationFailureOnce(statement);
+                    }
+                    return result;
+                });
+        }
+
+        private PreparedStatement serializationFailureOnce(PreparedStatement statement) {
+            return (PreparedStatement) Proxy.newProxyInstance(
+                PreparedStatement.class.getClassLoader(),
+                new Class<?>[]{PreparedStatement.class},
+                (proxy, method, arguments) -> {
+                    if (method.getName().startsWith("execute")
+                        && serializationFailureInjected.compareAndSet(false, true)) {
+                        throw new SQLException("forced nested serialization failure", "40001");
+                    }
+                    return invoke(statement, method, arguments);
+                });
+        }
+
+        @Override
+        public Connection getConnection(String username, String password) throws SQLException {
+            throw new SQLFeatureNotSupportedException("test datasource credentials are fixed");
+        }
+
+        @Override
+        public PrintWriter getLogWriter() throws SQLException {
+            return delegate.getLogWriter();
+        }
+
+        @Override
+        public void setLogWriter(PrintWriter output) throws SQLException {
+            delegate.setLogWriter(output);
+        }
+
+        @Override
+        public void setLoginTimeout(int seconds) throws SQLException {
+            delegate.setLoginTimeout(seconds);
+        }
+
+        @Override
+        public int getLoginTimeout() throws SQLException {
+            return delegate.getLoginTimeout();
+        }
+
+        @Override
+        public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+            return delegate.getParentLogger();
+        }
+
+        @Override
+        public <T> T unwrap(Class<T> type) throws SQLException {
+            return delegate.unwrap(type);
+        }
+
+        @Override
+        public boolean isWrapperFor(Class<?> type) throws SQLException {
+            return delegate.isWrapperFor(type);
+        }
+    }
+
+    private static final class BlockingStatementObservationDataSource implements DataSource {
+        private final DataSource delegate;
+        private final CountDownLatch blockingStatementStarted = new CountDownLatch(1);
+        private final AtomicBoolean statementCancelled = new AtomicBoolean();
+        private final AtomicBoolean connectionAborted = new AtomicBoolean();
+        private final AtomicBoolean connectionClosed = new AtomicBoolean();
+
+        private BlockingStatementObservationDataSource(DataSource delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Connection getConnection() throws SQLException {
+            Connection physical = delegate.getConnection();
+            return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, arguments) -> {
+                    if ("abort".equals(method.getName())) {
+                        connectionAborted.set(true);
+                    } else if ("close".equals(method.getName())) {
+                        connectionClosed.set(true);
+                    }
+                    Object result = invoke(physical, method, arguments);
+                    if ("prepareStatement".equals(method.getName())
+                        && arguments != null
+                        && arguments.length > 0
+                        && arguments[0] instanceof String sql
+                        && result instanceof PreparedStatement statement) {
+                        return observedStatement(statement, sql);
+                    }
+                    return result;
+                });
+        }
+
+        private PreparedStatement observedStatement(PreparedStatement statement, String sql) {
+            boolean blocksOnFixture = sql.contains("FROM funds.ledger_account account")
+                && sql.contains("FOR UPDATE OF account");
+            return (PreparedStatement) Proxy.newProxyInstance(
+                PreparedStatement.class.getClassLoader(),
+                new Class<?>[]{PreparedStatement.class},
+                (proxy, method, arguments) -> {
+                    if (blocksOnFixture && method.getName().startsWith("execute")) {
+                        blockingStatementStarted.countDown();
+                    } else if (blocksOnFixture && "cancel".equals(method.getName())) {
+                        statementCancelled.set(true);
+                    }
+                    return invoke(statement, method, arguments);
+                });
+        }
+
+        @Override
+        public Connection getConnection(String username, String password) throws SQLException {
+            throw new SQLFeatureNotSupportedException("test datasource credentials are fixed");
+        }
+
+        @Override
+        public PrintWriter getLogWriter() throws SQLException {
+            return delegate.getLogWriter();
+        }
+
+        @Override
+        public void setLogWriter(PrintWriter output) throws SQLException {
+            delegate.setLogWriter(output);
+        }
+
+        @Override
+        public void setLoginTimeout(int seconds) throws SQLException {
+            delegate.setLoginTimeout(seconds);
+        }
+
+        @Override
+        public int getLoginTimeout() throws SQLException {
+            return delegate.getLoginTimeout();
+        }
+
+        @Override
+        public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+            return delegate.getParentLogger();
+        }
+
+        @Override
+        public <T> T unwrap(Class<T> type) throws SQLException {
+            return delegate.unwrap(type);
+        }
+
+        @Override
+        public boolean isWrapperFor(Class<?> type) throws SQLException {
+            return delegate.isWrapperFor(type);
+        }
+    }
+
+    private static Object invoke(Object target, Method method, Object[] arguments) throws Throwable {
+        try {
+            return method.invoke(target, arguments);
+        } catch (InvocationTargetException failure) {
+            throw failure.getCause();
         }
     }
 }
