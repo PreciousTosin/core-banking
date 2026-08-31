@@ -502,6 +502,81 @@ class PostingCrashRecoveryIT {
     }
 
     @Test
+    void workerCleanupPrestartsOneDeletionAndJoinsItAfterNonDeletionBudgetIsExhausted() {
+        var clock = new MutableNanoClock();
+        var process = new DeterministicExitProcess();
+        var deletionPrepared = new CountDownLatch(1);
+        var deletionReleased = new CountDownLatch(1);
+        var deletionJoined = new CountDownLatch(1);
+        var deletionAttempts = new AtomicInteger();
+        Path outputFile = tempDirectory.resolve("exhausted-cleanup-output.log");
+        TimedWaits waits = new TimedWaits() {
+            @Override
+            public boolean waitFor(Process ignored, long remainingNanos) {
+                assertEquals(0, deletionPrepared.getCount(), "process cleanup began before deletion was pre-started");
+                assertEquals(90, remainingNanos);
+                clock.advance(90);
+                process.exited.set(true);
+                return true;
+            }
+
+            @Override
+            public <T> T call(Callable<T> operation, Deadline deadline, String description) throws Exception {
+                throw new AssertionError("cleanup must join the pre-started deletion, not submit a late call");
+            }
+
+            @Override
+            public <T> DeferredCall<T> defer(
+                Callable<T> operation,
+                Deadline startDeadline,
+                Deadline cleanupDeadline,
+                String description
+            ) {
+                assertEquals(90, startDeadline.remainingNanos());
+                assertEquals(100, cleanupDeadline.remainingNanos());
+                deletionPrepared.countDown();
+                return completionDeadline -> {
+                    deletionReleased.countDown();
+                    try {
+                        assertEquals(10, completionDeadline.remainingNanos());
+                        return operation.call();
+                    } finally {
+                        deletionJoined.countDown();
+                    }
+                };
+            }
+        };
+        WorkerFiles files = new WorkerFiles() {
+            @Override
+            public String read(Path path) {
+                throw new AssertionError("cleanup must not read worker output");
+            }
+
+            @Override
+            public void delete(Path path) {
+                assertEquals(outputFile, path);
+                deletionAttempts.incrementAndGet();
+            }
+        };
+        var worker = new WorkerHandle(
+            process,
+            CrashPostingWorker.CrashPoint.BEFORE_COMMIT,
+            outputFile,
+            Duration.ofNanos(100),
+            clock::nanoTime,
+            waits,
+            files);
+
+        worker.close();
+
+        assertAll(
+            () -> assertEquals(0, deletionPrepared.getCount()),
+            () -> assertEquals(0, deletionReleased.getCount()),
+            () -> assertEquals(0, deletionJoined.getCount()),
+            () -> assertEquals(1, deletionAttempts.get()));
+    }
+
+    @Test
     void workerStartFailureStillAttemptsBoundedDeletionAndSuppressesItsFailure() {
         var clock = new MutableNanoClock();
         var waits = new RecordingTimedWaits(clock);
@@ -1907,6 +1982,20 @@ class PostingCrashRecoveryIT {
         boolean waitFor(Process process, long remainingNanos) throws InterruptedException;
 
         <T> T call(Callable<T> operation, Deadline deadline, String description) throws Exception;
+
+        default <T> DeferredCall<T> defer(
+            Callable<T> operation,
+            Deadline startDeadline,
+            Deadline cleanupDeadline,
+            String description
+        ) throws Exception {
+            throw new UnsupportedOperationException("deferred bounded call is not implemented");
+        }
+    }
+
+    @FunctionalInterface
+    private interface DeferredCall<T> {
+        T releaseAndJoin(Deadline deadline) throws Exception;
     }
 
     private enum SystemTimedWaits implements TimedWaits {
@@ -1920,6 +2009,16 @@ class PostingCrashRecoveryIT {
         @Override
         public <T> T call(Callable<T> operation, Deadline deadline, String description) throws Exception {
             return runBounded(deadline, description, operation);
+        }
+
+        @Override
+        public <T> DeferredCall<T> defer(
+            Callable<T> operation,
+            Deadline startDeadline,
+            Deadline cleanupDeadline,
+            String description
+        ) {
+            return SystemDeferredCall.start(operation, startDeadline, cleanupDeadline, description);
         }
     }
 
@@ -2018,13 +2117,34 @@ class PostingCrashRecoveryIT {
         @Override
         public void close() {
             Deadline cleanupDeadline = Deadline.after(timeout, nanoTime);
+            Deadline nonDeletionDeadline = cleanupDeadline.reservingTail(deletionReserve);
             AssertionError cleanupFailure = null;
             boolean restoreInterrupt = Thread.interrupted();
+            DeferredCall<Void> deletion = null;
+            try {
+                deletion = timedWaits.defer(
+                    () -> {
+                        files.delete(outputFile);
+                        return null;
+                    },
+                    nonDeletionDeadline,
+                    cleanupDeadline,
+                    "crash-worker output-file deletion at " + point);
+            } catch (InterruptedException interrupted) {
+                restoreInterrupt = true;
+                cleanupFailure = append(
+                    cleanupFailure,
+                    new AssertionError("crash-worker output-file deletion did not start at " + point, interrupted));
+            } catch (Exception | Error failure) {
+                cleanupFailure = append(
+                    cleanupFailure,
+                    new AssertionError("crash-worker output-file deletion did not start at " + point, failure));
+            }
             if (process.isAlive()) {
                 process.destroyForcibly();
                 boolean waitComplete = false;
                 while (!waitComplete) {
-                    long remaining = budgetBeforeDeletion(cleanupDeadline);
+                    long remaining = nonDeletionDeadline.remainingNanos();
                     if (remaining == 0) {
                         cleanupFailure = append(
                             cleanupFailure,
@@ -2045,28 +2165,21 @@ class PostingCrashRecoveryIT {
             }
 
             boolean deleteComplete = false;
-            do {
+            if (deletion != null) {
                 try {
-                    timedWaits.call(
-                        () -> {
-                            files.delete(outputFile);
-                            return null;
-                        },
-                        cleanupDeadline,
-                        "crash-worker output-file deletion at " + point);
+                    deletion.releaseAndJoin(cleanupDeadline);
                     deleteComplete = true;
                 } catch (InterruptedException interrupted) {
                     restoreInterrupt = true;
-                    if (!cleanupDeadline.hasRemaining()) {
-                        break;
-                    }
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError("crash-worker output-file deletion was interrupted at " + point, interrupted));
                 } catch (Exception | Error failure) {
                     cleanupFailure = append(
                         cleanupFailure,
                         new AssertionError("crash-worker output-file deletion failed at " + point, failure));
-                    break;
                 }
-            } while (!deleteComplete);
+            }
             if (!deleteComplete) {
                 cleanupFailure = append(
                     cleanupFailure,
@@ -2080,13 +2193,154 @@ class PostingCrashRecoveryIT {
             }
         }
 
-        private long budgetBeforeDeletion(Deadline cleanupDeadline) {
-            return Math.max(0, cleanupDeadline.remainingNanos() - deletionReserve);
-        }
-
         private static AssertionError append(AssertionError existing, AssertionError next) {
             return PostingCrashRecoveryIT.append(existing, next);
         }
+    }
+
+    private static final class SystemDeferredCall<T> implements DeferredCall<T> {
+        private final ExecutorService executor;
+        private final Future<T> future;
+        private final CountDownLatch release;
+        private final CountDownLatch operationStarted;
+        private final String description;
+
+        private SystemDeferredCall(
+            ExecutorService executor,
+            Future<T> future,
+            CountDownLatch release,
+            CountDownLatch operationStarted,
+            String description
+        ) {
+            this.executor = executor;
+            this.future = future;
+            this.release = release;
+            this.operationStarted = operationStarted;
+            this.description = description;
+        }
+
+        private static <T> SystemDeferredCall<T> start(
+            Callable<T> operation,
+            Deadline startDeadline,
+            Deadline cleanupDeadline,
+            String description
+        ) {
+            ExecutorService executor = Executors.newSingleThreadExecutor(
+                Thread.ofVirtual().name("deferred-" + description.replace(' ', '-')).factory());
+            var ready = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var operationStarted = new CountDownLatch(1);
+            Future<T> future = executor.submit(() -> {
+                ready.countDown();
+                release.await();
+                operationStarted.countDown();
+                return operation.call();
+            });
+            boolean restoreInterrupt = false;
+            boolean started = false;
+            while (!started) {
+                long remaining = startDeadline.remainingNanos();
+                if (remaining == 0) {
+                    break;
+                }
+                try {
+                    started = ready.await(remaining, NANOSECONDS);
+                } catch (InterruptedException interrupted) {
+                    restoreInterrupt = true;
+                }
+            }
+            if (!started) {
+                future.cancel(true);
+                executor.shutdownNow();
+                CleanupOutcome cleanup = awaitTerminationBounded(
+                    executor,
+                    description + " deferred executor",
+                    cleanupDeadline,
+                    restoreInterrupt,
+                    new AssertionError(description + " did not start within its reserved allocation"));
+                if (cleanup.restoreInterrupt()) {
+                    Thread.currentThread().interrupt();
+                }
+                throw cleanup.failure();
+            }
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt();
+            }
+            return new SystemDeferredCall<>(executor, future, release, operationStarted, description);
+        }
+
+        @Override
+        public T releaseAndJoin(Deadline deadline) throws Exception {
+            release.countDown();
+            Throwable primaryFailure = null;
+            boolean restoreInterrupt = Thread.interrupted();
+            long joinReserve = Math.min(
+                SECONDS.toNanos(1),
+                Math.max(1, deadline.remainingNanos() / 2));
+            Deadline operationDeadline = deadline.reservingTail(joinReserve);
+            try {
+                boolean entered = false;
+                while (!entered) {
+                    long remaining = operationDeadline.remainingNanos();
+                    if (remaining == 0) {
+                        throw new AssertionError(description + " did not enter within its reserved cleanup allocation");
+                    }
+                    try {
+                        entered = operationStarted.await(remaining, NANOSECONDS);
+                    } catch (InterruptedException interrupted) {
+                        restoreInterrupt = true;
+                    }
+                }
+                while (true) {
+                    long remaining = operationDeadline.remainingNanos();
+                    if (remaining == 0) {
+                        throw new AssertionError(description + " exceeded its reserved cleanup allocation");
+                    }
+                    try {
+                        return future.get(remaining, NANOSECONDS);
+                    } catch (InterruptedException interrupted) {
+                        restoreInterrupt = true;
+                    } catch (TimeoutException timeoutFailure) {
+                        throw new AssertionError(
+                            description + " exceeded its reserved cleanup allocation",
+                            timeoutFailure);
+                    } catch (ExecutionException executionFailure) {
+                        Throwable cause = executionFailure.getCause();
+                        if (cause instanceof Exception exception) {
+                            throw exception;
+                        }
+                        if (cause instanceof Error error) {
+                            throw error;
+                        }
+                        throw new AssertionError(description + " failed", cause);
+                    }
+                }
+            } catch (Exception | Error failure) {
+                primaryFailure = failure;
+                throw failure;
+            } finally {
+                CleanupOutcome cleanup = shutdownBounded(
+                    executor,
+                    future,
+                    description + " deferred task",
+                    deadline,
+                    () -> null,
+                    () -> null);
+                restoreInterrupt |= cleanup.restoreInterrupt();
+                if (restoreInterrupt) {
+                    Thread.currentThread().interrupt();
+                }
+                if (cleanup.failure() != null) {
+                    if (primaryFailure == null) {
+                        throw cleanup.failure();
+                    }
+                    if (cleanup.failure() != primaryFailure) {
+                        primaryFailure.addSuppressed(cleanup.failure());
+                    }
+                }
+            }
+        }
+
     }
 
     private static AssertionError append(AssertionError existing, AssertionError next) {
@@ -2122,6 +2376,13 @@ class PostingCrashRecoveryIT {
 
         private boolean hasRemaining() {
             return remainingNanos() > 0;
+        }
+
+        private Deadline reservingTail(long reservedNanos) {
+            long now = nanoTime.getAsLong();
+            long usable = Math.max(0, remainingNanos() - Math.max(0, reservedNanos));
+            long usableExpiresAt = Long.MAX_VALUE - now < usable ? Long.MAX_VALUE : now + usable;
+            return new Deadline(usableExpiresAt, nanoTime);
         }
     }
 
@@ -2211,6 +2472,19 @@ class PostingCrashRecoveryIT {
                 clock.advance(20);
             }
             return operation.call();
+        }
+
+        @Override
+        public <T> DeferredCall<T> defer(
+            Callable<T> operation,
+            Deadline startDeadline,
+            Deadline cleanupDeadline,
+            String description
+        ) {
+            return completionDeadline -> {
+                observedBudgets.add(completionDeadline.remainingNanos());
+                return operation.call();
+            };
         }
     }
 
