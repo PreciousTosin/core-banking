@@ -35,7 +35,7 @@ class JournalValidatorTest {
     private static final UUID NGN_POSITION = uuid(11);
     private static final UUID POSTING_A = uuid(12);
     private static final UUID POSTING_B = uuid(13);
-    private static final Instant BOOKING_TIME = Instant.parse("2026-08-30T14:15:16.123456789Z");
+    private static final Instant BOOKING_TIME = Instant.parse("2026-08-30T14:15:16.123456Z");
     private static final LocalDate VALUE_DATE = LocalDate.of(2026, 8, 30);
 
     private final JournalValidator validator = new JournalValidator();
@@ -48,6 +48,24 @@ class JournalValidatorTest {
             line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100_000));
 
         assertDoesNotThrow(() -> validator.validate(draft));
+    }
+
+    @Test
+    void acceptsMicrosecondBookingTimeAndRejectsSubMicrosecondPrecision() {
+        var postings = List.of(
+            line(POSTING_A, ASSET_ACCOUNT, "NGN", 100),
+            line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100));
+        var microsecond = journal(
+            JOURNAL_ID, COMMAND_ID, CORRELATION_ID, BUSINESS_TRANSACTION_ID,
+            LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID, "CUSTOMER_CREDIT", "microsecond",
+            Instant.parse("2026-08-30T14:15:16.123456Z"), VALUE_DATE, null, 41, postings);
+        var subMicrosecond = journal(
+            JOURNAL_ID, COMMAND_ID, CORRELATION_ID, BUSINESS_TRANSACTION_ID,
+            LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID, "CUSTOMER_CREDIT", "nanosecond",
+            Instant.parse("2026-08-30T14:15:16.123456001Z"), VALUE_DATE, null, 41, postings);
+
+        assertDoesNotThrow(() -> validator.validate(microsecond));
+        assertThrows(InvalidJournalException.class, () -> validator.validate(subMicrosecond));
     }
 
     @Test

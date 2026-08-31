@@ -114,6 +114,20 @@ public final class ReferenceLedgerModel {
         return List.copyOf(journals.keySet());
     }
 
+    /** Journals eligible for their first exact reversal under the database-wide correction rule. */
+    public List<UUID> reversibleJournalIds() {
+        Set<UUID> alreadyReversed = new LinkedHashSet<>();
+        journals.values().stream()
+            .map(StoredJournal::reversalOfJournalId)
+            .filter(Objects::nonNull)
+            .forEach(alreadyReversed::add);
+        return journals.values().stream()
+            .filter(journal -> journal.reversalOfJournalId() == null)
+            .map(StoredJournal::journalId)
+            .filter(journalId -> !alreadyReversed.contains(journalId))
+            .toList();
+    }
+
     public SuccessfulCommand successfulCommand(UUID commandId) {
         SuccessfulCommand command = successfulCommands.get(commandId);
         if (command == null) {

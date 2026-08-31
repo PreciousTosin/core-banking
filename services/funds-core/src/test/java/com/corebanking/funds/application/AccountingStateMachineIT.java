@@ -107,6 +107,38 @@ class AccountingStateMachineIT {
         assertTrue(mismatch.getMessage().contains("dimensions"), mismatch::getMessage);
     }
 
+    @Test
+    void reversalCandidatesExcludeCorrectionsAndAlreadyReversedOriginals() {
+        long seed = BASE_SEED;
+        Fixture fixture = seedFixture(seed);
+        var model = new ReferenceLedgerModel(fixture.accountControls());
+        PostingCommand firstOriginal = commandFor(
+            seed, 0, new GeneratedLedgerOperation.Post(deterministicUuid(seed, 0, 200), 100),
+            fixture, model);
+        PostingCommand secondOriginal = commandFor(
+            seed, 1, new GeneratedLedgerOperation.Post(deterministicUuid(seed, 1, 200), 99),
+            fixture, model);
+        model.apply(firstOriginal, modelResult(firstOriginal, 1));
+        model.apply(secondOriginal, modelResult(secondOriginal, 2));
+        PostingCommand reversal = commandFor(
+            seed,
+            2,
+            new GeneratedLedgerOperation.Reverse(
+                deterministicUuid(seed, 2, 200), firstOriginal.journal().journalId()),
+            fixture,
+            model);
+        model.apply(reversal, modelResult(reversal, 3));
+
+        assertEquals(List.of(secondOriginal.journal().journalId()), model.reversibleJournalIds());
+    }
+
+    private static PostingResult modelResult(PostingCommand command, long sequence) {
+        return new PostingResult(
+            command.journal().journalId(),
+            sequence,
+            new CanonicalJournalHasher().sha256(command.journal()));
+    }
+
     private static JournalDraft copyWithPostings(JournalDraft journal, List<PostingLine> postings) {
         return new JournalDraft(
             journal.journalId(),
@@ -161,10 +193,10 @@ class AccountingStateMachineIT {
             return new GeneratedLedgerOperation.RetryDifferentHash(
                 select(random, model.successfulCommandIds()));
         }
-        if (choice < 90 && !model.journalIds().isEmpty()) {
+        if (choice < 90 && !model.reversibleJournalIds().isEmpty()) {
             return new GeneratedLedgerOperation.Reverse(
                 randomUuid(random),
-                select(random, model.journalIds()));
+                select(random, model.reversibleJournalIds()));
         }
         if (choice >= 90) {
             long debit = PropertyCases.stateMachineMinorUnits(random, operationIndex);

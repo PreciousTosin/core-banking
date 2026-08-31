@@ -13,6 +13,10 @@ import java.util.UUID;
 public class JournalValidator {
     public void validate(JournalDraft draft) {
         Objects.requireNonNull(draft, "draft");
+        if (draft.bookingTime().getNano() % 1_000 != 0) {
+            throw new InvalidJournalException(
+                "bookingTime must use PostgreSQL-compatible microsecond precision");
+        }
         var postingIds = new HashSet<UUID>();
         Map<CurrencyCode, Long> currencyTotals = new HashMap<>();
 

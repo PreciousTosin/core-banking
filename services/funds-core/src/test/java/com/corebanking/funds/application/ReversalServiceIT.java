@@ -15,6 +15,8 @@ import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
+import com.corebanking.funds.infrastructure.postgres.JdbcLedgerRepository;
+import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import java.lang.reflect.InvocationTargetException;
@@ -34,6 +36,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -404,8 +411,8 @@ class ReversalServiceIT {
 
         assertAll(
             () -> assertTrue(!mutator.isAlive(), "mutator must terminate"),
-            () -> assertEquals(null, mutationFailure.get()),
-            () -> assertEquals(4, queryLong(
+            () -> assertTrue(mutationFailure.get() instanceof SQLException),
+            () -> assertEquals(2, queryLong(
                 "SELECT count(*) FROM funds.posting WHERE journal_id = ?",
                 ORIGINAL_JOURNAL_ID)),
             () -> assertEquals(2, journalSnapshot(result.journalId()).postings().size()),
@@ -454,7 +461,7 @@ class ReversalServiceIT {
             hash("all-query-timeouts")));
 
         assertAll(
-            () -> assertEquals(4, prepared.get()),
+            () -> assertEquals(5, prepared.get()),
             () -> assertEquals(prepared.get(), executed.get()));
     }
 
@@ -490,18 +497,209 @@ class ReversalServiceIT {
     @Test
     void rejectsPostCompletionPostingAppendThatBreaksCanonicalFact() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
-        appendBalancedLinesToOriginal();
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(SQLException.class, this::appendBalancedLinesToOriginal);
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void postingAndReversalHashesMatchPersistedMicrosecondBookingTimes() throws SQLException {
+        Instant originalTime = Instant.parse("2026-01-15T10:00:00.123456Z");
+        PostingCommand microsecondOriginal = withBookingTime(
+            exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID),
+            originalTime);
+        PostingResult originalResult = postingService.post(microsecondOriginal);
+        PostingCommand subMicrosecond = withBookingTime(
+            exampleA(TestPostingStack.uuid(250), TestPostingStack.uuid(251)),
+            Instant.parse("2026-01-15T10:00:00.123456001Z"));
+        assertThrows(InvalidJournalException.class, () -> postingService.post(subMicrosecond));
+        closeOriginalAndOpenNextPeriod();
+        Instant reversalTime = Instant.parse("2026-02-15T09:30:00.654321Z");
+        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(new ReversalRequest(
+            TestPostingStack.uuid(252),
+            hash("sub-microsecond-reversal"),
+            ORIGINAL_JOURNAL_ID,
+            TestPostingStack.uuid(253),
+            TestPostingStack.uuid(254),
+            NEXT_PERIOD_ID,
+            Instant.parse("2026-02-15T09:30:00.654321001Z"),
+            REVERSAL_VALUE_DATE,
+            "Invalid precision")));
+        ReversalRequest request = new ReversalRequest(
+            REVERSAL_COMMAND_ID,
+            hash("microsecond-reversal"),
+            ORIGINAL_JOURNAL_ID,
+            TestPostingStack.uuid(212),
+            TestPostingStack.uuid(213),
+            NEXT_PERIOD_ID,
+            reversalTime,
+            REVERSAL_VALUE_DATE,
+            "Microsecond correction");
+        PostingResult reversalResult = reversalService.reverse(request);
+
+        assertAll(
+            () -> assertEquals(originalTime, journalSnapshot(ORIGINAL_JOURNAL_ID).bookingTime()),
+            () -> assertEquals(originalResult.canonicalHash(), queryString(
+                "SELECT canonical_hash FROM funds.journal WHERE journal_id = ?",
+                ORIGINAL_JOURNAL_ID)),
+            () -> assertEquals(reversalTime, journalSnapshot(reversalResult.journalId()).bookingTime()),
+            () -> assertEquals(reversalResult.canonicalHash(), queryString(
+                "SELECT canonical_hash FROM funds.journal WHERE journal_id = ?",
+                reversalResult.journalId())));
+
+    }
+
+    @Test
+    void acceptsDimensionJsonAtExactPocByteLimit() throws SQLException {
+        postDimensionFixture(Map.of("k", "x".repeat(8_183)));
+        assertEquals(ReversalService.MAX_DIMENSION_JSON_BYTES, queryLong("""
+            SELECT octet_length(dimensions::text) FROM funds.posting WHERE posting_id = ?
+            """, TestPostingStack.uuid(204)));
+        closeOriginalAndOpenNextPeriod();
+
+        PostingResult result = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            hash("exact-dimension-bytes")));
+
+        assertEquals(2, journalSnapshot(result.journalId()).postings().size());
+    }
+
+    @Test
+    void rejectsOversizedDimensionValueBeforeExpansion() throws SQLException {
+        postDimensionFixture(Map.of("k", "x".repeat(8_184)));
         closeOriginalAndOpenNextPeriod();
         DatabaseCounts before = databaseCounts();
 
-        assertThrows(
-            InvalidJournalException.class,
-            () -> reversalService.reverse(reversalRequest(
-                REVERSAL_COMMAND_ID,
-                ORIGINAL_JOURNAL_ID,
-                hash("canonical-mismatch"))));
+        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            hash("oversized-dimension-value"))));
 
         assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void rejectsOversizedDimensionKeyBeforeExpansion() throws SQLException {
+        postDimensionFixture(Map.of("k".repeat(8_185), ""));
+        closeOriginalAndOpenNextPeriod();
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            hash("oversized-dimension-key"))));
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void existingReversalIsRejectedBeforePostingAnotherCommand() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID,
+            ORIGINAL_JOURNAL_ID,
+            hash("first-correction")));
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(reversalRequest(
+            TestPostingStack.uuid(260),
+            ORIGINAL_JOURNAL_ID,
+            hash("second-correction"))));
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void unrelatedDatabaseConstraintRemainsAPersistenceFailure() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        UUID collidingPostingId = UUID.nameUUIDFromBytes(
+            ("funds-reversal:" + REVERSAL_COMMAND_ID + ":posting:"
+                + TestPostingStack.uuid(204)).getBytes(StandardCharsets.UTF_8));
+        UUID collisionCommandId = TestPostingStack.uuid(280);
+        postingService.post(command(new JournalDraft(
+            TestPostingStack.uuid(281),
+            collisionCommandId,
+            TestPostingStack.uuid(282),
+            TestPostingStack.uuid(283),
+            TestPostingStack.LEGAL_ENTITY_ID,
+            TestPostingStack.BOOK_ID,
+            TestPostingStack.PERIOD_ID,
+            "COLLISION_FIXTURE",
+            "Pre-existing unrelated posting identifier",
+            Instant.parse("2026-01-16T10:00:00Z"),
+            LocalDate.of(2026, 1, 16),
+            null,
+            1,
+            List.of(
+                new PostingLine(collidingPostingId, TestPostingStack.PROVIDER_ASSET,
+                    NGN, 1, 0, Map.of()),
+                new PostingLine(TestPostingStack.uuid(284), TestPostingStack.CUSTOMER_LIABILITY,
+                    NGN, -1, 0, Map.of())))));
+        closeOriginalAndOpenNextPeriod();
+        DatabaseCounts before = databaseCounts();
+
+        assertThrows(LedgerPersistenceException.class, () -> reversalService.reverse(
+            reversalRequest(REVERSAL_COMMAND_ID, ORIGINAL_JOURNAL_ID, hash("unrelated-constraint"))));
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void concurrentDistinctCommandsCreateExactlyOneReversal() throws Exception {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
+        closeOriginalAndOpenNextPeriod();
+        var bothCommandsComposed = new CyclicBarrier(2);
+        PostingService racingPosting = new PostingService(
+            dataSource,
+            new JdbcLedgerRepository(),
+            new PostgresRetryPolicy((commandId, attempt) -> {})) {
+            @Override
+            public PostingResult post(PostingCommand command) {
+                try {
+                    bothCommandsComposed.await(5, TimeUnit.SECONDS);
+                } catch (Exception failure) {
+                    throw new IllegalStateException("reversal race gate failed", failure);
+                }
+                return super.post(command);
+            }
+        };
+        ReversalService racingReversal = new ReversalService(dataSource, racingPosting);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<PostingResult> first = executor.submit(() -> racingReversal.reverse(reversalRequest(
+            TestPostingStack.uuid(270), ORIGINAL_JOURNAL_ID, hash("race-one"))));
+        Future<PostingResult> second = executor.submit(() -> racingReversal.reverse(reversalRequest(
+            TestPostingStack.uuid(271), ORIGINAL_JOURNAL_ID, hash("race-two"))));
+
+        List<Object> outcomes;
+        try {
+            outcomes = List.of(outcome(first), outcome(second));
+        } finally {
+            first.cancel(true);
+            second.cancel(true);
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "race executor must terminate");
+        }
+
+        assertAll(
+            () -> assertEquals(1, outcomes.stream().filter(PostingResult.class::isInstance).count()),
+            () -> assertEquals(
+                1,
+                outcomes.stream().filter(InvalidJournalException.class::isInstance).count(),
+                () -> "unexpected race outcomes: " + outcomes.stream()
+                    .map(outcome -> outcome.getClass().getName() + ":" + outcome)
+                    .toList()),
+            () -> assertEquals(1, queryLong("""
+                SELECT count(*) FROM funds.journal
+                WHERE reversal_of_journal_id = ? AND transaction_type = 'REVERSAL'
+                """, ORIGINAL_JOURNAL_ID)),
+            () -> assertEquals(2, count("funds.journal")),
+            () -> assertEquals(4, count("funds.posting")),
+            () -> assertEquals(2, count("funds.idempotency_command")),
+            () -> assertEquals(2, count("funds.outbox_event")));
     }
 
     private PostingCommand exampleA(UUID commandId, UUID journalId) {
@@ -524,6 +722,42 @@ class ReversalServiceIT {
                     NGN, 100_000, 0, Map.of("rail", "provider", "route", "nibss")),
                 new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
                     NGN, -100_000, 0, Map.of("customer", "example-a")))));
+    }
+
+    private static PostingCommand withBookingTime(PostingCommand command, Instant bookingTime) {
+        JournalDraft source = command.journal();
+        var changed = new JournalDraft(
+            source.journalId(),
+            source.commandId(),
+            source.correlationId(),
+            source.businessTransactionId(),
+            source.legalEntityId(),
+            source.bookId(),
+            source.periodId(),
+            source.transactionType(),
+            source.narration(),
+            bookingTime,
+            source.valueDate(),
+            source.reversalOfJournalId(),
+            source.policyVersion(),
+            source.postings());
+        return command(changed);
+    }
+
+    private void postDimensionFixture(Map<String, String> dimensions) {
+        postingService.post(command(originalJournal(List.of(
+            new PostingLine(TestPostingStack.uuid(204), TestPostingStack.PROVIDER_ASSET,
+                NGN, 1, 0, dimensions),
+            new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
+                NGN, -1, 0, Map.of())))));
+    }
+
+    private static Object outcome(Future<PostingResult> future) throws Exception {
+        try {
+            return future.get(10, TimeUnit.SECONDS);
+        } catch (ExecutionException failure) {
+            return failure.getCause();
+        }
     }
 
     private JournalDraft originalJournal(List<PostingLine> postings) {
@@ -940,6 +1174,19 @@ class ReversalServiceIT {
             try (var rows = statement.executeQuery()) {
                 rows.next();
                 return rows.getLong(1);
+            }
+        }
+    }
+
+    private String queryString(String sql, Object... values) throws SQLException {
+        try (var connection = dataSource.getConnection();
+             var statement = connection.prepareStatement(sql)) {
+            for (int index = 0; index < values.length; index++) {
+                statement.setObject(index + 1, values[index]);
+            }
+            try (var rows = statement.executeQuery()) {
+                rows.next();
+                return rows.getString(1);
             }
         }
     }

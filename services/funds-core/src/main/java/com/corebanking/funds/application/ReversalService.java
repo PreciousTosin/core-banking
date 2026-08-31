@@ -24,15 +24,18 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import javax.sql.DataSource;
+import org.postgresql.util.PSQLException;
 
 @ApplicationScoped
 public class ReversalService {
     // POC guardrails keep a single correction comfortably bounded on an 8 GiB VM.
     static final int MAX_POSTINGS_PER_JOURNAL = 256;
     static final int MAX_DIMENSIONS_PER_POSTING = 32;
+    static final int MAX_DIMENSION_JSON_BYTES = 8_192;
     static final int QUERY_TIMEOUT_SECONDS = 5;
     private static final int MAX_DIMENSION_ROWS =
         MAX_POSTINGS_PER_JOURNAL * MAX_DIMENSIONS_PER_POSTING;
+    private static final String SINGLE_REVERSAL_CONSTRAINT = "one_reversal_per_original_idx";
 
     private final DataSource dataSource;
     private final PostingService postingService;
@@ -86,10 +89,18 @@ public class ReversalService {
             original.currentPolicyVersion(),
             reversalPostings);
         validator.validate(reversal);
-        return postingService.post(new PostingCommand(
-            request.commandId(),
-            request.requestHash(),
-            reversal));
+        try {
+            return postingService.post(new PostingCommand(
+                request.commandId(),
+                request.requestHash(),
+                reversal));
+        } catch (LedgerPersistenceException failure) {
+            if (hasConstraint(failure, SINGLE_REVERSAL_CONSTRAINT)) {
+                throw new InvalidJournalException(
+                    "original journal already has an exact reversal: " + original.journalId());
+            }
+            throw failure;
+        }
     }
 
     private LoadOutcome loadCoherentFact(ReversalRequest request) {
@@ -110,6 +121,7 @@ public class ReversalService {
                 OriginalJournalHeader header = loadVerifiedHeader(
                     connection,
                     request.originalJournalId());
+                rejectExistingReversal(connection, request.originalJournalId());
                 List<PostingLine> postings = loadBoundedPostings(
                     connection,
                     request.originalJournalId());
@@ -130,6 +142,25 @@ public class ReversalService {
             }
         } catch (SQLException failure) {
             throw new LedgerPersistenceException(failure);
+        }
+    }
+
+    private static void rejectExistingReversal(Connection connection, UUID originalJournalId)
+        throws SQLException {
+        try (var statement = connection.prepareStatement("""
+            SELECT journal_id
+            FROM funds.journal
+            WHERE reversal_of_journal_id = ? AND transaction_type = 'REVERSAL'
+            LIMIT 1
+            """)) {
+            statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
+            statement.setObject(1, originalJournalId);
+            try (var rows = statement.executeQuery()) {
+                if (rows.next()) {
+                    throw new InvalidJournalException(
+                        "original journal already has an exact reversal: " + originalJournalId);
+                }
+            }
         }
     }
 
@@ -239,10 +270,6 @@ public class ReversalService {
         loadDimensions(connection, journalId, builders);
         var postings = new ArrayList<PostingLine>(builders.size());
         for (PostingBuilder builder : builders.values()) {
-            if (builder.dimensions().size() != builder.dimensionCount()) {
-                throw new InvalidJournalException(
-                    "posting dimensions changed within reversal snapshot: " + builder.postingId());
-            }
             postings.add(builder.build());
         }
         return List.copyOf(postings);
@@ -255,12 +282,9 @@ public class ReversalService {
         try (var statement = connection.prepareStatement("""
             SELECT posting.posting_id, posting.account_id, posting.currency,
                    posting.signed_minor_units, posting.account_sequence,
-                   count(dimension.key) AS dimension_count
+                   octet_length(posting.dimensions::text) AS dimension_json_bytes
             FROM funds.posting posting
-            LEFT JOIN LATERAL jsonb_object_keys(posting.dimensions) dimension(key) ON true
             WHERE posting.journal_id = ?
-            GROUP BY posting.posting_id, posting.account_id, posting.currency,
-                     posting.signed_minor_units, posting.account_sequence
             ORDER BY posting.account_sequence, posting.posting_id
             LIMIT ?
             """)) {
@@ -275,11 +299,11 @@ public class ReversalService {
                             "original journal exceeds POC posting limit of "
                                 + MAX_POSTINGS_PER_JOURNAL);
                     }
-                    int dimensionCount = Math.toIntExact(rows.getLong("dimension_count"));
-                    if (dimensionCount > MAX_DIMENSIONS_PER_POSTING) {
+                    int dimensionBytes = rows.getInt("dimension_json_bytes");
+                    if (dimensionBytes > MAX_DIMENSION_JSON_BYTES) {
                         throw new InvalidJournalException(
-                            "posting exceeds POC dimension limit of "
-                                + MAX_DIMENSIONS_PER_POSTING);
+                            "posting dimension JSON exceeds POC byte limit of "
+                                + MAX_DIMENSION_JSON_BYTES);
                     }
                     UUID postingId = rows.getObject("posting_id", UUID.class);
                     builders.put(postingId, new PostingBuilder(
@@ -288,7 +312,6 @@ public class ReversalService {
                         CurrencyCode.of(rows.getString("currency")),
                         rows.getLong("signed_minor_units"),
                         rows.getLong("account_sequence"),
-                        dimensionCount,
                         new LinkedHashMap<>()));
                 }
                 if (builders.isEmpty()) {
@@ -326,6 +349,11 @@ public class ReversalService {
                     if (builder == null) {
                         throw new InvalidJournalException(
                             "posting set changed within reversal snapshot: " + postingId);
+                    }
+                    if (builder.dimensions().size() == MAX_DIMENSIONS_PER_POSTING) {
+                        throw new InvalidJournalException(
+                            "posting exceeds POC dimension limit of "
+                                + MAX_DIMENSIONS_PER_POSTING);
                     }
                     builder.dimensions().put(rows.getString("key"), rows.getString("value"));
                 }
@@ -444,6 +472,18 @@ public class ReversalService {
         }
     }
 
+    private static boolean hasConstraint(Throwable failure, String expectedConstraint) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof PSQLException postgresFailure
+                && postgresFailure.getServerErrorMessage() != null
+                && expectedConstraint.equals(
+                    postgresFailure.getServerErrorMessage().getConstraint())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static UUID deterministicId(UUID commandId, String component) {
         return UUID.nameUUIDFromBytes(
             ("funds-reversal:" + commandId + ":" + component).getBytes(StandardCharsets.UTF_8));
@@ -485,7 +525,6 @@ public class ReversalService {
         CurrencyCode currency,
         long signedMinorUnits,
         long accountSequence,
-        int dimensionCount,
         Map<String, String> dimensions) {
 
         private PostingLine build() {

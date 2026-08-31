@@ -194,6 +194,22 @@ class LedgerConstraintIT {
     }
 
     @Test
+    void allowsPostingAssemblyOnlyWhileCommandIsInProgress() throws Exception {
+        inRollbackTransaction(connection -> {
+            insertReferenceGraph(connection);
+            insertInProgressCommand(connection, COMMAND_ID, REQUEST_HASH);
+            insertJournal(connection, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
+            insertPosting(connection, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
+            insertPosting(connection, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+
+            assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting"));
+        });
+
+        withFinalizedJournal(connection -> assertSqlState(connection, "55000", postingInsert(
+            uuid(399), JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 1, 2)));
+    }
+
+    @Test
     void rejectsDuplicateCommandIdWithDifferentRequestHash() throws Exception {
         inRollbackTransaction(connection -> {
             insertInProgressCommand(connection, COMMAND_ID, REQUEST_HASH);
@@ -232,13 +248,7 @@ class LedgerConstraintIT {
             try (var connection = dataSource.getConnection()) {
                 connection.setAutoCommit(false);
                 insertReferenceGraph(connection);
-                execute(connection, idempotencyInsert(
-                    COMMAND_ID,
-                    REQUEST_HASH,
-                    "COMPLETED",
-                    JOURNAL_ID,
-                    "'{\"status\":\"BOOKED\"}'::jsonb",
-                    "TIMESTAMPTZ '2026-01-15 10:00:01+00'"));
+                insertInProgressCommand(connection, COMMAND_ID, REQUEST_HASH);
                 insertJournal(connection, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
                 journalSequence = queryLong(connection, """
                     SELECT journal_sequence FROM funds.journal WHERE journal_id = '%s'
@@ -264,6 +274,13 @@ class LedgerConstraintIT {
                         ('%s', '%s', %d, 'JournalPosted', 1,
                          '{"journalId":"%s"}'::jsonb, TIMESTAMPTZ '2026-01-15 10:00:01+00')
                     """.formatted(EVENT_ID, JOURNAL_ID, journalSequence, JOURNAL_ID));
+                execute(connection, """
+                    UPDATE funds.idempotency_command
+                    SET state = 'COMPLETED', journal_id = '%s',
+                        result_json = '{"status":"BOOKED"}'::jsonb,
+                        completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
+                    WHERE command_id = '%s'
+                    """.formatted(JOURNAL_ID, COMMAND_ID));
                 connection.commit();
             }
 
@@ -339,6 +356,32 @@ class LedgerConstraintIT {
                 insertJournal(connection, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
                 insertPosting(connection, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
                 insertPosting(connection, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+                connection.commit();
+            }
+
+            inRollbackTransaction(mutation);
+        } finally {
+            truncateAllTables();
+        }
+    }
+
+    private void withFinalizedJournal(SqlConsumer mutation) throws Exception {
+        truncateAllTables();
+        try {
+            try (var connection = dataSource.getConnection()) {
+                connection.setAutoCommit(false);
+                insertReferenceGraph(connection);
+                insertInProgressCommand(connection, COMMAND_ID, REQUEST_HASH);
+                insertJournal(connection, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
+                insertPosting(connection, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
+                insertPosting(connection, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+                execute(connection, """
+                    UPDATE funds.idempotency_command
+                    SET state = 'COMPLETED', journal_id = '%s',
+                        result_json = '{"journalId":"%s"}'::jsonb,
+                        completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
+                    WHERE command_id = '%s'
+                    """.formatted(JOURNAL_ID, JOURNAL_ID, COMMAND_ID));
                 connection.commit();
             }
 

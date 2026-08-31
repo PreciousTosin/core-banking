@@ -71,6 +71,30 @@ class MigrationIT {
     }
 
     @Test
+    void installsJournalFinalityTriggerAndSingleReversalIndex() throws Exception {
+        inTransaction(connection -> {
+            assertEquals(1, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_trigger trigger
+                JOIN pg_class relation ON relation.oid = trigger.tgrelid
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = 'funds'
+                  AND relation.relname = 'posting'
+                  AND trigger.tgname = 'posting_requires_in_progress_command'
+                  AND NOT trigger.tgisinternal
+                """));
+            assertEquals(1, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_indexes
+                WHERE schemaname = 'funds'
+                  AND tablename = 'journal'
+                  AND indexname = 'one_reversal_per_original_idx'
+                  AND indexdef LIKE '%WHERE%transaction_type%REVERSAL%'
+                """));
+        });
+    }
+
+    @Test
     void rejectsLedgerCurrencyLongerThanThreeCharacters() throws Exception {
         inTransaction(connection -> {
             insertReferenceGraph(connection);
