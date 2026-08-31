@@ -5,8 +5,10 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -58,6 +60,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.postgresql.PGConnection;
+import org.postgresql.PGStatement;
 import org.postgresql.ds.PGSimpleDataSource;
 
 @QuarkusTest
@@ -258,6 +262,106 @@ class PostingCrashRecoveryIT {
     }
 
     @Test
+    void trackedJdbcProxiesUseIdentitySemanticsAndPreserveWrapperContracts() throws Exception {
+        runJdbcBounded(
+            PROCESS_TIMEOUT,
+            "tracked JDBC proxy contract",
+            boundedDataSource,
+            resources -> resources.withConnection(connection -> {
+                PGConnection connectionDelegate = connection.unwrap(PGConnection.class);
+                assertAll(
+                    () -> assertTrue(connection.equals(connection)),
+                    () -> assertFalse(connection.equals(connectionDelegate)),
+                    () -> assertFalse(connectionDelegate.equals(connection)),
+                    () -> assertEquals(System.identityHashCode(connection), connection.hashCode()),
+                    () -> assertTrue(connection.toString().startsWith("tracked Connection@")),
+                    () -> assertTrue(connection.isWrapperFor(Connection.class)),
+                    () -> assertSame(connection, connection.unwrap(Connection.class)),
+                    () -> assertTrue(connection.isWrapperFor(PGConnection.class)),
+                    () -> assertSame(connectionDelegate, connection.unwrap(PGConnection.class)));
+
+                try (PreparedStatement statement = connection.prepareStatement("SELECT 1")) {
+                    PGStatement statementDelegate = statement.unwrap(PGStatement.class);
+                    assertAll(
+                        () -> assertTrue(statement.equals(statement)),
+                        () -> assertFalse(statement.equals(statementDelegate)),
+                        () -> assertFalse(statementDelegate.equals(statement)),
+                        () -> assertEquals(System.identityHashCode(statement), statement.hashCode()),
+                        () -> assertTrue(statement.toString().startsWith("tracked PreparedStatement@")),
+                        () -> assertTrue(statement.isWrapperFor(Statement.class)),
+                        () -> assertSame(statement, statement.unwrap(Statement.class)),
+                        () -> assertTrue(statement.isWrapperFor(PreparedStatement.class)),
+                        () -> assertSame(statement, statement.unwrap(PreparedStatement.class)),
+                        () -> assertTrue(statement.isWrapperFor(PGStatement.class)),
+                        () -> assertSame(statementDelegate, statement.unwrap(PGStatement.class)));
+                    try (var result = statement.executeQuery()) {
+                        assertTrue(result.next());
+                        assertEquals(1, result.getInt(1));
+                    }
+                }
+                return null;
+            }));
+    }
+
+    @Test
+    void blockingResourceCancellationRunsInOwnedBoundedTaskBeforeMainWorkJoins() {
+        Thread caller = Thread.currentThread();
+        var operationStarted = new CountDownLatch(1);
+        var operationInterrupted = new CountDownLatch(1);
+        var cancellationStarted = new CountDownLatch(1);
+        var cancellationInterrupted = new CountDownLatch(1);
+        var cancellationRanOnCaller = new AtomicBoolean();
+        var releaseVerified = new AtomicBoolean();
+        var sequence = new AtomicInteger();
+
+        AssertionError failure = assertThrows(AssertionError.class, () -> runBounded(
+            Duration.ofMillis(400),
+            "blocking resource-cancellation proof",
+            () -> {
+                operationStarted.countDown();
+                try {
+                    new CountDownLatch(1).await();
+                } catch (InterruptedException expected) {
+                    operationInterrupted.countDown();
+                    sequence.compareAndSet(2, 3);
+                    throw expected;
+                }
+                return null;
+            },
+            () -> {
+                if (Thread.currentThread() == caller) {
+                    cancellationRanOnCaller.set(true);
+                    return new AssertionError("resource cancellation ran on the caller");
+                }
+                cancellationStarted.countDown();
+                sequence.compareAndSet(0, 1);
+                try {
+                    new CountDownLatch(1).await();
+                    return null;
+                } catch (InterruptedException expected) {
+                    cancellationInterrupted.countDown();
+                    sequence.compareAndSet(1, 2);
+                    return new AssertionError("blocked cancellation interrupted", expected);
+                }
+            },
+            () -> {
+                releaseVerified.set(true);
+                return new AssertionError("live resource diagnostic");
+            }));
+
+        assertAll(
+            () -> assertEquals(0, operationStarted.getCount()),
+            () -> assertFalse(cancellationRanOnCaller.get()),
+            () -> assertEquals(0, cancellationStarted.getCount()),
+            () -> assertEquals(0, cancellationInterrupted.getCount()),
+            () -> assertEquals(0, operationInterrupted.getCount()),
+            () -> assertEquals(3, sequence.get()),
+            () -> assertTrue(releaseVerified.get()),
+            () -> assertTrue(throwableTreeContains(failure, "resource cancellation task")),
+            () -> assertTrue(throwableTreeContains(failure, "live resource diagnostic")));
+    }
+
+    @Test
     void realRepositoryRetryClosesAndClearsTheFailedAttemptBeforeOpeningTheNextConnection() throws Exception {
         UUID commandId = TestPostingStack.uuid(60);
         PostingCommand command = CrashPostingWorker.command(commandId);
@@ -343,7 +447,7 @@ class PostingCrashRecoveryIT {
     }
 
     @Test
-    void workerUsesOneDeterministicDeadlineForProcessWaitOutputReadAndFileDeletion() {
+    void workerOperationAndCleanupBudgetsStartFreshAfterLongVisibilityPhase() {
         var clock = new MutableNanoClock();
         var process = new DeterministicExitProcess();
         var waits = new RecordingTimedWaits(clock);
@@ -358,7 +462,9 @@ class PostingCrashRecoveryIT {
             waits,
             files);
 
+        clock.advance(1_000);
         WorkerExit exit = worker.awaitExit();
+        clock.advance(1_000);
         worker.close();
 
         assertAll(
@@ -368,7 +474,72 @@ class PostingCrashRecoveryIT {
             () -> assertTrue(files.deleted.get()),
             () -> assertEquals(outputFile, files.readPath.get()),
             () -> assertEquals(outputFile, files.deletedPath.get()),
-            () -> assertEquals(List.of(90L, 60L, 50L), waits.observedBudgets));
+            () -> assertEquals(List.of(100L, 100L, 100L), waits.observedBudgets));
+    }
+
+    @Test
+    void workerCleanupReservesDeletionWithinOneDiminishingDeadline() {
+        var clock = new MutableNanoClock();
+        var process = new DeterministicExitProcess();
+        var waits = new RecordingTimedWaits(clock);
+        var files = new RecordingWorkerFiles(process);
+        Path outputFile = tempDirectory.resolve("deterministic-cleanup-output.log");
+        var worker = new WorkerHandle(
+            process,
+            CrashPostingWorker.CrashPoint.BEFORE_COMMIT,
+            outputFile,
+            Duration.ofNanos(100),
+            clock::nanoTime,
+            waits,
+            files);
+
+        worker.close();
+
+        assertAll(
+            () -> assertTrue(files.deleted.get()),
+            () -> assertEquals(outputFile, files.deletedPath.get()),
+            () -> assertEquals(List.of(90L, 70L), waits.observedBudgets));
+    }
+
+    @Test
+    void workerStartFailureStillAttemptsBoundedDeletionAndSuppressesItsFailure() {
+        var clock = new MutableNanoClock();
+        var waits = new RecordingTimedWaits(clock);
+        var deletionAttempted = new AtomicBoolean();
+        var deletionFailure = new IOException("deterministic deletion diagnostic");
+        Path outputFile = tempDirectory.resolve("failed-worker-start-output.log");
+        WorkerFiles files = new WorkerFiles() {
+            @Override
+            public String read(Path path) {
+                throw new AssertionError("start-failure output must not be read");
+            }
+
+            @Override
+            public void delete(Path path) throws IOException {
+                assertEquals(outputFile, path);
+                deletionAttempted.set(true);
+                throw deletionFailure;
+            }
+        };
+
+        IOException startFailure = assertThrows(IOException.class, () -> startWorker(
+            () -> {
+                clock.advance(1_000);
+                throw new IOException("deterministic process-start diagnostic");
+            },
+            CrashPostingWorker.CrashPoint.BEFORE_COMMIT,
+            outputFile,
+            Duration.ofNanos(100),
+            clock::nanoTime,
+            waits,
+            files));
+
+        assertAll(
+            () -> assertEquals("deterministic process-start diagnostic", startFailure.getMessage()),
+            () -> assertTrue(deletionAttempted.get()),
+            () -> assertEquals(List.of(100L), waits.observedBudgets),
+            () -> assertEquals(1, startFailure.getSuppressed().length),
+            () -> assertSame(deletionFailure, startFailure.getSuppressed()[0]));
     }
 
     @Test
@@ -456,13 +627,54 @@ class PostingCrashRecoveryIT {
         builder.environment().put("CB_TEST_JDBC_URL", credentials.jdbcUrl());
         builder.environment().put("CB_TEST_DB_USER", credentials.username());
         builder.environment().put("CB_TEST_DB_PASSWORD", credentials.password());
+        return startWorker(
+            builder::start,
+            point,
+            outputFile,
+            PROCESS_TIMEOUT,
+            System::nanoTime,
+            SystemTimedWaits.INSTANCE,
+            SystemWorkerFiles.INSTANCE);
+    }
+
+    private static WorkerHandle startWorker(
+        ProcessStarter processStarter,
+        CrashPostingWorker.CrashPoint point,
+        Path outputFile,
+        Duration timeout,
+        LongSupplier nanoTime,
+        TimedWaits timedWaits,
+        WorkerFiles files
+    ) throws IOException {
         try {
-            return new WorkerHandle(builder.start(), point, outputFile);
+            return new WorkerHandle(
+                processStarter.start(),
+                point,
+                outputFile,
+                timeout,
+                nanoTime,
+                timedWaits,
+                files);
         } catch (IOException startFailure) {
+            boolean restoreInterrupt = Thread.interrupted();
+            Deadline cleanupDeadline = Deadline.after(timeout, nanoTime);
             try {
-                Files.deleteIfExists(outputFile);
-            } catch (IOException deleteFailure) {
+                timedWaits.call(
+                    () -> {
+                        files.delete(outputFile);
+                        return null;
+                    },
+                    cleanupDeadline,
+                    "failed crash-worker output-file deletion at " + point);
+            } catch (InterruptedException interrupted) {
+                restoreInterrupt = true;
+                startFailure.addSuppressed(interrupted);
+            } catch (Exception | Error deleteFailure) {
                 startFailure.addSuppressed(deleteFailure);
+            }
+            restoreInterrupt |= Thread.interrupted();
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt();
             }
             throw startFailure;
         }
@@ -685,7 +897,36 @@ class PostingCrashRecoveryIT {
         ExecutorService executor
     ) throws Exception {
         Deadline deadline = Deadline.after(timeout, System::nanoTime);
-        long cleanupReserve = Math.min(SECONDS.toNanos(3), Math.max(1, timeout.toNanos() / 4));
+        return runBounded(
+            deadline,
+            description,
+            operation,
+            cancellation,
+            releaseVerification,
+            executor);
+    }
+
+    private static <T> T runBounded(
+        Deadline deadline,
+        String description,
+        Callable<T> operation
+    ) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor(
+            Thread.ofVirtual().name("bounded-" + description.replace(' ', '-')).factory());
+        return runBounded(deadline, description, operation, () -> null, () -> null, executor);
+    }
+
+    private static <T> T runBounded(
+        Deadline deadline,
+        String description,
+        Callable<T> operation,
+        Supplier<AssertionError> cancellation,
+        Supplier<AssertionError> releaseVerification,
+        ExecutorService executor
+    ) throws Exception {
+        long cleanupReserve = Math.min(
+            SECONDS.toNanos(3),
+            Math.max(1, deadline.remainingNanos() / 2));
         Future<T> future = executor.submit(operation);
         Throwable primaryFailure = null;
         boolean restoreInterrupt = false;
@@ -745,13 +986,81 @@ class PostingCrashRecoveryIT {
         AssertionError cleanupFailure = null;
         boolean restoreInterrupt = Thread.interrupted();
         if (!future.isDone()) {
+            ExecutorService cancellationExecutor = Executors.newSingleThreadExecutor(
+                Thread.ofVirtual().name("cancel-" + description.replace(' ', '-')).factory());
+            Future<AssertionError> cancellationTask = null;
             try {
-                cleanupFailure = append(cleanupFailure, cancellation.get());
+                cancellationTask = cancellationExecutor.submit(cancellation::get);
             } catch (RuntimeException | Error failure) {
                 cleanupFailure = append(
                     cleanupFailure,
-                    new AssertionError(description + " resource cancellation failed", failure));
+                    new AssertionError(description + " resource cancellation task submission failed", failure));
             }
+            if (cancellationTask != null) {
+                boolean cancellationComplete = false;
+                while (!cancellationComplete) {
+                    long remaining = deadline.remainingNanos();
+                    if (remaining == 0) {
+                        cleanupFailure = append(
+                            cleanupFailure,
+                            new AssertionError(
+                                description + " resource cancellation task did not complete within the overall bound"));
+                        break;
+                    }
+                    long terminationReserve = Math.min(
+                        SECONDS.toNanos(1),
+                        Math.max(1, remaining / 4));
+                    long cancellationBudget = Math.max(1, remaining - terminationReserve);
+                    try {
+                        cleanupFailure = append(
+                            cleanupFailure,
+                            cancellationTask.get(cancellationBudget, NANOSECONDS));
+                        cancellationComplete = true;
+                    } catch (TimeoutException timeoutFailure) {
+                        cleanupFailure = append(
+                            cleanupFailure,
+                            new AssertionError(
+                                description + " resource cancellation task did not complete within the overall bound",
+                                timeoutFailure));
+                        break;
+                    } catch (InterruptedException interrupted) {
+                        restoreInterrupt = true;
+                    } catch (ExecutionException executionFailure) {
+                        cleanupFailure = append(
+                            cleanupFailure,
+                            new AssertionError(
+                                description + " resource cancellation task failed",
+                                executionFailure.getCause()));
+                        cancellationComplete = true;
+                    }
+                }
+                if (!cancellationComplete) {
+                    try {
+                        cancellationTask.cancel(true);
+                    } catch (RuntimeException failure) {
+                        cleanupFailure = append(
+                            cleanupFailure,
+                            new AssertionError(
+                                description + " resource cancellation future cancellation failed",
+                                failure));
+                    }
+                }
+            }
+            try {
+                cancellationExecutor.shutdownNow();
+            } catch (RuntimeException failure) {
+                cleanupFailure = append(
+                    cleanupFailure,
+                    new AssertionError(description + " resource cancellation executor shutdown failed", failure));
+            }
+            CleanupOutcome cancellationShutdown = awaitTerminationBounded(
+                cancellationExecutor,
+                description + " resource cancellation executor",
+                deadline,
+                restoreInterrupt,
+                cleanupFailure);
+            restoreInterrupt = cancellationShutdown.restoreInterrupt();
+            cleanupFailure = cancellationShutdown.failure();
         }
         try {
             if (!future.isDone()) {
@@ -769,25 +1078,14 @@ class PostingCrashRecoveryIT {
                 cleanupFailure,
                 new AssertionError(description + " executor shutdown failed", failure));
         }
-        while (!executor.isTerminated()) {
-            long remaining = deadline.remainingNanos();
-            if (remaining == 0) {
-                cleanupFailure = append(
-                    cleanupFailure,
-                    new AssertionError(description + " executor did not terminate within the overall bound"));
-                break;
-            }
-            try {
-                if (!executor.awaitTermination(remaining, NANOSECONDS)) {
-                    cleanupFailure = append(
-                        cleanupFailure,
-                        new AssertionError(description + " executor did not terminate within the overall bound"));
-                    break;
-                }
-            } catch (InterruptedException interrupted) {
-                restoreInterrupt = true;
-            }
-        }
+        CleanupOutcome executorShutdown = awaitTerminationBounded(
+            executor,
+            description + " executor",
+            deadline,
+            restoreInterrupt,
+            cleanupFailure);
+        restoreInterrupt = executorShutdown.restoreInterrupt();
+        cleanupFailure = executorShutdown.failure();
         try {
             cleanupFailure = append(cleanupFailure, releaseVerification.get());
         } catch (RuntimeException | Error failure) {
@@ -796,6 +1094,35 @@ class PostingCrashRecoveryIT {
                 new AssertionError(description + " resource-release verification failed", failure));
         }
         restoreInterrupt |= Thread.interrupted();
+        return new CleanupOutcome(restoreInterrupt, cleanupFailure);
+    }
+
+    private static CleanupOutcome awaitTerminationBounded(
+        ExecutorService executor,
+        String description,
+        Deadline deadline,
+        boolean restoreInterrupt,
+        AssertionError cleanupFailure
+    ) {
+        while (!executor.isTerminated()) {
+            long remaining = deadline.remainingNanos();
+            if (remaining == 0) {
+                cleanupFailure = append(
+                    cleanupFailure,
+                    new AssertionError(description + " did not terminate within the overall bound"));
+                break;
+            }
+            try {
+                if (!executor.awaitTermination(remaining, NANOSECONDS)) {
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError(description + " did not terminate within the overall bound"));
+                    break;
+                }
+            } catch (InterruptedException interrupted) {
+                restoreInterrupt = true;
+            }
+        }
         return new CleanupOutcome(restoreInterrupt, cleanupFailure);
     }
 
@@ -825,6 +1152,11 @@ class PostingCrashRecoveryIT {
     @FunctionalInterface
     private interface JdbcWork<T> {
         T execute(JdbcResources resources) throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface ProcessStarter {
+        Process start() throws IOException;
     }
 
     @FunctionalInterface
@@ -970,6 +1302,21 @@ class PostingCrashRecoveryIT {
                 Connection.class.getClassLoader(),
                 new Class<?>[]{Connection.class},
                 (proxy, method, arguments) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return identityObjectMethod(proxy, method, arguments, "Connection");
+                    }
+                    if ("unwrap".equals(method.getName())
+                        && arguments != null
+                        && arguments[0] instanceof Class<?> type
+                        && type.isInstance(proxy)) {
+                        return type.cast(proxy);
+                    }
+                    if ("isWrapperFor".equals(method.getName())
+                        && arguments != null
+                        && arguments[0] instanceof Class<?> type
+                        && type.isInstance(proxy)) {
+                        return true;
+                    }
                     if ("close".equals(method.getName()) || "abort".equals(method.getName())) {
                         try {
                             return invoke(delegate, method, arguments);
@@ -998,6 +1345,21 @@ class PostingCrashRecoveryIT {
                 statementType.getClassLoader(),
                 new Class<?>[]{statementType},
                 (proxy, method, arguments) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return identityObjectMethod(proxy, method, arguments, statementType.getSimpleName());
+                    }
+                    if ("unwrap".equals(method.getName())
+                        && arguments != null
+                        && arguments[0] instanceof Class<?> type
+                        && type.isInstance(proxy)) {
+                        return type.cast(proxy);
+                    }
+                    if ("isWrapperFor".equals(method.getName())
+                        && arguments != null
+                        && arguments[0] instanceof Class<?> type
+                        && type.isInstance(proxy)) {
+                        return true;
+                    }
                     if ("close".equals(method.getName())) {
                         try {
                             return invoke(delegate, method, arguments);
@@ -1544,7 +1906,7 @@ class PostingCrashRecoveryIT {
     private interface TimedWaits {
         boolean waitFor(Process process, long remainingNanos) throws InterruptedException;
 
-        <T> T call(Callable<T> operation, long remainingNanos, String description) throws Exception;
+        <T> T call(Callable<T> operation, Deadline deadline, String description) throws Exception;
     }
 
     private enum SystemTimedWaits implements TimedWaits {
@@ -1556,8 +1918,8 @@ class PostingCrashRecoveryIT {
         }
 
         @Override
-        public <T> T call(Callable<T> operation, long remainingNanos, String description) throws Exception {
-            return runBounded(Duration.ofNanos(Math.max(1, remainingNanos)), description, operation);
+        public <T> T call(Callable<T> operation, Deadline deadline, String description) throws Exception {
+            return runBounded(deadline, description, operation);
         }
     }
 
@@ -1590,7 +1952,8 @@ class PostingCrashRecoveryIT {
         private final Path outputFile;
         private final TimedWaits timedWaits;
         private final WorkerFiles files;
-        private final Deadline deadline;
+        private final Duration timeout;
+        private final LongSupplier nanoTime;
         private final long deletionReserve;
 
         private WorkerHandle(Process process, CrashPostingWorker.CrashPoint point, Path outputFile) {
@@ -1618,15 +1981,17 @@ class PostingCrashRecoveryIT {
             this.outputFile = outputFile;
             this.timedWaits = timedWaits;
             this.files = files;
-            this.deadline = Deadline.after(timeout, nanoTime);
+            this.timeout = timeout;
+            this.nanoTime = nanoTime;
             this.deletionReserve = Math.min(
                 SECONDS.toNanos(1),
                 Math.max(1, timeout.toNanos() / 10));
         }
 
         private WorkerExit awaitExit() {
+            Deadline exitDeadline = Deadline.after(timeout, nanoTime);
             try {
-                if (!timedWaits.waitFor(process, budgetBeforeDeletion())) {
+                if (!timedWaits.waitFor(process, Math.max(1, exitDeadline.remainingNanos()))) {
                     throw new AssertionError("crash worker did not exit within 10 seconds at " + point);
                 }
             } catch (InterruptedException interrupted) {
@@ -1635,11 +2000,12 @@ class PostingCrashRecoveryIT {
             }
 
             try {
+                Deadline outputDeadline = Deadline.after(timeout, nanoTime);
                 return new WorkerExit(
                     process.exitValue(),
                     timedWaits.call(
                         () -> files.read(outputFile),
-                        budgetBeforeDeletion(),
+                        outputDeadline,
                         "crash-worker output-file read at " + point));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -1651,13 +2017,20 @@ class PostingCrashRecoveryIT {
 
         @Override
         public void close() {
+            Deadline cleanupDeadline = Deadline.after(timeout, nanoTime);
             AssertionError cleanupFailure = null;
             boolean restoreInterrupt = Thread.interrupted();
             if (process.isAlive()) {
                 process.destroyForcibly();
                 boolean waitComplete = false;
-                while (!waitComplete && deadline.hasRemaining()) {
-                    long remaining = Math.max(1, deadline.remainingNanos() / 2);
+                while (!waitComplete) {
+                    long remaining = budgetBeforeDeletion(cleanupDeadline);
+                    if (remaining == 0) {
+                        cleanupFailure = append(
+                            cleanupFailure,
+                            new AssertionError("crash worker survived forced destruction at " + point));
+                        break;
+                    }
                     try {
                         if (!timedWaits.waitFor(process, remaining)) {
                             cleanupFailure = append(
@@ -1669,33 +2042,31 @@ class PostingCrashRecoveryIT {
                         restoreInterrupt = true;
                     }
                 }
-                if (!waitComplete) {
-                    cleanupFailure = append(
-                        cleanupFailure,
-                        new AssertionError("crash worker survived forced destruction at " + point));
-                }
             }
 
             boolean deleteComplete = false;
-            while (!deleteComplete && deadline.hasRemaining()) {
+            do {
                 try {
                     timedWaits.call(
                         () -> {
                             files.delete(outputFile);
                             return null;
                         },
-                        deadline.remainingNanos(),
+                        cleanupDeadline,
                         "crash-worker output-file deletion at " + point);
                     deleteComplete = true;
                 } catch (InterruptedException interrupted) {
                     restoreInterrupt = true;
+                    if (!cleanupDeadline.hasRemaining()) {
+                        break;
+                    }
                 } catch (Exception | Error failure) {
                     cleanupFailure = append(
                         cleanupFailure,
                         new AssertionError("crash-worker output-file deletion failed at " + point, failure));
                     break;
                 }
-            }
+            } while (!deleteComplete);
             if (!deleteComplete) {
                 cleanupFailure = append(
                     cleanupFailure,
@@ -1709,8 +2080,8 @@ class PostingCrashRecoveryIT {
             }
         }
 
-        private long budgetBeforeDeletion() {
-            return Math.max(1, deadline.remainingNanos() - deletionReserve);
+        private long budgetBeforeDeletion(Deadline cleanupDeadline) {
+            return Math.max(0, cleanupDeadline.remainingNanos() - deletionReserve);
         }
 
         private static AssertionError append(AssertionError existing, AssertionError next) {
@@ -1834,8 +2205,8 @@ class PostingCrashRecoveryIT {
         }
 
         @Override
-        public <T> T call(Callable<T> operation, long remainingNanos, String description) throws Exception {
-            observedBudgets.add(remainingNanos);
+        public <T> T call(Callable<T> operation, Deadline deadline, String description) throws Exception {
+            observedBudgets.add(deadline.remainingNanos());
             if (description.contains("read")) {
                 clock.advance(20);
             }
@@ -2138,5 +2509,20 @@ class PostingCrashRecoveryIT {
         } catch (InvocationTargetException failure) {
             throw failure.getCause();
         }
+    }
+
+    private static Object identityObjectMethod(
+        Object proxy,
+        Method method,
+        Object[] arguments,
+        String interfaceName
+    ) {
+        return switch (method.getName()) {
+            case "equals" -> proxy == arguments[0];
+            case "hashCode" -> System.identityHashCode(proxy);
+            case "toString" -> "tracked " + interfaceName + '@'
+                + Integer.toHexString(System.identityHashCode(proxy));
+            default -> throw new AssertionError("unexpected Object method: " + method);
+        };
     }
 }
