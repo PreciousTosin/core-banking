@@ -63,7 +63,8 @@ public class JdbcAccountingProofRepository {
     ) {
         String sql = """
             WITH source AS (
-                SELECT coalesce(sum(posting.signed_minor_units::numeric), 0::numeric) AS source_total
+                SELECT coalesce(sum(posting.signed_minor_units::numeric), 0::numeric) AS source_total,
+                       coalesce(max(journal.journal_sequence), 0::bigint) AS source_latest_journal_sequence
                 FROM funds.posting posting
                 JOIN funds.journal journal ON journal.journal_id = posting.journal_id
                 JOIN funds.ledger_account account ON account.account_id = posting.account_id
@@ -79,6 +80,7 @@ public class JdbcAccountingProofRepository {
                 WHERE book_id = ? AND control_account_code = ? AND currency = ?
             )
             SELECT source.source_total,
+                   source.source_latest_journal_sequence,
                    coalesce(projection.projection_total, 0::numeric) AS projection_total,
                    projection.latest_journal_sequence
             FROM source
@@ -96,11 +98,18 @@ public class JdbcAccountingProofRepository {
             statement.setString(7, currency.value());
             try (var rows = statement.executeQuery()) {
                 requireOneRow(rows);
+                long sourceSequence = rows.getLong("source_latest_journal_sequence");
                 long projectionSequence = rows.getLong("latest_journal_sequence");
-                if (!rows.wasNull() && projectionSequence > cutoff) {
+                boolean projectionMissing = rows.wasNull();
+                if (projectionMissing && sourceSequence != 0) {
+                    throw new IllegalStateException(
+                        "control projection is missing for mapped source at sequence " + sourceSequence);
+                }
+                if (!projectionMissing && projectionSequence != sourceSequence) {
                     throw new IllegalStateException(
                         "control projection latest journal sequence " + projectionSequence
-                            + " is newer than cutoff " + cutoff);
+                            + " does not match source latest journal sequence " + sourceSequence
+                            + " at cutoff " + cutoff);
                 }
                 BigInteger source = exactInteger(rows, "source_total");
                 BigInteger projection = exactInteger(rows, "projection_total");

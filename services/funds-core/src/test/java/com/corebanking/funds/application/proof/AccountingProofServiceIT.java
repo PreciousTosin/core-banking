@@ -10,9 +10,11 @@ import com.corebanking.funds.application.CanonicalJournalHasher;
 import com.corebanking.funds.application.PostingCommand;
 import com.corebanking.funds.application.PostingResult;
 import com.corebanking.funds.application.PostingService;
+import com.corebanking.funds.application.ReversalService;
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
+import com.corebanking.funds.domain.ReversalRequest;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import java.math.BigInteger;
@@ -37,10 +39,12 @@ class AccountingProofServiceIT {
     private static final UUID PROVIDER = uuid(10);
     private static final UUID CUSTOMER_A = uuid(11);
     private static final UUID CUSTOMER_B = uuid(12);
+    private static final UUID OTHER = uuid(13);
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
 
     @Inject DataSource dataSource;
     @Inject PostingService postingService;
+    @Inject ReversalService reversalService;
     @Inject AccountingProofService proofService;
 
     @BeforeEach
@@ -51,6 +55,7 @@ class AccountingProofServiceIT {
             seedAccount(connection, PROVIDER, BOOK, CHART, "PROVIDER", "NGN", "PROVIDER-CASH");
             seedAccount(connection, CUSTOMER_A, BOOK, CHART, "CUSTOMER-A", "NGN", "CUSTOMER-DEPOSITS");
             seedAccount(connection, CUSTOMER_B, BOOK, CHART, "CUSTOMER-B", "NGN", "CUSTOMER-DEPOSITS");
+            seedAccount(connection, OTHER, BOOK, CHART, "OTHER", "NGN", "OTHER-CONTROL");
         }
     }
 
@@ -69,8 +74,9 @@ class AccountingProofServiceIT {
             line(31, CUSTOMER_A, NGN, 25_000), line(32, CUSTOMER_B, NGN, -25_000));
         assertProof(transfer.journalSequence(), 125_000, 125_000, -100_000);
 
-        PostingResult reversal = post(40, "REVERSAL", inflow.journalId(),
-            line(41, PROVIDER, NGN, -100_000), line(42, CUSTOMER_A, NGN, 100_000));
+        PostingResult reversal = reversalService.reverse(new ReversalRequest(
+            uuid(40), "b".repeat(64), inflow.journalId(), uuid(2_040), uuid(3_040), PERIOD,
+            Instant.parse("2026-01-16T10:00:00Z"), LocalDate.of(2026, 1, 16), "Proof reversal"));
         assertProof(reversal.journalSequence(), 225_000, 225_000, 0);
     }
 
@@ -106,7 +112,7 @@ class AccountingProofServiceIT {
     }
 
     @Test
-    void missingProjectionIsZeroForEmptySourceAndAnExactDifferenceForNonzeroSource() throws SQLException {
+    void missingProjectionForMappedSourceFailsClosedWhileEmptySourceUsesZero() throws SQLException {
         PostingResult result = post(55, "INFLOW", null,
             line(56, PROVIDER, NGN, 90), line(57, CUSTOMER_A, NGN, -90));
         try (var connection = dataSource.getConnection()) {
@@ -116,29 +122,65 @@ class AccountingProofServiceIT {
                 """, BOOK);
         }
 
-        ControlAccountProof missing = proofService.controlAccount(
-            BOOK, "CUSTOMER-DEPOSITS", NGN, result.journalSequence());
-
         assertAll(
-            () -> assertEquals(BigInteger.valueOf(-90), missing.sourceTotal()),
-            () -> assertEquals(BigInteger.ZERO, missing.projectionTotal()),
-            () -> assertEquals(BigInteger.valueOf(-90), missing.difference()),
+            () -> assertThrows(IllegalStateException.class,
+                () -> proofService.controlAccount(
+                    BOOK, "CUSTOMER-DEPOSITS", NGN, result.journalSequence())),
             () -> assertEquals(BigInteger.ZERO,
                 proofService.controlAccount(BOOK, "NEVER-POSTED", NGN, result.journalSequence()).difference()));
     }
 
     @Test
-    void failsClosedWhenCurrentProjectionIsNewerThanRequestedCutoff() {
+    void exactSourceSequenceAcceptsUnrelatedLaterJournalAndRejectsRewrittenProjectionSequence()
+        throws SQLException {
         PostingResult first = post(60, "INFLOW", null,
             line(61, PROVIDER, NGN, 50), line(62, CUSTOMER_A, NGN, -50));
-        post(70, "TRANSFER", null,
-            line(71, CUSTOMER_A, NGN, 20), line(72, CUSTOMER_B, NGN, -20));
+        PostingResult unrelated = post(70, "UNRELATED", null,
+            line(71, PROVIDER, NGN, 20), line(72, OTHER, NGN, -20));
 
-        IllegalStateException failure = assertThrows(IllegalStateException.class,
-            () -> proofService.controlAccount(BOOK, "CUSTOMER-DEPOSITS", NGN, first.journalSequence()));
+        ControlAccountProof valid = proofService.controlAccount(
+            BOOK, "CUSTOMER-DEPOSITS", NGN, unrelated.journalSequence());
+        try (var connection = dataSource.getConnection()) {
+            execute(connection, """
+                UPDATE funds.control_account_projection SET latest_journal_sequence = ?
+                WHERE book_id = ? AND control_account_code = 'CUSTOMER-DEPOSITS' AND currency = 'NGN'
+                """, unrelated.journalSequence(), BOOK);
+        }
 
-        assertTrue(failure.getMessage().contains("newer than cutoff"));
-        assertTrue(proofService.trialBalance(BOOK, NGN, first.journalSequence()).balanced());
+        assertAll(
+            () -> assertEquals(BigInteger.valueOf(-50), valid.sourceTotal()),
+            () -> assertEquals(BigInteger.valueOf(-50), valid.projectionTotal()),
+            () -> assertThrows(IllegalStateException.class,
+                () -> proofService.controlAccount(
+                    BOOK, "CUSTOMER-DEPOSITS", NGN, unrelated.journalSequence())),
+            () -> assertTrue(proofService.trialBalance(BOOK, NGN, first.journalSequence()).balanced()));
+
+        try (var connection = dataSource.getConnection()) {
+            execute(connection, """
+                UPDATE funds.control_account_projection SET latest_journal_sequence = ?
+                WHERE book_id = ? AND control_account_code = 'CUSTOMER-DEPOSITS' AND currency = 'NGN'
+                """, unrelated.journalSequence() + 1, BOOK);
+        }
+        assertThrows(IllegalStateException.class,
+            () -> proofService.controlAccount(
+                BOOK, "CUSTOMER-DEPOSITS", NGN, unrelated.journalSequence()));
+    }
+
+    @Test
+    void laterNetZeroMappedActivityCannotBeHiddenByRewindingProjectionSequence() throws SQLException {
+        PostingResult first = post(75, "INFLOW", null,
+            line(76, PROVIDER, NGN, 50), line(77, CUSTOMER_A, NGN, -50));
+        PostingResult transfer = post(78, "TRANSFER", null,
+            line(79, CUSTOMER_A, NGN, 20), line(80, CUSTOMER_B, NGN, -20));
+        try (var connection = dataSource.getConnection()) {
+            execute(connection, """
+                UPDATE funds.control_account_projection SET latest_journal_sequence = ?
+                WHERE book_id = ? AND control_account_code = 'CUSTOMER-DEPOSITS' AND currency = 'NGN'
+                """, first.journalSequence(), BOOK);
+        }
+
+        assertThrows(IllegalStateException.class,
+            () -> proofService.controlAccount(BOOK, "CUSTOMER-DEPOSITS", NGN, transfer.journalSequence()));
     }
 
     @Test
@@ -180,6 +222,66 @@ class AccountingProofServiceIT {
                 proofService.trialBalance(BOOK, usd, huge.journalSequence()).totalDebits()),
             () -> assertEquals(BigInteger.ZERO,
                 proofService.trialBalance(otherBook, NGN, huge.journalSequence()).totalDebits()));
+    }
+
+    @Test
+    void controlProofCoordinatesIsolateBookCurrencyAndControlCode() throws SQLException {
+        UUID otherBook = uuid(200);
+        UUID otherChart = uuid(201);
+        UUID otherPeriod = uuid(202);
+        UUID otherEntity = uuid(203);
+        UUID otherDebit = uuid(204);
+        UUID otherCustomer = uuid(205);
+        UUID usdDebit = uuid(206);
+        UUID usdCustomer = uuid(207);
+        CurrencyCode usd = CurrencyCode.of("USD");
+        try (var connection = dataSource.getConnection()) {
+            seedBook(connection, otherBook, otherChart, otherPeriod, otherEntity, "NGN");
+            seedAccount(connection, otherDebit, otherBook, otherChart,
+                "OTHER-BOOK-DEBIT", "NGN", "ASSET-CONTROL");
+            seedAccount(connection, otherCustomer, otherBook, otherChart,
+                "OTHER-BOOK-CUSTOMER", "NGN", "CUSTOMER-DEPOSITS");
+            seedAccount(connection, usdDebit, BOOK, CHART, "USD-DEBIT", "USD", "USD-ASSET");
+            seedAccount(connection, usdCustomer, BOOK, CHART,
+                "USD-CUSTOMER", "USD", "CUSTOMER-DEPOSITS");
+        }
+        post(210, "BASE-NGN", null,
+            line(211, PROVIDER, NGN, 11), line(212, CUSTOMER_A, NGN, -11));
+        postFor(otherBook, otherPeriod, otherEntity, 220, "OTHER-BOOK", null, List.of(
+            line(221, otherDebit, NGN, 22), line(222, otherCustomer, NGN, -22)));
+        postFor(BOOK, PERIOD, LEGAL_ENTITY, 230, "BASE-USD", null, List.of(
+            line(231, usdDebit, usd, 33), line(232, usdCustomer, usd, -33)));
+        PostingResult last = post(240, "OTHER-CONTROL", null,
+            line(241, PROVIDER, NGN, 44), line(242, OTHER, NGN, -44));
+
+        assertAll(
+            () -> assertControl(BOOK, "CUSTOMER-DEPOSITS", NGN, last.journalSequence(), -11),
+            () -> assertControl(otherBook, "CUSTOMER-DEPOSITS", NGN, last.journalSequence(), -22),
+            () -> assertControl(BOOK, "CUSTOMER-DEPOSITS", usd, last.journalSequence(), -33),
+            () -> assertControl(BOOK, "OTHER-CONTROL", NGN, last.journalSequence(), -44));
+    }
+
+    @Test
+    void trialProofHandlesOrderedLongMinimumWithoutNegationOverflow() throws SQLException {
+        UUID minimum = uuid(300);
+        UUID maximum = uuid(301);
+        UUID unit = uuid(302);
+        try (var connection = dataSource.getConnection()) {
+            seedAccount(connection, minimum, BOOK, CHART, "MINIMUM", "NGN", "MINIMUM-CONTROL");
+            seedAccount(connection, maximum, BOOK, CHART, "MAXIMUM", "NGN", "MAXIMUM-CONTROL");
+            seedAccount(connection, unit, BOOK, CHART, "UNIT", "NGN", "UNIT-CONTROL");
+        }
+        PostingResult result = postFor(BOOK, PERIOD, LEGAL_ENTITY, 310, "EXTREME", null, List.of(
+            line(311, minimum, NGN, Long.MIN_VALUE),
+            line(312, maximum, NGN, Long.MAX_VALUE),
+            line(313, unit, NGN, 1)));
+
+        TrialBalanceProof proof = proofService.trialBalance(BOOK, NGN, result.journalSequence());
+        BigInteger magnitude = new BigInteger("9223372036854775808");
+        assertAll(
+            () -> assertEquals(magnitude, proof.totalDebits()),
+            () -> assertEquals(magnitude, proof.totalCredits()),
+            () -> assertTrue(proof.balanced()));
     }
 
     @Test
@@ -225,6 +327,17 @@ class AccountingProofServiceIT {
             () -> assertEquals(BigInteger.valueOf(customerTotal), control.sourceTotal()),
             () -> assertEquals(BigInteger.valueOf(customerTotal), control.projectionTotal()),
             () -> assertEquals(BigInteger.ZERO, control.difference()));
+    }
+
+    private void assertControl(
+        UUID book, String controlCode, CurrencyCode currency, long cutoff, long expected
+    ) {
+        ControlAccountProof proof = proofService.controlAccount(book, controlCode, currency, cutoff);
+        BigInteger total = BigInteger.valueOf(expected);
+        assertAll(
+            () -> assertEquals(total, proof.sourceTotal()),
+            () -> assertEquals(total, proof.projectionTotal()),
+            () -> assertEquals(BigInteger.ZERO, proof.difference()));
     }
 
     private PostingResult post(long seed, String type, UUID reversal, PostingLine... lines) {
