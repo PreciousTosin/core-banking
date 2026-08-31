@@ -15,7 +15,7 @@ Management endpoints belong on the private container network. Authentication and
 
 Runtime replicas connect with a login granted `funds_app`. They never migrate the schema: `quarkus.flyway.migrate-at-start=false`. Before a replica is admitted, an operator-controlled Flyway job must apply all migrations through the `funds_migrator` role as described in [`MIGRATION-ROLES.md`](../src/main/resources/db/MIGRATION-ROLES.md). A reachable but unmigrated or incorrectly privileged database can pass a shallow connection check and then fail application operations; deployment therefore treats successful migration validation as a separate prerequisite.
 
-The three production connection values (`FUNDS_DB_JDBC_URL`, `FUNDS_APP_DB_USER`, and `FUNDS_APP_DB_PASSWORD`) are mounted configuration/secret inputs. Missing inputs make packaged startup fail closed. Tests instead use PostgreSQL 18.6 Dev Services and enable Flyway in the test profile.
+The three production connection values (`FUNDS_DB_JDBC_URL`, `FUNDS_APP_DB_USER`, and `FUNDS_APP_DB_PASSWORD`) are mounted configuration/secret inputs. The production datasource is explicitly active, and a prod-only eager startup guard checks the resolved datasource URL, username and password for missing/blank values without logging their contents. Missing inputs make packaged startup fail closed before healthy readiness. Tests instead use PostgreSQL 18.6 Dev Services and enable Flyway in the test profile.
 
 ## Resource and failure semantics
 

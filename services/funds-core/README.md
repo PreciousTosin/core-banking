@@ -29,6 +29,8 @@ Customer accounts bind immutably to a versioned savings, current, fixed-deposit 
 
 An operator-controlled migration login assumes `funds_migrator`; the service login receives only `funds_app`. The complete ownership, grants and reset procedure is in [`MIGRATION-ROLES.md`](src/main/resources/db/MIGRATION-ROLES.md). Packaged runtime configuration is supplied through `FUNDS_DB_JDBC_URL`, `FUNDS_APP_DB_USER`, and `FUNDS_APP_DB_PASSWORD`. Flyway is disabled at runtime and enabled only by the test profile; the migration job must finish before service admission.
 
+The production datasource is explicitly active. Missing or blank production datasource inputs fail closed before readiness can be UP; the diagnostic names only the missing Quarkus property and never its value. A reachable datasource can make the framework database readiness check pass, but does not prove migrations or privileges, so migration validation remains a separate admission prerequisite.
+
 There are six versioned migrations: `V001`, `V002`, `V003`, `V003.1`, `V003.2`, and `V004`. The plan's earlier “four migrations” wording predates the two reviewed invariant-hardening intermediates. No application cache stores balances or journals.
 
 ## Build and verification
@@ -42,6 +44,7 @@ cd services/funds-core
 docker build -f Dockerfile.jvm -t core-banking/funds-core:accounting-kernel .
 docker run --rm --entrypoint java --memory=640m --cpus=0.60 --pids-limit=256 \
   core-banking/funds-core:accounting-kernel -version
+./scripts/prod-runtime-smoke.sh core-banking/funds-core:accounting-kernel
 ```
 
 The test gate contains unit, deterministic generated-property, PostgreSQL integration, failure-injection and real child-process crash tests; no accounting test is intentionally skipped. Full service startup additionally requires the separately migrated profile database and is deferred to the deployment-profile plan.
@@ -51,6 +54,12 @@ The test gate contains unit, deterministic generated-property, PostgreSQL integr
 The image uses `-Xms128m -Xmx384m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m -Xss512k -XX:+ExitOnOutOfMemoryError` inside the planned 640 MiB container. The remainder is deliberate headroom for JIT code cache, native libraries, TLS/socket buffers and other RSS. Heap dumps are opt-in through an approved encrypted diagnostic workflow. The JDBC pool is bounded to 2–8 connections with a five-second acquisition timeout; request bodies are capped at 128 KiB. No unused cache or executor is introduced. See the [health contract](docs/health-contract.md) for health, pool-saturation and failure semantics.
 
 The target VM has 8 GiB RAM, but that is an evidence-suite budget across versioned normal, concurrency and restore profiles—not permission to run every component at peak simultaneously. Later profile work must measure and cap PostgreSQL connections and per-query memory, use bounded Go queues/goroutines and `GOMEMLIMIT`, stream/paginate file and projection work, bound broker retention/batches, cap workflow history/concurrency and observability queues/label cardinality. Those other-component controls and the exact orchestration limits are planned, not implemented by this module.
+
+## Base-image review and refresh
+
+The Dockerfile pins `eclipse-temurin:25-jre` to registry manifest `sha256:f9e65324a37f28209ce7dd0e5149a7aa954520ed936fb87813cf6ded2400a112`, resolved from Docker Hub by the local Docker registry client on 2026-08-31 for `linux/amd64`. The constrained smoke identifies that reviewed image as Temurin Java 25.0.4. The tag communicates the supported major version; the digest makes rebuilds reproducible. It does not provide automatic security-patch uptake.
+
+To refresh, explicitly pull the Java 25 JRE tag for the target platform, inspect and record its registry digest and Java patch version, review the upstream image/security change, update the Dockerfile plus semantic contract together, rebuild without relying on the old tag cache, then rerun the clean Maven gate, image inspection, constrained Java smoke and all three production-runtime probes. Commit the new digest, review date, platform and evidence as one reviewed change.
 
 ## Acceptance coverage and limits
 
@@ -68,4 +77,20 @@ The target VM has 8 GiB RAM, but that is an evidence-suite budget across version
 | ACC-40 | Immutable product-version binding to customer accounts. | Version foundation only; product-specific lifecycle behavior is excluded. |
 | ACC-42 | Immutable finance-principle classification and approval-reference foundations. | Constraint foundation only; complete template/rate/account guards and allocation behavior are excluded. |
 
-Explicit exclusions are identifier issuance/resolution APIs, real or simulated NIP, account-details projection, accrual/capitalisation/maturity, non-interest allocation, holds, Go contracts, event relay, providers, reconciliation, FX execution, security UI, and full 8 GiB orchestration. The POC does not claim production readiness, high availability, regulatory certification, host-loss durability or production throughput.
+## Explicit exclusions
+
+- Identifier issuance/resolution APIs
+- Real or simulated NIP
+- Account-details projection
+- Accrual/capitalisation/maturity
+- Non-interest allocation
+- Holds
+- Go contracts
+- Event relay
+- Providers
+- Reconciliation
+- FX execution
+- Security UI
+- Full 8 GiB orchestration
+
+The POC does not claim production readiness, high availability, regulatory certification, host-loss durability or production throughput.
