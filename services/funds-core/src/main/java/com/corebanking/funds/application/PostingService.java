@@ -16,6 +16,7 @@ public class PostingService {
     private final LedgerRepository repository;
     private final PostgresRetryPolicy retryPolicy;
     private final PostingTransactionObserver observer;
+    private final JournalValidator validator;
 
     public PostingService(
         DataSource dataSource,
@@ -36,10 +37,12 @@ public class PostingService {
         this.repository = Objects.requireNonNull(repository, "repository");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
         this.observer = Objects.requireNonNull(observer, "observer");
+        this.validator = new JournalValidator();
     }
 
     public PostingResult post(PostingCommand command) {
         Objects.requireNonNull(command, "command");
+        validator.validate(command.journal());
         return retryPolicy.execute(command.commandId(), () -> {
             try (Connection connection = dataSource.getConnection()) {
                 connection.setAutoCommit(false);

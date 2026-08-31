@@ -12,6 +12,12 @@ BEGIN
     WHERE journal.journal_id = NEW.journal_id
     FOR UPDATE OF command;
 
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'posting journal is not visible to finality guard %', NEW.journal_id
+            USING ERRCODE = '55000',
+                  CONSTRAINT = 'posting_requires_in_progress_command';
+    END IF;
+
     IF command_state = 'COMPLETED' THEN
         RAISE EXCEPTION 'cannot append posting to completed journal %', NEW.journal_id
             USING ERRCODE = '55000',

@@ -1,6 +1,8 @@
 package com.corebanking.funds.infrastructure.postgres;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -13,6 +15,12 @@ import java.sql.SQLException;
 import java.sql.Savepoint;
 import java.sql.Statement;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.postgresql.util.PSQLException;
 import org.junit.jupiter.api.Test;
 
 @QuarkusTest
@@ -210,6 +218,102 @@ class LedgerConstraintIT {
     }
 
     @Test
+    void rejectsAppendWhoseCompletedJournalWasUncommittedAtTriggerLookup() throws Exception {
+        truncateAllTables();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<SQLException> append = null;
+        try {
+            try (var referenceConnection = dataSource.getConnection()) {
+                insertReferenceGraph(referenceConnection);
+            }
+            try (var creator = dataSource.getConnection()) {
+                creator.setAutoCommit(false);
+                insertInProgressCommand(creator, COMMAND_ID, REQUEST_HASH);
+                insertJournal(creator, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
+                insertPosting(creator, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
+                insertPosting(creator, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+                execute(creator, """
+                    UPDATE funds.idempotency_command
+                    SET state = 'COMPLETED', journal_id = '%s',
+                        result_json = '{"journalId":"%s"}'::jsonb,
+                        completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
+                    WHERE command_id = '%s'
+                    """.formatted(JOURNAL_ID, JOURNAL_ID, COMMAND_ID));
+
+                var appenderBackendPid = new AtomicInteger();
+                append = executor.submit(() -> appendBalancedPostings(appenderBackendPid));
+                awaitAppendAtConstraintBoundary(appenderBackendPid, append);
+                creator.commit();
+
+                SQLException failure = append.get(5, TimeUnit.SECONDS);
+                assertNotNull(failure, "append must be rejected rather than pass after the FK wait");
+                assertEquals("55000", failure.getSQLState());
+                assertEquals(
+                    "posting_requires_in_progress_command",
+                    ((PSQLException) failure).getServerErrorMessage().getConstraint());
+            }
+
+            try (var connection = dataSource.getConnection()) {
+                assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.journal"));
+                assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting"));
+                assertEquals(0, queryLong(connection, """
+                    SELECT sum(signed_minor_units) FROM funds.posting WHERE journal_id = '%s'
+                    """.formatted(JOURNAL_ID)));
+            }
+        } finally {
+            if (append != null) {
+                append.cancel(true);
+            }
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            truncateAllTables();
+        }
+    }
+
+    @Test
+    void visibleInProgressAssemblySerializesBeforeCompletion() throws Exception {
+        truncateAllTables();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<SQLException> completion = null;
+        try {
+            try (var setup = dataSource.getConnection()) {
+                setup.setAutoCommit(false);
+                insertReferenceGraph(setup);
+                insertInProgressCommand(setup, COMMAND_ID, REQUEST_HASH);
+                insertJournal(setup, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
+                setup.commit();
+            }
+            try (var assembly = dataSource.getConnection()) {
+                assembly.setAutoCommit(false);
+                insertPosting(assembly, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
+                insertPosting(assembly, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+
+                var completionBackendPid = new AtomicInteger();
+                completion = executor.submit(() -> completeJournal(completionBackendPid));
+                awaitBackendLock(completionBackendPid, completion);
+                assertTrue(!completion.isDone(), "completion must wait for in-progress assembly");
+                assembly.commit();
+
+                assertNull(completion.get(5, TimeUnit.SECONDS));
+            }
+
+            try (var connection = dataSource.getConnection()) {
+                assertEquals("COMPLETED", queryString(connection, """
+                    SELECT state FROM funds.idempotency_command WHERE command_id = '%s'
+                    """.formatted(COMMAND_ID)));
+                assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting"));
+            }
+        } finally {
+            if (completion != null) {
+                completion.cancel(true);
+            }
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            truncateAllTables();
+        }
+    }
+
+    @Test
     void rejectsDuplicateCommandIdWithDifferentRequestHash() throws Exception {
         inRollbackTransaction(connection -> {
             insertInProgressCommand(connection, COMMAND_ID, REQUEST_HASH);
@@ -389,6 +493,100 @@ class LedgerConstraintIT {
         } finally {
             truncateAllTables();
         }
+    }
+
+    private SQLException appendBalancedPostings(AtomicInteger backendPid) {
+        try (var connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            backendPid.set(Math.toIntExact(queryLong(connection, "SELECT pg_backend_pid()")));
+            try {
+                execute(connection, """
+                    INSERT INTO funds.posting
+                        (posting_id, journal_id, account_id, currency, signed_minor_units,
+                         account_sequence, dimensions)
+                    VALUES
+                        ('%s', '%s', '%s', 'NGN', 1, 2, '{}'::jsonb),
+                        ('%s', '%s', '%s', 'NGN', -1, 2, '{}'::jsonb)
+                    """.formatted(
+                        uuid(399), JOURNAL_ID, CUSTOMER_ACCOUNT_A,
+                        uuid(400), JOURNAL_ID, CUSTOMER_ACCOUNT_B));
+                connection.commit();
+                return null;
+            } catch (SQLException failure) {
+                connection.rollback();
+                return failure;
+            }
+        } catch (SQLException failure) {
+            return failure;
+        }
+    }
+
+    private SQLException completeJournal(AtomicInteger backendPid) {
+        try (var connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            backendPid.set(Math.toIntExact(queryLong(connection, "SELECT pg_backend_pid()")));
+            try {
+                execute(connection, """
+                    UPDATE funds.idempotency_command
+                    SET state = 'COMPLETED', journal_id = '%s',
+                        result_json = '{"journalId":"%s"}'::jsonb,
+                        completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
+                    WHERE command_id = '%s'
+                    """.formatted(JOURNAL_ID, JOURNAL_ID, COMMAND_ID));
+                connection.commit();
+                return null;
+            } catch (SQLException failure) {
+                connection.rollback();
+                return failure;
+            }
+        } catch (SQLException failure) {
+            return failure;
+        }
+    }
+
+    private void awaitAppendAtConstraintBoundary(AtomicInteger backendPid, Future<?> append)
+        throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (append.isDone()) {
+                return;
+            }
+            int pid = backendPid.get();
+            if (pid != 0) {
+                try (var connection = dataSource.getConnection()) {
+                    if (queryLong(connection, """
+                        SELECT count(*) FROM pg_stat_activity
+                        WHERE pid = %d AND wait_event_type = 'Lock'
+                        """.formatted(pid)) == 1) {
+                        return;
+                    }
+                }
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("append neither rejected nor blocked at its foreign-key boundary");
+    }
+
+    private void awaitBackendLock(AtomicInteger backendPid, Future<?> operation) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (operation.isDone()) {
+                throw new AssertionError("operation completed without command-row serialization");
+            }
+            int pid = backendPid.get();
+            if (pid != 0) {
+                try (var connection = dataSource.getConnection()) {
+                    if (queryLong(connection, """
+                        SELECT count(*) FROM pg_stat_activity
+                        WHERE pid = %d AND wait_event_type = 'Lock'
+                        """.formatted(pid)) == 1) {
+                        return;
+                    }
+                }
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("operation did not block on command-row serialization");
     }
 
     private static void insertReferenceGraph(Connection connection) throws SQLException {
