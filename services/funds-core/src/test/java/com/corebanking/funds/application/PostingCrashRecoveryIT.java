@@ -1,7 +1,6 @@
 package com.corebanking.funds.application;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertAll;
@@ -19,10 +18,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintWriter;
+import java.lang.reflect.Proxy;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLTimeoutException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -42,11 +45,15 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.ds.PGSimpleDataSource;
 
 @QuarkusTest
 class PostingCrashRecoveryIT {
@@ -59,14 +66,14 @@ class PostingCrashRecoveryIT {
 
     private CrashProbe rows;
     private DatabaseCredentials credentials;
-    private DataSource boundedDataSource;
+    private PGSimpleDataSource boundedDataSource;
 
     @BeforeEach
     void setUp() throws SQLException {
         TestPostingStack.resetAndSeed(dataSource);
-        boundedDataSource = new TimeoutDataSource(dataSource);
-        rows = new CrashProbe(boundedDataSource);
         credentials = databaseCredentials(dataSource);
+        boundedDataSource = timeoutDataSource(credentials);
+        rows = new CrashProbe(boundedDataSource);
     }
 
     @AfterEach
@@ -77,33 +84,47 @@ class PostingCrashRecoveryIT {
     @Test
     void unchangedMvccSnapshotDoesNotClaimRollbackWhileAccountLocksRemainHeld() throws Exception {
         CrashSnapshot before = rows.snapshot(BEFORE_COMMIT_COMMAND_ID);
-        try (var blocker = runSqlBounded(
-            "lock-holder connection acquisition",
-            boundedDataSource::getConnection)) {
-            blocker.setAutoCommit(false);
-            try (var statement = blocker.prepareStatement("""
-                SELECT account_id
-                FROM funds.ledger_account
-                WHERE account_id IN (?, ?)
-                ORDER BY account_id
-                FOR UPDATE
-                """)) {
-                statement.setQueryTimeout(1);
-                statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
-                statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
-                try (var result = statement.executeQuery()) {
-                    assertTrue(result.next());
-                    assertTrue(result.next());
+        runJdbcBounded(
+            PROCESS_TIMEOUT,
+            "lock-holder proof",
+            boundedDataSource,
+            resources -> resources.withConnection(blocker -> {
+                blocker.setAutoCommit(false);
+                try (var tracked = resources.prepare(blocker, """
+                    SELECT account_id
+                    FROM funds.ledger_account
+                    WHERE account_id IN (?, ?)
+                    ORDER BY account_id
+                    FOR UPDATE
+                    """)) {
+                    var statement = tracked.statement();
+                    statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
+                    statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
+                    try (var result = statement.executeQuery()) {
+                        assertTrue(result.next());
+                        assertTrue(result.next());
+                    }
                 }
-            }
 
-            assertEquals(before, rows.snapshot(BEFORE_COMMIT_COMMAND_ID));
-            SQLException lockStillHeld = assertThrows(SQLException.class, rows::probeRollbackReleaseOnce);
-            assertEquals("55P03", lockStillHeld.getSQLState());
+                assertEquals(before, rows.snapshot(BEFORE_COMMIT_COMMAND_ID));
+                SQLException lockStillHeld = assertThrows(SQLException.class, rows::probeRollbackReleaseOnce);
+                assertEquals("55P03", lockStillHeld.getSQLState());
 
-            blocker.rollback();
-            rows.awaitRollbackComplete();
-        }
+                blocker.rollback();
+                rows.awaitRollbackComplete();
+                return null;
+            }));
+    }
+
+    @Test
+    void boundedCrashProbesDoNotContaminateQuarkusPoolSessionTimeouts() throws Exception {
+        SessionTimeouts before = pooledSessionTimeouts();
+
+        rows.snapshot(BEFORE_COMMIT_COMMAND_ID);
+
+        assertAll(
+            () -> assertEquals(new SessionTimeouts("0", "0"), before),
+            () -> assertEquals(before, pooledSessionTimeouts()));
     }
 
     @Test
@@ -133,21 +154,100 @@ class PostingCrashRecoveryIT {
     }
 
     @Test
-    void workerCleanupSharesOneDeadlineAcrossProcessAndOutputReader() throws Exception {
+    void callerInterruptionCompletesBoundedCleanupBeforeRestoringInterrupt() throws Exception {
+        var operationStarted = new CountDownLatch(1);
+        var operationInterrupted = new CountDownLatch(1);
+        var allowOperationCleanup = new CountDownLatch(1);
+        var operationCleaned = new AtomicBoolean();
+        var callerFinished = new CountDownLatch(1);
+        var callerInterruptRestored = new AtomicBoolean();
+
+        Thread caller = Thread.ofVirtual().start(() -> {
+            try {
+                assertThrows(AssertionError.class, () -> runBounded(
+                    Duration.ofSeconds(2),
+                    "interrupted bounded-call proof",
+                    () -> {
+                        operationStarted.countDown();
+                        try {
+                            new CountDownLatch(1).await();
+                        } catch (InterruptedException expected) {
+                            operationInterrupted.countDown();
+                            boolean cleanupAllowed = false;
+                            while (!cleanupAllowed) {
+                                try {
+                                    allowOperationCleanup.await();
+                                    cleanupAllowed = true;
+                                } catch (InterruptedException repeatedCancellation) {
+                                    // Future.cancel and shutdownNow may both signal cancellation.
+                                }
+                            }
+                            operationCleaned.set(true);
+                            throw expected;
+                        }
+                        return null;
+                    }));
+                callerInterruptRestored.set(Thread.currentThread().isInterrupted());
+            } finally {
+                callerFinished.countDown();
+            }
+        });
+
+        try {
+            assertTrue(operationStarted.await(1, SECONDS));
+            caller.interrupt();
+            assertTrue(operationInterrupted.await(1, SECONDS));
+            assertEquals(1, callerFinished.getCount(), "caller returned before bounded cleanup finished");
+        } finally {
+            allowOperationCleanup.countDown();
+            assertTrue(caller.join(Duration.ofSeconds(1)));
+        }
+
+        assertAll(
+            () -> assertTrue(operationCleaned.get()),
+            () -> assertTrue(callerInterruptRestored.get()));
+    }
+
+    @Test
+    void lateJdbcConnectionIsClosedWhenTimeoutWinsAcquisitionRace() {
+        var lateDataSource = new InterruptReturningDataSource();
+
+        AssertionError failure = assertThrows(AssertionError.class, () -> runJdbcBounded(
+            Duration.ofSeconds(1),
+            "late JDBC acquisition proof",
+            lateDataSource,
+            resources -> resources.withConnection(connection -> null)));
+
+        assertAll(
+            () -> assertTrue(failure.getMessage().contains("late JDBC acquisition proof")),
+            () -> assertEquals(0, lateDataSource.acquisitionStarted.getCount()),
+            () -> assertEquals(0, lateDataSource.acquisitionFinished.getCount()),
+            () -> assertTrue(lateDataSource.aborted.get()),
+            () -> assertTrue(lateDataSource.closed.get()));
+    }
+
+    @Test
+    void workerCleanupSharesOneDeterministicDeadlineAndBoundsStreamClose() throws Exception {
+        var clock = new MutableNanoClock();
         var input = new StubbornInputStream();
-        var process = new SlowTerminationProcess(input, Duration.ofMillis(120));
+        var process = new SlowTerminationProcess(input);
+        var waits = new RecordingTimedWaits(clock, input);
         var worker = new WorkerHandle(
             process,
             CrashPostingWorker.CrashPoint.BEFORE_COMMIT,
-            Duration.ofMillis(160));
-        long startedAt = System.nanoTime();
+            Duration.ofNanos(100),
+            clock::nanoTime,
+            waits);
         try {
             AssertionError failure = assertThrows(AssertionError.class, worker::close);
-            long elapsedMillis = Duration.ofNanos(System.nanoTime() - startedAt).toMillis();
             assertAll(
                 () -> assertTrue(process.destroyed.get()),
                 () -> assertTrue(failure.getMessage().contains("survived forced destruction")),
-                () -> assertTrue(elapsedMillis < 240, () -> "cleanup used fresh deadlines: " + elapsedMillis + "ms"));
+                () -> assertTrue(throwableTreeContains(failure, "output close did not finish")),
+                () -> assertTrue(throwableTreeContains(failure, "output reader survived")),
+                () -> assertEquals(0, input.closeStarted.getCount()),
+                () -> assertEquals(0, input.closeInterrupted.getCount()),
+                () -> assertEquals(List.of(100L, 40L, 20L, 20L), waits.observedBudgets));
         } finally {
             input.release();
             if (!worker.outputReader.join(Duration.ofSeconds(1))) {
@@ -200,10 +300,31 @@ class PostingCrashRecoveryIT {
     }
 
     private PostingResult postBounded(PostingCommand command, String description) throws Exception {
-        return runBounded(PROCESS_TIMEOUT, description, () -> TestPostingStack
-            .create(boundedDataSource, PostingTransactionObserver.noop())
-            .postingService()
-            .post(command));
+        return runJdbcBounded(
+            PROCESS_TIMEOUT,
+            description,
+            boundedDataSource,
+            resources -> TestPostingStack
+                .create(resources.trackingDataSource(), PostingTransactionObserver.noop())
+                .postingService()
+                .post(command));
+    }
+
+    private SessionTimeouts pooledSessionTimeouts() throws SQLException {
+        return runJdbcBounded(
+            PROCESS_TIMEOUT,
+            "pooled session-timeout inspection",
+            dataSource,
+            resources -> resources.withConnection(connection -> {
+                try (var tracked = resources.prepare(connection, """
+                    SELECT current_setting('statement_timeout'), current_setting('lock_timeout')
+                    """)) {
+                    try (var result = tracked.statement().executeQuery()) {
+                        assertTrue(result.next());
+                        return new SessionTimeouts(result.getString(1), result.getString(2));
+                    }
+                }
+            }));
     }
 
     private WorkerHandle startWorker(CrashPostingWorker.CrashPoint point, UUID commandId) throws IOException {
@@ -235,6 +356,20 @@ class PostingCrashRecoveryIT {
             .findFirst()
             .orElseThrow(() -> new IllegalStateException("datasource password is unavailable"));
         return new DatabaseCredentials(factory.jdbcUrl(), username, password);
+    }
+
+    private static PGSimpleDataSource timeoutDataSource(DatabaseCredentials credentials) {
+        var isolated = new PGSimpleDataSource();
+        isolated.setURL(credentials.jdbcUrl());
+        isolated.setUser(credentials.username());
+        isolated.setPassword(credentials.password());
+        isolated.setConnectTimeout(1);
+        isolated.setLoginTimeout(1);
+        isolated.setSocketTimeout(1);
+        isolated.setCancelSignalTimeout(1);
+        isolated.setQueryTimeout(1);
+        isolated.setOptions("-c statement_timeout=1000 -c lock_timeout=200");
+        return isolated;
     }
 
     private static void assertHaltedAt(WorkerExit exit, CrashPostingWorker.CrashPoint point) {
@@ -364,6 +499,21 @@ class PostingCrashRecoveryIT {
             - before.balances().get(accountId).signedPostingTotal();
     }
 
+    private static boolean throwableTreeContains(Throwable failure, String expectedText) {
+        if (failure.getMessage() != null && failure.getMessage().contains(expectedText)) {
+            return true;
+        }
+        if (failure.getCause() != null && throwableTreeContains(failure.getCause(), expectedText)) {
+            return true;
+        }
+        for (Throwable suppressed : failure.getSuppressed()) {
+            if (throwableTreeContains(suppressed, expectedText)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static long controlDelta(
         CrashSnapshot before,
         CrashSnapshot after,
@@ -379,12 +529,23 @@ class PostingCrashRecoveryIT {
         String description,
         Callable<T> operation
     ) throws Exception {
-        Deadline deadline = Deadline.after(timeout);
-        long cleanupReserve = Math.min(SECONDS.toNanos(1), Math.max(1, timeout.toNanos() / 4));
+        return runBounded(timeout, description, operation, () -> null, () -> null);
+    }
+
+    private static <T> T runBounded(
+        Duration timeout,
+        String description,
+        Callable<T> operation,
+        Supplier<AssertionError> cancellation,
+        Supplier<AssertionError> releaseVerification
+    ) throws Exception {
+        Deadline deadline = Deadline.after(timeout, System::nanoTime);
+        long cleanupReserve = Math.min(SECONDS.toNanos(3), Math.max(1, timeout.toNanos() / 4));
         ExecutorService executor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("bounded-" + description.replace(' ', '-')).factory());
         Future<T> future = executor.submit(operation);
         Throwable primaryFailure = null;
+        boolean restoreInterrupt = false;
         try {
             long operationBudget = Math.max(1, deadline.remainingNanos() - cleanupReserve);
             try {
@@ -392,7 +553,7 @@ class PostingCrashRecoveryIT {
             } catch (TimeoutException timeoutFailure) {
                 throw new AssertionError(description + " exceeded its overall bound", timeoutFailure);
             } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+                restoreInterrupt = true;
                 throw new AssertionError(description + " wait was interrupted", interrupted);
             } catch (ExecutionException executionFailure) {
                 Throwable cause = executionFailure.getCause();
@@ -408,18 +569,40 @@ class PostingCrashRecoveryIT {
             primaryFailure = failure;
             throw failure;
         } finally {
-            shutdownBounded(executor, future, description, deadline, primaryFailure);
+            restoreInterrupt |= shutdownBounded(
+                executor,
+                future,
+                description,
+                deadline,
+                primaryFailure,
+                cancellation,
+                releaseVerification);
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
-    private static void shutdownBounded(
+    private static boolean shutdownBounded(
         ExecutorService executor,
         Future<?> future,
         String description,
         Deadline deadline,
-        Throwable primaryFailure
+        Throwable primaryFailure,
+        Supplier<AssertionError> cancellation,
+        Supplier<AssertionError> releaseVerification
     ) {
         AssertionError cleanupFailure = null;
+        boolean restoreInterrupt = Thread.interrupted();
+        if (!future.isDone()) {
+            try {
+                cleanupFailure = append(cleanupFailure, cancellation.get());
+            } catch (RuntimeException | Error failure) {
+                cleanupFailure = append(
+                    cleanupFailure,
+                    new AssertionError(description + " resource cancellation failed", failure));
+            }
+        }
         try {
             if (!future.isDone()) {
                 future.cancel(true);
@@ -436,19 +619,31 @@ class PostingCrashRecoveryIT {
                 cleanupFailure,
                 new AssertionError(description + " executor shutdown failed", failure));
         }
-        try {
+        while (!executor.isTerminated()) {
             long remaining = deadline.remainingNanos();
-            if (!executor.isTerminated()
-                && (remaining == 0 || !executor.awaitTermination(remaining, NANOSECONDS))) {
+            if (remaining == 0) {
                 cleanupFailure = append(
                     cleanupFailure,
                     new AssertionError(description + " executor did not terminate within the overall bound"));
+                break;
             }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
+            try {
+                if (!executor.awaitTermination(remaining, NANOSECONDS)) {
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError(description + " executor did not terminate within the overall bound"));
+                    break;
+                }
+            } catch (InterruptedException interrupted) {
+                restoreInterrupt = true;
+            }
+        }
+        try {
+            cleanupFailure = append(cleanupFailure, releaseVerification.get());
+        } catch (RuntimeException | Error failure) {
             cleanupFailure = append(
                 cleanupFailure,
-                new AssertionError(description + " executor cleanup was interrupted", interrupted));
+                new AssertionError(description + " resource-release verification failed", failure));
         }
         if (cleanupFailure != null) {
             if (primaryFailure == null) {
@@ -458,11 +653,23 @@ class PostingCrashRecoveryIT {
                 primaryFailure.addSuppressed(cleanupFailure);
             }
         }
+        return restoreInterrupt;
     }
 
-    private static <T> T runSqlBounded(String description, Callable<T> operation) throws SQLException {
+    private static <T> T runJdbcBounded(
+        Duration timeout,
+        String description,
+        DataSource dataSource,
+        JdbcWork<T> operation
+    ) throws SQLException {
+        var resources = new JdbcResources(dataSource, description);
         try {
-            return runBounded(PROCESS_TIMEOUT, description, operation);
+            return runBounded(
+                timeout,
+                description,
+                () -> resources.execute(operation),
+                resources::cancelActive,
+                resources::releaseFailure);
         } catch (SQLException failure) {
             throw failure;
         } catch (RuntimeException | Error failure) {
@@ -472,31 +679,19 @@ class PostingCrashRecoveryIT {
         }
     }
 
-    private static Connection configureTimeouts(Connection connection) throws SQLException {
-        boolean configured = false;
-        try {
-            connection.setNetworkTimeout(Runnable::run, 1_000);
-            try (var statement = connection.createStatement()) {
-                statement.setQueryTimeout(1);
-                statement.execute("SET statement_timeout = '1000ms'");
-                statement.execute("SET lock_timeout = '200ms'");
-            }
-            configured = true;
-            return connection;
-        } finally {
-            if (!configured) {
-                connection.close();
-            }
-        }
+    @FunctionalInterface
+    private interface JdbcWork<T> {
+        T execute(JdbcResources resources) throws Exception;
     }
 
-    private static java.sql.PreparedStatement prepare(Connection connection, String sql) throws SQLException {
-        var statement = connection.prepareStatement(sql);
-        statement.setQueryTimeout(1);
-        return statement;
+    @FunctionalInterface
+    private interface SqlFunction<I, O> {
+        O apply(I input) throws Exception;
     }
 
     private record DatabaseCredentials(String jdbcUrl, String username, String password) {}
+
+    private record SessionTimeouts(String statementTimeout, String lockTimeout) {}
 
     private record WorkerExit(int exitCode, String output) {}
 
@@ -563,446 +758,242 @@ class PostingCrashRecoveryIT {
         int publishAttempts
     ) {}
 
-    private static final class CrashProbe {
+    private static final class JdbcResources {
         private final DataSource dataSource;
+        private final String description;
+        private final AtomicBoolean cancelled = new AtomicBoolean();
+        private final AtomicReference<Connection> activeConnection = new AtomicReference<>();
+        private final AtomicReference<Statement> activeStatement = new AtomicReference<>();
+        private final AtomicReference<AssertionError> lifecycleFailure = new AtomicReference<>();
 
-        private CrashProbe(DataSource dataSource) {
+        private JdbcResources(DataSource dataSource, String description) {
             this.dataSource = dataSource;
+            this.description = description;
         }
 
-        private UUID awaitCommittedJournal(UUID commandId) throws SQLException {
-            return runSqlBounded("committed-journal visibility", () -> {
-                Deadline deadline = Deadline.after(Duration.ofSeconds(8));
-                do {
-                    Optional<UUID> journalId = journalId(commandId);
-                    if (journalId.isPresent()) {
-                        return journalId.get();
-                    }
-                    Thread.onSpinWait();
-                } while (deadline.hasRemaining());
-                throw new AssertionError("committed journal was not visible within the overall bound");
-            });
+        private <T> T execute(JdbcWork<T> operation) throws Exception {
+            Throwable primaryFailure = null;
+            try {
+                return operation.execute(this);
+            } catch (Exception | Error failure) {
+                primaryFailure = failure;
+                throw failure;
+            } finally {
+                closeRemaining(primaryFailure);
+            }
         }
 
-        private Optional<UUID> journalId(UUID commandId) throws SQLException {
-            try (var connection = dataSource.getConnection();
-                 var statement = prepare(connection, """
-                     SELECT journal_id FROM funds.journal WHERE command_id = ?
-                     """)) {
-                statement.setObject(1, commandId);
-                try (var result = statement.executeQuery()) {
-                    return result.next()
-                        ? Optional.of(result.getObject("journal_id", UUID.class))
-                        : Optional.empty();
+        private DataSource trackingDataSource() {
+            return new TrackingDataSource(dataSource, this);
+        }
+
+        private <T> T withConnection(SqlFunction<Connection, T> operation) throws Exception {
+            Connection connection = acquireConnection();
+            try {
+                return operation.apply(connection);
+            } finally {
+                closeConnection(connection);
+            }
+        }
+
+        private Connection acquireConnection() throws SQLException {
+            Connection connection = dataSource.getConnection();
+            if (cancelled.get()) {
+                abortAndClose(connection);
+                throw new SQLTimeoutException(description + " acquired a connection after cancellation");
+            }
+            if (!activeConnection.compareAndSet(null, connection)) {
+                abortAndClose(connection);
+                throw new IllegalStateException(description + " opened concurrent JDBC connections");
+            }
+            if (cancelled.get()) {
+                cancelConnection(connection);
+                throw new SQLTimeoutException(description + " acquisition lost the cancellation race");
+            }
+            return connection;
+        }
+
+        private TrackedStatement prepare(Connection connection, String sql) throws SQLException {
+            PreparedStatement statement = connection.prepareStatement(sql);
+            statement.setQueryTimeout(1);
+            if (cancelled.get()) {
+                closeStatement(statement);
+                throw new SQLTimeoutException(description + " prepared a statement after cancellation");
+            }
+            if (!activeStatement.compareAndSet(null, statement)) {
+                closeStatement(statement);
+                throw new IllegalStateException(description + " opened concurrent JDBC statements");
+            }
+            if (cancelled.get()) {
+                cancelStatement(statement);
+                throw new SQLTimeoutException(description + " statement preparation lost the cancellation race");
+            }
+            return new TrackedStatement(this, statement);
+        }
+
+        private AssertionError cancelActive() {
+            cancelled.set(true);
+            Statement statement = activeStatement.get();
+            if (statement != null) {
+                cancelStatement(statement);
+            }
+            Connection connection = activeConnection.get();
+            if (connection != null) {
+                cancelConnection(connection);
+            }
+            return null;
+        }
+
+        private void cancelStatement(Statement statement) {
+            try {
+                statement.cancel();
+            } catch (SQLException | RuntimeException failure) {
+                recordFailure(new AssertionError(description + " active statement cancellation failed", failure));
+            }
+        }
+
+        private void cancelConnection(Connection connection) {
+            try {
+                connection.abort(Runnable::run);
+            } catch (SQLException | RuntimeException failure) {
+                recordFailure(new AssertionError(description + " active connection abort failed", failure));
+            } finally {
+                closeConnection(connection);
+            }
+        }
+
+        private void abortAndClose(Connection connection) {
+            try {
+                connection.abort(Runnable::run);
+            } catch (SQLException | RuntimeException failure) {
+                recordFailure(new AssertionError(description + " late connection abort failed", failure));
+            } finally {
+                try {
+                    connection.close();
+                } catch (SQLException | RuntimeException failure) {
+                    recordFailure(new AssertionError(description + " late connection close failed", failure));
                 }
             }
         }
 
-        private CrashSnapshot snapshot(UUID commandId) throws SQLException {
-            return runSqlBounded("scoped ledger snapshot", () -> snapshotWithinBound(commandId));
-        }
-
-        private CrashSnapshot snapshotWithinBound(UUID commandId) throws SQLException {
-            try (var connection = dataSource.getConnection()) {
-                return new CrashSnapshot(
-                    idempotency(connection, commandId),
-                    journals(connection, commandId),
-                    postings(connection, commandId),
-                    balances(connection),
-                    controls(connection),
-                    outbox(connection, commandId));
-            }
-        }
-
-        private void awaitRollbackComplete() throws SQLException {
-            runSqlBounded("pre-commit rollback synchronization", () -> {
-                Deadline deadline = Deadline.after(Duration.ofSeconds(8));
-                SQLException lastLockFailure = null;
-                do {
-                    try {
-                        probeRollbackReleaseOnceWithinBound();
-                        return null;
-                    } catch (SQLException failure) {
-                        if (!"55P03".equals(failure.getSQLState())) {
-                            throw failure;
-                        }
-                        lastLockFailure = failure;
-                        Thread.onSpinWait();
-                    }
-                } while (deadline.hasRemaining());
-                throw new AssertionError(
-                    "fixture account locks were not released within the overall bound",
-                    lastLockFailure);
-            });
-        }
-
-        private void probeRollbackReleaseOnce() throws SQLException {
-            runSqlBounded("single rollback-release probe", () -> {
-                probeRollbackReleaseOnceWithinBound();
-                return null;
-            });
-        }
-
-        private void probeRollbackReleaseOnceWithinBound() throws SQLException {
-            try (var connection = dataSource.getConnection()) {
-                connection.setAutoCommit(false);
-                Throwable primaryFailure = null;
-                try (var statement = prepare(connection, """
-                    SELECT account_id
-                    FROM funds.ledger_account
-                    WHERE account_id IN (?, ?)
-                    ORDER BY account_id
-                    FOR UPDATE
-                    """)) {
-                    statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
-                    statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
-                    try (var result = statement.executeQuery()) {
-                        if (!result.next() || !result.next() || result.next()) {
-                            throw new AssertionError("rollback-release probe did not lock exactly two fixture accounts");
-                        }
-                    }
-                } catch (SQLException | RuntimeException | Error failure) {
-                    primaryFailure = failure;
-                    throw failure;
-                } finally {
-                    try {
-                        connection.rollback();
-                    } catch (SQLException rollbackFailure) {
-                        if (primaryFailure == null) {
-                            throw rollbackFailure;
-                        }
-                        primaryFailure.addSuppressed(rollbackFailure);
-                    }
+        private void closeStatement(Statement statement) {
+            try {
+                statement.close();
+            } catch (SQLException | RuntimeException failure) {
+                recordFailure(new AssertionError(description + " statement close failed", failure));
+            } finally {
+                if (isClosed(statement)) {
+                    activeStatement.compareAndSet(statement, null);
                 }
             }
         }
 
-        private static List<IdempotencyState> idempotency(Connection connection, UUID commandId)
-            throws SQLException {
-            var states = new ArrayList<IdempotencyState>();
-            try (var statement = prepare(connection, """
-                SELECT command_id, request_hash, state, journal_id, result_json::text,
-                       created_at, completed_at
-                FROM funds.idempotency_command
-                WHERE command_id = ?
-                ORDER BY command_id
-                """)) {
-                statement.setObject(1, commandId);
-                try (var result = statement.executeQuery()) {
-                    while (result.next()) {
-                        states.add(new IdempotencyState(
-                            result.getObject("command_id", UUID.class),
-                            result.getString("request_hash"),
-                            result.getString("state"),
-                            result.getObject("journal_id", UUID.class),
-                            result.getString("result_json"),
-                            result.getObject("created_at", OffsetDateTime.class),
-                            result.getObject("completed_at", OffsetDateTime.class)));
-                    }
+        private void closeConnection(Connection connection) {
+            try {
+                connection.close();
+            } catch (SQLException | RuntimeException failure) {
+                recordFailure(new AssertionError(description + " connection close failed", failure));
+            } finally {
+                if (isClosed(connection)) {
+                    activeConnection.compareAndSet(connection, null);
                 }
             }
-            return List.copyOf(states);
         }
 
-        private static List<JournalState> journals(Connection connection, UUID commandId) throws SQLException {
-            var states = new ArrayList<JournalState>();
-            try (var statement = prepare(connection, """
-                SELECT journal_id, journal_sequence, command_id, correlation_id,
-                       business_transaction_id, legal_entity_id, book_id, period_id,
-                       transaction_type, narration, booking_time, value_date,
-                       reversal_of_journal_id, policy_version, canonical_hash
-                FROM funds.journal
-                WHERE command_id = ?
-                ORDER BY journal_sequence
-                """)) {
-                statement.setObject(1, commandId);
-                try (var result = statement.executeQuery()) {
-                    while (result.next()) {
-                        states.add(new JournalState(
-                            result.getObject("journal_id", UUID.class),
-                            result.getLong("journal_sequence"),
-                            result.getObject("command_id", UUID.class),
-                            result.getObject("correlation_id", UUID.class),
-                            result.getObject("business_transaction_id", UUID.class),
-                            result.getObject("legal_entity_id", UUID.class),
-                            result.getObject("book_id", UUID.class),
-                            result.getObject("period_id", UUID.class),
-                            result.getString("transaction_type"),
-                            result.getString("narration"),
-                            result.getObject("booking_time", OffsetDateTime.class),
-                            result.getObject("value_date", LocalDate.class),
-                            result.getObject("reversal_of_journal_id", UUID.class),
-                            result.getInt("policy_version"),
-                            result.getString("canonical_hash")));
+        private void closeRemaining(Throwable primaryFailure) {
+            Statement statement = activeStatement.get();
+            if (statement != null) {
+                closeStatement(statement);
+            }
+            Connection connection = activeConnection.get();
+            if (connection != null) {
+                closeConnection(connection);
+            }
+            if (!cancelled.get()) {
+                AssertionError closeFailure = lifecycleFailure.getAndSet(null);
+                if (closeFailure != null) {
+                    if (primaryFailure == null) {
+                        throw closeFailure;
                     }
+                    primaryFailure.addSuppressed(closeFailure);
                 }
             }
-            return List.copyOf(states);
         }
 
-        private static List<PostingState> postings(Connection connection, UUID commandId) throws SQLException {
-            var states = new ArrayList<PostingState>();
-            try (var statement = prepare(connection, """
-                SELECT posting.posting_id, posting.journal_id, posting.account_id,
-                       posting.currency, posting.signed_minor_units,
-                       posting.account_sequence, posting.dimensions::text
-                FROM funds.posting posting
-                JOIN funds.journal journal ON journal.journal_id = posting.journal_id
-                WHERE journal.command_id = ?
-                  AND posting.account_id IN (?, ?)
-                ORDER BY posting.posting_id
-                """)) {
-                statement.setObject(1, commandId);
-                statement.setObject(2, TestPostingStack.PROVIDER_ASSET);
-                statement.setObject(3, TestPostingStack.CUSTOMER_LIABILITY);
-                try (var result = statement.executeQuery()) {
-                    while (result.next()) {
-                        states.add(new PostingState(
-                            result.getObject("posting_id", UUID.class),
-                            result.getObject("journal_id", UUID.class),
-                            result.getObject("account_id", UUID.class),
-                            result.getString("currency"),
-                            result.getLong("signed_minor_units"),
-                            result.getLong("account_sequence"),
-                            result.getString("dimensions")));
-                    }
+        private AssertionError releaseFailure() {
+            AssertionError failure = lifecycleFailure.getAndSet(null);
+            Statement statement = activeStatement.get();
+            if (statement != null) {
+                if (isClosed(statement)) {
+                    activeStatement.compareAndSet(statement, null);
+                } else {
+                    failure = append(
+                        failure,
+                        new AssertionError(description + " completed with a live JDBC statement"));
                 }
             }
-            return List.copyOf(states);
+            Connection connection = activeConnection.get();
+            if (connection != null) {
+                if (isClosed(connection)) {
+                    activeConnection.compareAndSet(connection, null);
+                } else {
+                    failure = append(
+                        failure,
+                        new AssertionError(description + " completed with a live JDBC connection"));
+                }
+            }
+            return failure;
         }
 
-        private static Map<UUID, BalanceState> balances(Connection connection) throws SQLException {
-            var states = new LinkedHashMap<UUID, BalanceState>();
-            try (var statement = prepare(connection, """
-                SELECT account_id, signed_posting_total, latest_account_sequence, version
-                FROM funds.materialised_balance
-                WHERE account_id IN (?, ?)
-                ORDER BY account_id
-                """)) {
-                statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
-                statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
-                try (var result = statement.executeQuery()) {
-                    while (result.next()) {
-                        states.put(
-                            result.getObject("account_id", UUID.class),
-                            new BalanceState(
-                                result.getLong("signed_posting_total"),
-                                result.getLong("latest_account_sequence"),
-                                result.getLong("version")));
-                    }
-                }
+        private void recordFailure(AssertionError failure) {
+            AssertionError existing = lifecycleFailure.get();
+            if (existing == null && lifecycleFailure.compareAndSet(null, failure)) {
+                return;
             }
-            return Map.copyOf(states);
+            lifecycleFailure.get().addSuppressed(failure);
         }
 
-        private static Map<String, ControlState> controls(Connection connection) throws SQLException {
-            var states = new LinkedHashMap<String, ControlState>();
-            try (var statement = prepare(connection, """
-                SELECT control_account_code, signed_posting_total, latest_journal_sequence
-                FROM funds.control_account_projection
-                WHERE book_id = ? AND currency = 'NGN'
-                  AND control_account_code IN (?, ?, ?)
-                ORDER BY control_account_code
-                """)) {
-                statement.setObject(1, TestPostingStack.BOOK_ID);
-                statement.setString(2, TestPostingStack.PROVIDER_CONTROL);
-                statement.setString(3, TestPostingStack.CUSTOMER_CONTROL);
-                statement.setString(4, TestPostingStack.INDEPENDENT_CONTROL);
-                try (var result = statement.executeQuery()) {
-                    while (result.next()) {
-                        states.put(
-                            result.getString("control_account_code"),
-                            new ControlState(
-                                result.getLong("signed_posting_total"),
-                                result.getLong("latest_journal_sequence")));
-                    }
-                }
+        private static boolean isClosed(Statement statement) {
+            try {
+                return statement.isClosed();
+            } catch (SQLException | RuntimeException failure) {
+                return false;
             }
-            return Map.copyOf(states);
         }
 
-        private static List<OutboxState> outbox(Connection connection, UUID commandId) throws SQLException {
-            var states = new ArrayList<OutboxState>();
-            try (var statement = prepare(connection, """
-                SELECT event.event_id, event.aggregate_id, event.aggregate_version,
-                       event.event_type, event.schema_version, event.payload::text,
-                       event.created_at, event.published_at, event.publish_attempts
-                FROM funds.outbox_event event
-                JOIN funds.journal journal ON journal.journal_id = event.aggregate_id
-                WHERE journal.command_id = ?
-                ORDER BY event.event_id
-                """)) {
-                statement.setObject(1, commandId);
-                try (var result = statement.executeQuery()) {
-                    while (result.next()) {
-                        states.add(new OutboxState(
-                            result.getObject("event_id", UUID.class),
-                            result.getObject("aggregate_id", UUID.class),
-                            result.getLong("aggregate_version"),
-                            result.getString("event_type"),
-                            result.getInt("schema_version"),
-                            result.getString("payload"),
-                            result.getObject("created_at", OffsetDateTime.class),
-                            result.getObject("published_at", OffsetDateTime.class),
-                            result.getInt("publish_attempts")));
-                    }
-                }
+        private static boolean isClosed(Connection connection) {
+            try {
+                return connection.isClosed();
+            } catch (SQLException | RuntimeException failure) {
+                return false;
             }
-            return List.copyOf(states);
         }
     }
 
-    private static final class WorkerHandle implements AutoCloseable {
-        private final Process process;
-        private final CrashPostingWorker.CrashPoint point;
-        private final FutureTask<String> outputRead;
-        private final Thread outputReader;
-        private final Duration timeout;
-
-        private WorkerHandle(Process process, CrashPostingWorker.CrashPoint point) {
-            this(process, point, PROCESS_TIMEOUT);
-        }
-
-        private WorkerHandle(
-            Process process,
-            CrashPostingWorker.CrashPoint point,
-            Duration timeout
-        ) {
-            this.process = process;
-            this.point = point;
-            this.timeout = timeout;
-            this.outputRead = new FutureTask<>(() -> new String(process.getInputStream().readAllBytes(), UTF_8));
-            this.outputReader = Thread.ofVirtual()
-                .name("crash-posting-worker-output-" + point)
-                .start(outputRead);
-        }
-
-        private WorkerExit awaitExit() {
-            Deadline deadline = Deadline.after(timeout);
-            try {
-                if (!process.waitFor(deadline.remainingNanos(), NANOSECONDS)) {
-                    throw new AssertionError("crash worker did not exit within 10 seconds at " + point);
-                }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("crash worker wait was interrupted at " + point, interrupted);
-            }
-
-            try {
-                return new WorkerExit(
-                    process.exitValue(),
-                    outputRead.get(Math.max(1, deadline.remainingNanos()), NANOSECONDS));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("crash worker output read was interrupted at " + point, interrupted);
-            } catch (ExecutionException failure) {
-                throw new AssertionError("crash worker output read failed at " + point, failure.getCause());
-            } catch (TimeoutException failure) {
-                throw new AssertionError("crash worker output was not drained within 10 seconds at " + point, failure);
-            }
-        }
-
+    private record TrackedStatement(JdbcResources owner, PreparedStatement statement) implements AutoCloseable {
         @Override
         public void close() {
-            Deadline deadline = Deadline.after(timeout);
-            AssertionError cleanupFailure = null;
-            if (process.isAlive()) {
-                process.destroyForcibly();
-                try {
-                    long remaining = deadline.remainingNanos();
-                    if (remaining == 0 || !process.waitFor(remaining, NANOSECONDS)) {
-                        cleanupFailure = append(
-                            cleanupFailure,
-                            new AssertionError("crash worker survived forced destruction at " + point));
-                    }
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    cleanupFailure = append(
-                        cleanupFailure,
-                        new AssertionError("forced crash-worker wait was interrupted at " + point, interrupted));
-                }
-            }
-
-            try {
-                process.getInputStream().close();
-            } catch (IOException failure) {
-                cleanupFailure = append(
-                    cleanupFailure,
-                    new AssertionError("crash-worker output close failed at " + point, failure));
-            }
-            if (outputReader.isAlive()) {
-                outputRead.cancel(true);
-                outputReader.interrupt();
-                try {
-                    long remaining = deadline.remainingNanos();
-                    if (remaining == 0 || !outputReader.join(Duration.ofNanos(remaining))) {
-                        cleanupFailure = append(
-                            cleanupFailure,
-                            new AssertionError("crash-worker output reader survived 10-second cleanup at " + point));
-                    }
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    cleanupFailure = append(
-                        cleanupFailure,
-                        new AssertionError("crash-worker output cleanup was interrupted at " + point, interrupted));
-                }
-            }
-            if (cleanupFailure != null) {
-                throw cleanupFailure;
-            }
-        }
-
-        private static AssertionError append(AssertionError existing, AssertionError next) {
-            return PostingCrashRecoveryIT.append(existing, next);
+            owner.closeStatement(statement);
         }
     }
 
-    private static AssertionError append(AssertionError existing, AssertionError next) {
-        if (existing == null) {
-            return next;
-        }
-        existing.addSuppressed(next);
-        return existing;
-    }
-
-    private static final class Deadline {
-        private final long expiresAt;
-
-        private Deadline(long expiresAt) {
-            this.expiresAt = expiresAt;
-        }
-
-        private static Deadline after(Duration timeout) {
-            long now = System.nanoTime();
-            long duration = Math.max(0, timeout.toNanos());
-            long expiresAt = Long.MAX_VALUE - now < duration ? Long.MAX_VALUE : now + duration;
-            return new Deadline(expiresAt);
-        }
-
-        private long remainingNanos() {
-            return Math.max(0, expiresAt - System.nanoTime());
-        }
-
-        private boolean hasRemaining() {
-            return remainingNanos() > 0;
-        }
-    }
-
-    private static final class TimeoutDataSource implements DataSource {
+    private static final class TrackingDataSource implements DataSource {
         private final DataSource delegate;
+        private final JdbcResources resources;
 
-        private TimeoutDataSource(DataSource delegate) {
+        private TrackingDataSource(DataSource delegate, JdbcResources resources) {
             this.delegate = delegate;
+            this.resources = resources;
         }
 
         @Override
         public Connection getConnection() throws SQLException {
-            return configureTimeouts(delegate.getConnection());
+            return resources.acquireConnection();
         }
 
         @Override
         public Connection getConnection(String username, String password) throws SQLException {
-            return configureTimeouts(delegate.getConnection(username, password));
+            throw new SQLFeatureNotSupportedException("scoped credentials are fixed");
         }
 
         @Override
@@ -1044,8 +1035,552 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    private static final class CrashProbe {
+        private final PGSimpleDataSource dataSource;
+
+        private CrashProbe(PGSimpleDataSource dataSource) {
+            this.dataSource = dataSource;
+        }
+
+        private UUID awaitCommittedJournal(UUID commandId) throws SQLException {
+            return runJdbcBounded(PROCESS_TIMEOUT, "committed-journal visibility", dataSource, resources -> {
+                Deadline deadline = Deadline.after(Duration.ofSeconds(8), System::nanoTime);
+                do {
+                    Optional<UUID> journalId = journalId(resources, commandId);
+                    if (journalId.isPresent()) {
+                        return journalId.get();
+                    }
+                    Thread.onSpinWait();
+                } while (deadline.hasRemaining());
+                throw new AssertionError("committed journal was not visible within the overall bound");
+            });
+        }
+
+        private Optional<UUID> journalId(JdbcResources resources, UUID commandId) throws Exception {
+            return resources.withConnection(connection -> {
+                try (var tracked = resources.prepare(connection, """
+                     SELECT journal_id FROM funds.journal WHERE command_id = ?
+                     """)) {
+                    var statement = tracked.statement();
+                statement.setObject(1, commandId);
+                try (var result = statement.executeQuery()) {
+                    return result.next()
+                        ? Optional.of(result.getObject("journal_id", UUID.class))
+                        : Optional.empty();
+                }
+                }
+            });
+        }
+
+        private CrashSnapshot snapshot(UUID commandId) throws SQLException {
+            return runJdbcBounded(
+                PROCESS_TIMEOUT,
+                "scoped ledger snapshot",
+                dataSource,
+                resources -> snapshotWithinBound(resources, commandId));
+        }
+
+        private CrashSnapshot snapshotWithinBound(JdbcResources resources, UUID commandId) throws Exception {
+            return resources.withConnection(connection -> new CrashSnapshot(
+                idempotency(resources, connection, commandId),
+                journals(resources, connection, commandId),
+                postings(resources, connection, commandId),
+                balances(resources, connection),
+                controls(resources, connection),
+                outbox(resources, connection, commandId)));
+        }
+
+        private void awaitRollbackComplete() throws SQLException {
+            runJdbcBounded(PROCESS_TIMEOUT, "pre-commit rollback synchronization", dataSource, resources -> {
+                Deadline deadline = Deadline.after(Duration.ofSeconds(8), System::nanoTime);
+                SQLException lastLockFailure = null;
+                do {
+                    try {
+                        probeRollbackReleaseOnceWithinBound(resources);
+                        return null;
+                    } catch (SQLException failure) {
+                        if (!"55P03".equals(failure.getSQLState())) {
+                            throw failure;
+                        }
+                        lastLockFailure = failure;
+                        Thread.onSpinWait();
+                    }
+                } while (deadline.hasRemaining());
+                throw new AssertionError(
+                    "fixture account locks were not released within the overall bound",
+                    lastLockFailure);
+            });
+        }
+
+        private void probeRollbackReleaseOnce() throws SQLException {
+            runJdbcBounded(PROCESS_TIMEOUT, "single rollback-release probe", dataSource, resources -> {
+                probeRollbackReleaseOnceWithinBound(resources);
+                return null;
+            });
+        }
+
+        private void probeRollbackReleaseOnceWithinBound(JdbcResources resources) throws Exception {
+            resources.withConnection(connection -> {
+                connection.setAutoCommit(false);
+                Throwable primaryFailure = null;
+                try (var tracked = resources.prepare(connection, """
+                    SELECT account_id
+                    FROM funds.ledger_account
+                    WHERE account_id IN (?, ?)
+                    ORDER BY account_id
+                    FOR UPDATE
+                    """)) {
+                    var statement = tracked.statement();
+                    statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
+                    statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
+                    try (var result = statement.executeQuery()) {
+                        if (!result.next() || !result.next() || result.next()) {
+                            throw new AssertionError("rollback-release probe did not lock exactly two fixture accounts");
+                        }
+                    }
+                } catch (SQLException | RuntimeException | Error failure) {
+                    primaryFailure = failure;
+                    throw failure;
+                } finally {
+                    try {
+                        connection.rollback();
+                    } catch (SQLException rollbackFailure) {
+                        if (primaryFailure == null) {
+                            throw rollbackFailure;
+                        }
+                        primaryFailure.addSuppressed(rollbackFailure);
+                    }
+                }
+                return null;
+            });
+        }
+
+        private static List<IdempotencyState> idempotency(
+            JdbcResources resources,
+            Connection connection,
+            UUID commandId
+        ) throws SQLException {
+            var states = new ArrayList<IdempotencyState>();
+            try (var tracked = resources.prepare(connection, """
+                SELECT command_id, request_hash, state, journal_id, result_json::text,
+                       created_at, completed_at
+                FROM funds.idempotency_command
+                WHERE command_id = ?
+                ORDER BY command_id
+                """)) {
+                var statement = tracked.statement();
+                statement.setObject(1, commandId);
+                try (var result = statement.executeQuery()) {
+                    while (result.next()) {
+                        states.add(new IdempotencyState(
+                            result.getObject("command_id", UUID.class),
+                            result.getString("request_hash"),
+                            result.getString("state"),
+                            result.getObject("journal_id", UUID.class),
+                            result.getString("result_json"),
+                            result.getObject("created_at", OffsetDateTime.class),
+                            result.getObject("completed_at", OffsetDateTime.class)));
+                    }
+                }
+            }
+            return List.copyOf(states);
+        }
+
+        private static List<JournalState> journals(
+            JdbcResources resources,
+            Connection connection,
+            UUID commandId
+        ) throws SQLException {
+            var states = new ArrayList<JournalState>();
+            try (var tracked = resources.prepare(connection, """
+                SELECT journal_id, journal_sequence, command_id, correlation_id,
+                       business_transaction_id, legal_entity_id, book_id, period_id,
+                       transaction_type, narration, booking_time, value_date,
+                       reversal_of_journal_id, policy_version, canonical_hash
+                FROM funds.journal
+                WHERE command_id = ?
+                ORDER BY journal_sequence
+                """)) {
+                var statement = tracked.statement();
+                statement.setObject(1, commandId);
+                try (var result = statement.executeQuery()) {
+                    while (result.next()) {
+                        states.add(new JournalState(
+                            result.getObject("journal_id", UUID.class),
+                            result.getLong("journal_sequence"),
+                            result.getObject("command_id", UUID.class),
+                            result.getObject("correlation_id", UUID.class),
+                            result.getObject("business_transaction_id", UUID.class),
+                            result.getObject("legal_entity_id", UUID.class),
+                            result.getObject("book_id", UUID.class),
+                            result.getObject("period_id", UUID.class),
+                            result.getString("transaction_type"),
+                            result.getString("narration"),
+                            result.getObject("booking_time", OffsetDateTime.class),
+                            result.getObject("value_date", LocalDate.class),
+                            result.getObject("reversal_of_journal_id", UUID.class),
+                            result.getInt("policy_version"),
+                            result.getString("canonical_hash")));
+                    }
+                }
+            }
+            return List.copyOf(states);
+        }
+
+        private static List<PostingState> postings(
+            JdbcResources resources,
+            Connection connection,
+            UUID commandId
+        ) throws SQLException {
+            var states = new ArrayList<PostingState>();
+            try (var tracked = resources.prepare(connection, """
+                SELECT posting.posting_id, posting.journal_id, posting.account_id,
+                       posting.currency, posting.signed_minor_units,
+                       posting.account_sequence, posting.dimensions::text
+                FROM funds.posting posting
+                JOIN funds.journal journal ON journal.journal_id = posting.journal_id
+                WHERE journal.command_id = ?
+                  AND posting.account_id IN (?, ?)
+                ORDER BY posting.posting_id
+                """)) {
+                var statement = tracked.statement();
+                statement.setObject(1, commandId);
+                statement.setObject(2, TestPostingStack.PROVIDER_ASSET);
+                statement.setObject(3, TestPostingStack.CUSTOMER_LIABILITY);
+                try (var result = statement.executeQuery()) {
+                    while (result.next()) {
+                        states.add(new PostingState(
+                            result.getObject("posting_id", UUID.class),
+                            result.getObject("journal_id", UUID.class),
+                            result.getObject("account_id", UUID.class),
+                            result.getString("currency"),
+                            result.getLong("signed_minor_units"),
+                            result.getLong("account_sequence"),
+                            result.getString("dimensions")));
+                    }
+                }
+            }
+            return List.copyOf(states);
+        }
+
+        private static Map<UUID, BalanceState> balances(JdbcResources resources, Connection connection)
+            throws SQLException {
+            var states = new LinkedHashMap<UUID, BalanceState>();
+            try (var tracked = resources.prepare(connection, """
+                SELECT account_id, signed_posting_total, latest_account_sequence, version
+                FROM funds.materialised_balance
+                WHERE account_id IN (?, ?)
+                ORDER BY account_id
+                """)) {
+                var statement = tracked.statement();
+                statement.setObject(1, TestPostingStack.PROVIDER_ASSET);
+                statement.setObject(2, TestPostingStack.CUSTOMER_LIABILITY);
+                try (var result = statement.executeQuery()) {
+                    while (result.next()) {
+                        states.put(
+                            result.getObject("account_id", UUID.class),
+                            new BalanceState(
+                                result.getLong("signed_posting_total"),
+                                result.getLong("latest_account_sequence"),
+                                result.getLong("version")));
+                    }
+                }
+            }
+            return Map.copyOf(states);
+        }
+
+        private static Map<String, ControlState> controls(JdbcResources resources, Connection connection)
+            throws SQLException {
+            var states = new LinkedHashMap<String, ControlState>();
+            try (var tracked = resources.prepare(connection, """
+                SELECT control_account_code, signed_posting_total, latest_journal_sequence
+                FROM funds.control_account_projection
+                WHERE book_id = ? AND currency = 'NGN'
+                  AND control_account_code IN (?, ?, ?)
+                ORDER BY control_account_code
+                """)) {
+                var statement = tracked.statement();
+                statement.setObject(1, TestPostingStack.BOOK_ID);
+                statement.setString(2, TestPostingStack.PROVIDER_CONTROL);
+                statement.setString(3, TestPostingStack.CUSTOMER_CONTROL);
+                statement.setString(4, TestPostingStack.INDEPENDENT_CONTROL);
+                try (var result = statement.executeQuery()) {
+                    while (result.next()) {
+                        states.put(
+                            result.getString("control_account_code"),
+                            new ControlState(
+                                result.getLong("signed_posting_total"),
+                                result.getLong("latest_journal_sequence")));
+                    }
+                }
+            }
+            return Map.copyOf(states);
+        }
+
+        private static List<OutboxState> outbox(
+            JdbcResources resources,
+            Connection connection,
+            UUID commandId
+        ) throws SQLException {
+            var states = new ArrayList<OutboxState>();
+            try (var tracked = resources.prepare(connection, """
+                SELECT event.event_id, event.aggregate_id, event.aggregate_version,
+                       event.event_type, event.schema_version, event.payload::text,
+                       event.created_at, event.published_at, event.publish_attempts
+                FROM funds.outbox_event event
+                JOIN funds.journal journal ON journal.journal_id = event.aggregate_id
+                WHERE journal.command_id = ?
+                ORDER BY event.event_id
+                """)) {
+                var statement = tracked.statement();
+                statement.setObject(1, commandId);
+                try (var result = statement.executeQuery()) {
+                    while (result.next()) {
+                        states.add(new OutboxState(
+                            result.getObject("event_id", UUID.class),
+                            result.getObject("aggregate_id", UUID.class),
+                            result.getLong("aggregate_version"),
+                            result.getString("event_type"),
+                            result.getInt("schema_version"),
+                            result.getString("payload"),
+                            result.getObject("created_at", OffsetDateTime.class),
+                            result.getObject("published_at", OffsetDateTime.class),
+                            result.getInt("publish_attempts")));
+                    }
+                }
+            }
+            return List.copyOf(states);
+        }
+    }
+
+    private interface TimedWaits {
+        boolean waitFor(Process process, long remainingNanos) throws InterruptedException;
+
+        <T> T get(Future<T> future, long remainingNanos)
+            throws InterruptedException, ExecutionException, TimeoutException;
+
+        boolean join(Thread thread, long remainingNanos) throws InterruptedException;
+    }
+
+    private enum SystemTimedWaits implements TimedWaits {
+        INSTANCE;
+
+        @Override
+        public boolean waitFor(Process process, long remainingNanos) throws InterruptedException {
+            return process.waitFor(remainingNanos, NANOSECONDS);
+        }
+
+        @Override
+        public <T> T get(Future<T> future, long remainingNanos)
+            throws InterruptedException, ExecutionException, TimeoutException {
+            return future.get(remainingNanos, NANOSECONDS);
+        }
+
+        @Override
+        public boolean join(Thread thread, long remainingNanos) throws InterruptedException {
+            return thread.join(Duration.ofNanos(remainingNanos));
+        }
+    }
+
+    private static final class WorkerHandle implements AutoCloseable {
+        private final Process process;
+        private final CrashPostingWorker.CrashPoint point;
+        private final FutureTask<String> outputRead;
+        private final Thread outputReader;
+        private final Duration timeout;
+        private final LongSupplier nanoTime;
+        private final TimedWaits timedWaits;
+
+        private WorkerHandle(Process process, CrashPostingWorker.CrashPoint point) {
+            this(process, point, PROCESS_TIMEOUT, System::nanoTime, SystemTimedWaits.INSTANCE);
+        }
+
+        private WorkerHandle(
+            Process process,
+            CrashPostingWorker.CrashPoint point,
+            Duration timeout,
+            LongSupplier nanoTime,
+            TimedWaits timedWaits
+        ) {
+            this.process = process;
+            this.point = point;
+            this.timeout = timeout;
+            this.nanoTime = nanoTime;
+            this.timedWaits = timedWaits;
+            this.outputRead = new FutureTask<>(() -> new String(process.getInputStream().readAllBytes(), UTF_8));
+            this.outputReader = Thread.ofVirtual()
+                .name("crash-posting-worker-output-" + point)
+                .start(outputRead);
+        }
+
+        private WorkerExit awaitExit() {
+            Deadline deadline = Deadline.after(timeout, nanoTime);
+            try {
+                if (!timedWaits.waitFor(process, deadline.remainingNanos())) {
+                    throw new AssertionError("crash worker did not exit within 10 seconds at " + point);
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("crash worker wait was interrupted at " + point, interrupted);
+            }
+
+            try {
+                return new WorkerExit(
+                    process.exitValue(),
+                    timedWaits.get(outputRead, Math.max(1, deadline.remainingNanos())));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("crash worker output read was interrupted at " + point, interrupted);
+            } catch (ExecutionException failure) {
+                throw new AssertionError("crash worker output read failed at " + point, failure.getCause());
+            } catch (TimeoutException failure) {
+                throw new AssertionError("crash worker output was not drained within 10 seconds at " + point, failure);
+            }
+        }
+
+        @Override
+        public void close() {
+            Deadline deadline = Deadline.after(timeout, nanoTime);
+            AssertionError cleanupFailure = null;
+            boolean restoreInterrupt = Thread.interrupted();
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                boolean waitComplete = false;
+                while (!waitComplete && deadline.hasRemaining()) {
+                    long remaining = deadline.remainingNanos();
+                    try {
+                        if (!timedWaits.waitFor(process, remaining)) {
+                            cleanupFailure = append(
+                                cleanupFailure,
+                                new AssertionError("crash worker survived forced destruction at " + point));
+                        }
+                        waitComplete = true;
+                    } catch (InterruptedException interrupted) {
+                        restoreInterrupt = true;
+                    }
+                }
+                if (!waitComplete) {
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError("crash worker survived forced destruction at " + point));
+                }
+            }
+
+            var inputClose = new FutureTask<Void>(() -> {
+                process.getInputStream().close();
+                return null;
+            });
+            Thread inputCloser = Thread.ofVirtual()
+                .name("crash-posting-worker-input-close-" + point)
+                .start(inputClose);
+            boolean inputCloseWaitComplete = false;
+            while (!inputCloseWaitComplete && deadline.hasRemaining()) {
+                try {
+                    timedWaits.get(inputClose, deadline.remainingNanos());
+                    inputCloseWaitComplete = true;
+                } catch (InterruptedException interrupted) {
+                    restoreInterrupt = true;
+                } catch (TimeoutException timeoutFailure) {
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError("crash-worker output close did not finish within cleanup bound at " + point));
+                    break;
+                } catch (ExecutionException failure) {
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError("crash-worker output close failed at " + point, failure.getCause()));
+                    inputCloseWaitComplete = true;
+                }
+            }
+            if (!inputCloseWaitComplete && !inputClose.isDone()) {
+                inputClose.cancel(true);
+                inputCloser.interrupt();
+            }
+            boolean inputCloserJoined = !inputCloser.isAlive();
+            while (!inputCloserJoined && deadline.hasRemaining()) {
+                try {
+                    inputCloserJoined = timedWaits.join(inputCloser, deadline.remainingNanos());
+                } catch (InterruptedException interrupted) {
+                    restoreInterrupt = true;
+                }
+            }
+            if (!inputCloserJoined) {
+                cleanupFailure = append(
+                    cleanupFailure,
+                    new AssertionError("crash-worker output close task survived cleanup at " + point));
+            }
+
+            if (outputReader.isAlive()) {
+                outputRead.cancel(true);
+                outputReader.interrupt();
+                boolean readerJoined = false;
+                while (!readerJoined && deadline.hasRemaining()) {
+                    try {
+                        readerJoined = timedWaits.join(outputReader, deadline.remainingNanos());
+                    } catch (InterruptedException interrupted) {
+                        restoreInterrupt = true;
+                    }
+                }
+                if (!readerJoined) {
+                    cleanupFailure = append(
+                        cleanupFailure,
+                        new AssertionError("crash-worker output reader survived cleanup at " + point));
+                }
+            }
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt();
+            }
+            if (cleanupFailure != null) {
+                throw cleanupFailure;
+            }
+        }
+
+        private static AssertionError append(AssertionError existing, AssertionError next) {
+            return PostingCrashRecoveryIT.append(existing, next);
+        }
+    }
+
+    private static AssertionError append(AssertionError existing, AssertionError next) {
+        if (next == null) {
+            return existing;
+        }
+        if (existing == null) {
+            return next;
+        }
+        existing.addSuppressed(next);
+        return existing;
+    }
+
+    private static final class Deadline {
+        private final long expiresAt;
+        private final LongSupplier nanoTime;
+
+        private Deadline(long expiresAt, LongSupplier nanoTime) {
+            this.expiresAt = expiresAt;
+            this.nanoTime = nanoTime;
+        }
+
+        private static Deadline after(Duration timeout, LongSupplier nanoTime) {
+            long now = nanoTime.getAsLong();
+            long duration = Math.max(0, timeout.toNanos());
+            long expiresAt = Long.MAX_VALUE - now < duration ? Long.MAX_VALUE : now + duration;
+            return new Deadline(expiresAt, nanoTime);
+        }
+
+        private long remainingNanos() {
+            return Math.max(0, expiresAt - nanoTime.getAsLong());
+        }
+
+        private boolean hasRemaining() {
+            return remainingNanos() > 0;
+        }
+    }
+
     private static final class StubbornInputStream extends InputStream {
         private final CountDownLatch released = new CountDownLatch(1);
+        private final CountDownLatch closeStarted = new CountDownLatch(1);
+        private final CountDownLatch closeInterrupted = new CountDownLatch(1);
+        private final CountDownLatch closeReleased = new CountDownLatch(1);
 
         @Override
         public int read() {
@@ -1060,21 +1595,29 @@ class PostingCrashRecoveryIT {
         }
 
         @Override
-        public void close() {}
+        public void close() throws IOException {
+            closeStarted.countDown();
+            try {
+                closeReleased.await();
+            } catch (InterruptedException interrupted) {
+                closeInterrupted.countDown();
+                Thread.currentThread().interrupt();
+                throw new IOException("close interrupted", interrupted);
+            }
+        }
 
         private void release() {
+            closeReleased.countDown();
             released.countDown();
         }
     }
 
     private static final class SlowTerminationProcess extends Process {
         private final InputStream input;
-        private final Duration waitDuration;
         private final AtomicBoolean destroyed = new AtomicBoolean();
 
-        private SlowTerminationProcess(InputStream input, Duration waitDuration) {
+        private SlowTerminationProcess(InputStream input) {
             this.input = input;
-            this.waitDuration = waitDuration;
         }
 
         @Override
@@ -1099,8 +1642,6 @@ class PostingCrashRecoveryIT {
 
         @Override
         public boolean waitFor(long timeout, java.util.concurrent.TimeUnit unit) throws InterruptedException {
-            long waitMillis = Math.min(waitDuration.toMillis(), unit.toMillis(timeout));
-            new CountDownLatch(1).await(waitMillis, MILLISECONDS);
             return false;
         }
 
@@ -1123,6 +1664,106 @@ class PostingCrashRecoveryIT {
         @Override
         public boolean isAlive() {
             return true;
+        }
+    }
+
+    private static final class MutableNanoClock {
+        private long now;
+
+        private long nanoTime() {
+            return now;
+        }
+
+        private void advance(long nanoseconds) {
+            now += nanoseconds;
+        }
+    }
+
+    private static final class RecordingTimedWaits implements TimedWaits {
+        private final MutableNanoClock clock;
+        private final StubbornInputStream input;
+        private final List<Long> observedBudgets = new ArrayList<>();
+
+        private RecordingTimedWaits(MutableNanoClock clock, StubbornInputStream input) {
+            this.clock = clock;
+            this.input = input;
+        }
+
+        @Override
+        public boolean waitFor(Process process, long remainingNanos) {
+            observedBudgets.add(remainingNanos);
+            clock.advance(60);
+            return false;
+        }
+
+        @Override
+        public <T> T get(Future<T> future, long remainingNanos)
+            throws InterruptedException, ExecutionException, TimeoutException {
+            observedBudgets.add(remainingNanos);
+            assertTrue(input.closeStarted.await(1, SECONDS));
+            clock.advance(20);
+            throw new TimeoutException("deterministic close timeout");
+        }
+
+        @Override
+        public boolean join(Thread thread, long remainingNanos) throws InterruptedException {
+            observedBudgets.add(remainingNanos);
+            if (thread.getName().contains("input-close")) {
+                assertTrue(input.closeInterrupted.await(1, SECONDS));
+                return thread.join(Duration.ofSeconds(1));
+            }
+            clock.advance(remainingNanos);
+            return false;
+        }
+    }
+
+    private static final class InterruptReturningDataSource extends PGSimpleDataSource {
+        private final CountDownLatch acquisitionStarted = new CountDownLatch(1);
+        private final CountDownLatch acquisitionFinished = new CountDownLatch(1);
+        private final AtomicBoolean aborted = new AtomicBoolean();
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        @Override
+        public Connection getConnection() {
+            acquisitionStarted.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException timeoutCancellation) {
+                // Simulate a driver returning a connection after caller-side cancellation won the race.
+            }
+            acquisitionFinished.countDown();
+            return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, arguments) -> switch (method.getName()) {
+                    case "abort" -> {
+                        aborted.set(true);
+                        closed.set(true);
+                        yield null;
+                    }
+                    case "close" -> {
+                        closed.set(true);
+                        yield null;
+                    }
+                    case "isClosed" -> closed.get();
+                    case "isWrapperFor" -> false;
+                    case "unwrap" -> throw new SQLException("not a wrapper");
+                    case "toString" -> "interrupt-returning-connection";
+                    default -> defaultValue(method.getReturnType());
+                });
+        }
+
+        private static Object defaultValue(Class<?> type) {
+            if (!type.isPrimitive()) {
+                return null;
+            }
+            if (type == boolean.class) {
+                return false;
+            }
+            if (type == char.class) {
+                return '\0';
+            }
+            return 0;
         }
     }
 }
