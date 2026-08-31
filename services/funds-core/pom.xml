@@ -59,6 +59,7 @@
                         <include>**/*Tests.java</include>
                         <include>**/*TestCase.java</include>
                         <include>**/*Properties.java</include>
+                        <include>**/*IT.java</include>
                     </includes>
                     <systemPropertyVariables><java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager></systemPropertyVariables>
                 </configuration>
