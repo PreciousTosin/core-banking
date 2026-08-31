@@ -4,6 +4,7 @@ import com.corebanking.funds.application.CanonicalJournalHasher;
 import com.corebanking.funds.application.JournalValidator;
 import com.corebanking.funds.application.PostingCommand;
 import com.corebanking.funds.application.PostingResult;
+import com.corebanking.funds.application.PostingTransactionObserver;
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
@@ -13,6 +14,7 @@ import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -40,14 +42,29 @@ public class JdbcLedgerRepository implements LedgerRepository {
 
     private final JournalValidator validator;
     private final CanonicalJournalHasher hasher;
+    private final PostingTransactionObserver observer;
 
     public JdbcLedgerRepository() {
-        this(new JournalValidator(), new CanonicalJournalHasher());
+        this(new JournalValidator(), new CanonicalJournalHasher(), PostingTransactionObserver.noop());
     }
 
     public JdbcLedgerRepository(JournalValidator validator, CanonicalJournalHasher hasher) {
+        this(validator, hasher, PostingTransactionObserver.noop());
+    }
+
+    @Inject
+    public JdbcLedgerRepository(PostingTransactionObserver observer) {
+        this(new JournalValidator(), new CanonicalJournalHasher(), observer);
+    }
+
+    public JdbcLedgerRepository(
+        JournalValidator validator,
+        CanonicalJournalHasher hasher,
+        PostingTransactionObserver observer
+    ) {
         this.validator = Objects.requireNonNull(validator, "validator");
         this.hasher = Objects.requireNonNull(hasher, "hasher");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     @Override
@@ -60,6 +77,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
             if (!locked.requestHash().equals(command.requestHash())) {
                 throw new IdempotencyConflictException(command.commandId());
             }
+            observer.afterIdempotencyAcquired(command.commandId());
             if (locked.completed()) {
                 return loadCompletedResult(connection, command.commandId());
             }
@@ -70,6 +88,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 connection,
                 command.journal(),
                 accountIds);
+            observer.afterAccountLocks(command.commandId());
             JournalDraft assignedJournal = assignAccountSequences(command.journal(), accounts);
             validator.validate(assignedJournal);
             String canonicalHash = hasher.sha256(assignedJournal);
@@ -78,6 +97,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
             insertPostings(connection, assignedJournal);
             updateMaterialisedBalances(connection, assignedJournal, accounts);
             updateControlProjection(connection, assignedJournal, accounts, journalSequence);
+            observer.afterFinancialRowsBeforeOutbox(command.commandId());
             insertOutbox(connection, assignedJournal.journalId(), journalSequence, canonicalHash);
 
             var result = new PostingResult(assignedJournal.journalId(), journalSequence, canonicalHash);

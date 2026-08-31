@@ -15,16 +15,27 @@ public class PostingService {
     private final DataSource dataSource;
     private final LedgerRepository repository;
     private final PostgresRetryPolicy retryPolicy;
+    private final PostingTransactionObserver observer;
 
-    @Inject
     public PostingService(
         DataSource dataSource,
         LedgerRepository repository,
         PostgresRetryPolicy retryPolicy
     ) {
+        this(dataSource, repository, retryPolicy, PostingTransactionObserver.noop());
+    }
+
+    @Inject
+    public PostingService(
+        DataSource dataSource,
+        LedgerRepository repository,
+        PostgresRetryPolicy retryPolicy,
+        PostingTransactionObserver observer
+    ) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.repository = Objects.requireNonNull(repository, "repository");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     public PostingResult post(PostingCommand command) {
@@ -33,10 +44,11 @@ public class PostingService {
             try (Connection connection = dataSource.getConnection()) {
                 connection.setAutoCommit(false);
                 connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+                PostingResult result;
                 try {
-                    PostingResult result = repository.post(connection, command);
+                    result = repository.post(connection, command);
+                    observer.beforeCommit(command.commandId());
                     connection.commit();
-                    return result;
                 } catch (SQLException failure) {
                     rollback(connection, failure);
                     throw new LedgerPersistenceException(failure);
@@ -44,6 +56,8 @@ public class PostingService {
                     rollback(connection, failure);
                     throw failure;
                 }
+                observer.afterCommitBeforeReturn(command.commandId());
+                return result;
             } catch (SQLException connectionFailure) {
                 throw new LedgerPersistenceException(connectionFailure);
             }
