@@ -343,8 +343,8 @@ class PostingServiceIT {
         String loginRole = "funds_app_path_" + UUID.randomUUID().toString().replace("-", "");
         String password = "task12-role-path-password";
         execute("CREATE ROLE %s LOGIN PASSWORD '%s'".formatted(loginRole, password));
-        execute("GRANT funds_app TO " + loginRole);
-        try {
+        try (var ignored = new TemporaryLoginRole(dataSource, loginRole)) {
+            execute("GRANT funds_app TO " + loginRole);
             var roleDataSource = fundsAppDataSource(loginRole, password);
             var repository = new ScriptedLedgerRepository(
                 new JdbcLedgerRepository(),
@@ -388,8 +388,25 @@ class PostingServiceIT {
                         WHERE command_id = '%s' AND state = 'COMPLETED'
                         """.formatted(uuid(40)))));
             }
-        } finally {
-            execute("DROP ROLE " + loginRole);
+        }
+    }
+
+    @Test
+    void temporaryLoginRoleIsDroppedWhenSetupFails() throws SQLException {
+        String loginRole = "funds_app_cleanup_" + UUID.randomUUID().toString().replace("-", "");
+        execute("CREATE ROLE " + loginRole + " LOGIN");
+
+        SQLException grantFailure = assertThrows(SQLException.class, () -> {
+            try (var ignored = new TemporaryLoginRole(dataSource, loginRole)) {
+                execute("GRANT deliberately_missing_role TO " + loginRole);
+            }
+        });
+
+        assertEquals("42704", grantFailure.getSQLState());
+        try (var connection = dataSource.getConnection()) {
+            assertEquals(0, queryLong(connection, """
+                SELECT count(*) FROM pg_roles WHERE rolname = '%s'
+                """.formatted(loginRole)));
         }
     }
 
@@ -1025,6 +1042,40 @@ class PostingServiceIT {
 
         private List<ConnectionIdentity> identities() {
             return List.copyOf(identities);
+        }
+    }
+
+    private static final class TemporaryLoginRole implements AutoCloseable {
+        private final DataSource administratorDataSource;
+        private final String roleName;
+
+        private TemporaryLoginRole(DataSource administratorDataSource, String roleName) {
+            if (!roleName.matches("[a-z0-9_]+")) {
+                throw new IllegalArgumentException("Unsafe temporary role name");
+            }
+            this.administratorDataSource = administratorDataSource;
+            this.roleName = roleName;
+        }
+
+        @Override
+        public void close() throws SQLException {
+            try (Connection connection = administratorDataSource.getConnection()) {
+                execute(connection, "RESET ROLE");
+                execute(connection, "RESET SESSION AUTHORIZATION");
+                try (var statement = connection.prepareStatement("""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE usename = ? AND pid <> pg_backend_pid()
+                    """)) {
+                    statement.setString(1, roleName);
+                    try (ResultSet rows = statement.executeQuery()) {
+                        while (rows.next()) {
+                            rows.getBoolean(1);
+                        }
+                    }
+                }
+                execute(connection, "DROP ROLE " + roleName);
+            }
         }
     }
 

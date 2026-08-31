@@ -24,3 +24,13 @@ for `nextval` during journal insertion. This also permits session-local
 session. It does not permit `setval`, direct sequence reads, or sequence UPDATE
 privilege. Sequence gaps after rollbacks or abandoned allocations are expected;
 journal sequences are monotonic identifiers, not gapless business numbers.
+
+## Development reset
+
+Flyway `clean` removes database objects, but PostgreSQL roles are
+cluster-global and therefore survive it. For a development reset, recreate the
+PostgreSQL container or cluster; that is the preferred and least ambiguous
+procedure for this dedicated POC database. If recreation is impossible, use a
+controlled administrator teardown that first terminates relevant sessions and
+reassigns or drops every object owned by the capability roles before dropping
+the exact roles. Never use an ad-hoc or casual `DROP ROLE` as a reset step.
