@@ -27,6 +27,9 @@ class MigrationIT {
     private static final UUID CUSTOMER_ACCOUNT_A = uuid(5);
     private static final UUID CUSTOMER_ACCOUNT_B = uuid(6);
     private static final UUID CONTROL_ACCOUNT = uuid(7);
+    private static final UUID SECOND_PRODUCT_VERSION_ID = uuid(20);
+    private static final UUID SECOND_BOOK_ID = uuid(21);
+    private static final UUID SECOND_CHART_VERSION_ID = uuid(22);
     private static final String EVIDENCE_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     @Inject
@@ -98,6 +101,18 @@ class MigrationIT {
     }
 
     @Test
+    void rejectsChartVersionFromAnotherBook() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+            insertSecondBookAndChart(connection);
+
+            assertSqlRejected(connection, ledgerInsert(
+                uuid(105), BOOK_ID, SECOND_CHART_VERSION_ID, "WRONG-CHART-BOOK", "CUSTOMER",
+                PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN"));
+        });
+    }
+
+    @Test
     void acceptsCustomerAccountWithProductVersionBinding() throws Exception {
         inTransaction(connection -> {
             insertReferenceGraph(connection);
@@ -129,6 +144,56 @@ class MigrationIT {
             assertSqlRejected(connection, ledgerInsert(
                 uuid(104), BOOK_ID, CHART_VERSION_ID, "CONTROL-WITH-PRODUCT", "CONTROL",
                 PRODUCT_VERSION_ID, "ASSET", "DEBIT", "NGN"));
+        });
+    }
+
+    @Test
+    void rejectsProductVersionUpdate() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+
+            assertSqlRejected(connection, """
+                UPDATE funds.product_version SET approval_reference = 'REPLACED'
+                WHERE product_version_id = '%s'
+                """.formatted(PRODUCT_VERSION_ID));
+            assertEquals("APP-2026-001", queryString(connection, """
+                SELECT approval_reference FROM funds.product_version
+                WHERE product_version_id = '%s'
+                """.formatted(PRODUCT_VERSION_ID)));
+        });
+    }
+
+    @Test
+    void rejectsUnreferencedProductVersionDelete() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+            insertSecondProductVersion(connection);
+
+            assertSqlRejected(connection, """
+                DELETE FROM funds.product_version WHERE product_version_id = '%s'
+                """.formatted(SECOND_PRODUCT_VERSION_ID));
+            assertEquals(1, queryInt(connection, """
+                SELECT count(*) FROM funds.product_version WHERE product_version_id = '%s'
+                """.formatted(SECOND_PRODUCT_VERSION_ID)));
+        });
+    }
+
+    @Test
+    void rejectsCustomerProductVersionBindingReplacement() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+            insertSecondProductVersion(connection);
+
+            assertSqlRejected(connection, """
+                UPDATE funds.ledger_account SET product_version_id = '%s'
+                WHERE account_id = '%s'
+                """.formatted(SECOND_PRODUCT_VERSION_ID, CUSTOMER_ACCOUNT_A));
+            assertEquals(
+                PRODUCT_VERSION_ID,
+                queryUuid(
+                    connection,
+                    "SELECT product_version_id FROM funds.ledger_account WHERE account_id = ?",
+                    CUSTOMER_ACCOUNT_A));
         });
     }
 
@@ -225,19 +290,44 @@ class MigrationIT {
     }
 
     @Test
-    void acceptsSameProviderAliasFromDifferentProviders() throws Exception {
+    void acceptsSameProviderAliasFromDifferentProvidersOnOneAccount() throws Exception {
         inTransaction(connection -> {
             insertReferenceGraph(connection);
             execute(connection, identifierInsert(
                 uuid(135), CUSTOMER_ACCOUNT_A, "PROVIDER_VIRTUAL_ACCOUNT", "shared-alias", null, uuid(300),
                 "EXTERNAL", "ACTIVE", false));
             execute(connection, identifierInsert(
-                uuid(136), CUSTOMER_ACCOUNT_B, "PROVIDER_VIRTUAL_ACCOUNT", "shared-alias", null, uuid(301),
+                uuid(136), CUSTOMER_ACCOUNT_A, "PROVIDER_VIRTUAL_ACCOUNT", "shared-alias", null, uuid(301),
                 "EXTERNAL", "ACTIVE", false));
 
             assertEquals(2, queryInt(connection, """
                 SELECT count(*) FROM funds.account_identifier WHERE normalised_value = 'shared-alias'
                 """));
+        });
+    }
+
+    @Test
+    void rejectsProviderAliasWithInstitutionCode() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+
+            assertSqlRejected(connection, identifierInsert(
+                uuid(143), CUSTOMER_ACCOUNT_A, "PROVIDER_VIRTUAL_ACCOUNT", "scoped-alias", "000011", uuid(304),
+                "EXTERNAL", "ACTIVE", false));
+        });
+    }
+
+    @Test
+    void rejectsSameActiveProviderAliasWithinOneProvider() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+            execute(connection, identifierInsert(
+                uuid(144), CUSTOMER_ACCOUNT_A, "PROVIDER_VIRTUAL_ACCOUNT", "duplicate-alias", null, uuid(305),
+                "EXTERNAL", "ACTIVE", false));
+
+            assertSqlRejected(connection, identifierInsert(
+                uuid(145), CUSTOMER_ACCOUNT_B, "PROVIDER_VIRTUAL_ACCOUNT", "duplicate-alias", null, uuid(305),
+                "EXTERNAL", "ACTIVE", false));
         });
     }
 
@@ -287,6 +377,71 @@ class MigrationIT {
                 uuid(139), CONTROL_ACCOUNT, "PROVIDER_VIRTUAL_ACCOUNT", "control-external", null, uuid(302),
                 "EXTERNAL", "ACTIVE", false));
         });
+    }
+
+    @Test
+    void rejectsCustomerScopeChangeAfterExternalIdentifierExists() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+            execute(connection, identifierInsert(
+                uuid(146), CUSTOMER_ACCOUNT_A, "PROVIDER_VIRTUAL_ACCOUNT", "external-alias", null, uuid(306),
+                "EXTERNAL", "ACTIVE", false));
+
+            assertSqlRejected(connection, """
+                UPDATE funds.ledger_account
+                SET account_scope = 'CONTROL', product_version_id = NULL
+                WHERE account_id = '%s'
+                """.formatted(CUSTOMER_ACCOUNT_A));
+            assertEquals("CUSTOMER", queryString(connection, """
+                SELECT account_scope FROM funds.ledger_account WHERE account_id = '%s'
+                """.formatted(CUSTOMER_ACCOUNT_A)));
+        });
+    }
+
+    @Test
+    void rejectsAccountScopeChangeWithoutIdentifiers() throws Exception {
+        inTransaction(connection -> {
+            insertReferenceGraph(connection);
+
+            assertSqlRejected(connection, """
+                UPDATE funds.ledger_account SET account_scope = 'INTERNAL'
+                WHERE account_id = '%s'
+                """.formatted(CONTROL_ACCOUNT));
+            assertEquals("CONTROL", queryString(connection, """
+                SELECT account_scope FROM funds.ledger_account WHERE account_id = '%s'
+                """.formatted(CONTROL_ACCOUNT)));
+        });
+    }
+
+    @Test
+    void externalIdentifierInsertLocksLedgerRowAgainstConcurrentUpdate() throws Exception {
+        truncateReferenceTables();
+        try {
+            try (var setupConnection = dataSource.getConnection()) {
+                setupConnection.setAutoCommit(false);
+                insertReferenceGraph(setupConnection);
+                setupConnection.commit();
+            }
+
+            try (var identifierConnection = dataSource.getConnection();
+                 var ledgerConnection = dataSource.getConnection()) {
+                identifierConnection.setAutoCommit(false);
+                ledgerConnection.setAutoCommit(false);
+                execute(identifierConnection, identifierInsert(
+                    uuid(147), CUSTOMER_ACCOUNT_A, "PROVIDER_VIRTUAL_ACCOUNT", "locking-alias", null, uuid(307),
+                    "EXTERNAL", "ACTIVE", false));
+                execute(ledgerConnection, "SET LOCAL lock_timeout = '250ms'");
+
+                assertSqlRejected(ledgerConnection, """
+                    UPDATE funds.ledger_account SET status = 'DEBIT_BLOCKED'
+                    WHERE account_id = '%s'
+                    """.formatted(CUSTOMER_ACCOUNT_A));
+                identifierConnection.rollback();
+                ledgerConnection.rollback();
+            }
+        } finally {
+            truncateReferenceTables();
+        }
     }
 
     @Test
@@ -393,6 +548,42 @@ class MigrationIT {
         execute(connection, ledgerInsert(
             CONTROL_ACCOUNT, BOOK_ID, CHART_VERSION_ID, "CONTROL-A", "CONTROL",
             null, "ASSET", "DEBIT", "NGN"));
+    }
+
+    private static void insertSecondProductVersion(Connection connection) throws SQLException {
+        execute(connection, """
+            INSERT INTO funds.product_version
+                (product_version_id, product_id, version, effective_from, approval_reference,
+                 policy_hash, policy_json)
+            VALUES
+                ('%s', '00000000-0000-0000-0000-000000000003', 2,
+                 TIMESTAMPTZ '2027-01-01 00:00:00+00', 'APP-2027-001',
+                 '%s', '{"interestRate":"0.02"}'::jsonb)
+            """.formatted(SECOND_PRODUCT_VERSION_ID, EVIDENCE_HASH));
+    }
+
+    private static void insertSecondBookAndChart(Connection connection) throws SQLException {
+        execute(connection, """
+            INSERT INTO funds.book
+                (book_id, legal_entity_id, functional_currency, timezone, calendar_code, accounting_policy_version)
+            VALUES
+                ('%s', '00000000-0000-0000-0000-000000000023', 'NGN', 'Africa/Lagos', 'NG', 1)
+            """.formatted(SECOND_BOOK_ID));
+        execute(connection, """
+            INSERT INTO funds.chart_version
+                (chart_version_id, book_id, version, status, activated_at)
+            VALUES
+                ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+            """.formatted(SECOND_CHART_VERSION_ID, SECOND_BOOK_ID));
+    }
+
+    private void truncateReferenceTables() throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            execute(connection, """
+                TRUNCATE funds.account_identifier, funds.ledger_account, funds.accounting_period,
+                    funds.chart_version, funds.book, funds.product_version, funds.product_definition CASCADE
+                """);
+        }
     }
 
     private static String ledgerInsert(

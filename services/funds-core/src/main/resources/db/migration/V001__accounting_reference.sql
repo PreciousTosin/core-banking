@@ -48,7 +48,8 @@ CREATE TABLE funds.chart_version (
     version integer NOT NULL CHECK (version > 0),
     status text NOT NULL CHECK (status IN ('DRAFT','ACTIVE','RETIRED')),
     activated_at timestamptz,
-    UNIQUE (book_id, version)
+    UNIQUE (book_id, version),
+    UNIQUE (book_id, chart_version_id)
 );
 
 CREATE TABLE funds.accounting_period (
@@ -81,6 +82,21 @@ CREATE TABLE funds.product_version (
     CHECK (effective_to IS NULL OR effective_to > effective_from)
 );
 
+CREATE FUNCTION funds.reject_product_version_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RAISE EXCEPTION 'product versions are immutable; create a new version instead'
+        USING ERRCODE = '55000';
+END
+$function$;
+
+CREATE TRIGGER product_version_immutable
+BEFORE UPDATE OR DELETE ON funds.product_version
+FOR EACH ROW
+EXECUTE FUNCTION funds.reject_product_version_mutation();
+
 CREATE TABLE funds.ledger_account (
     account_id uuid PRIMARY KEY,
     book_id uuid NOT NULL REFERENCES funds.book(book_id),
@@ -97,9 +113,35 @@ CREATE TABLE funds.ledger_account (
     created_at timestamptz NOT NULL,
     closed_at timestamptz,
     UNIQUE (book_id, account_code, currency),
+    FOREIGN KEY (book_id, chart_version_id)
+        REFERENCES funds.chart_version(book_id, chart_version_id),
     CHECK ((account_scope = 'CUSTOMER' AND product_version_id IS NOT NULL)
         OR (account_scope <> 'CUSTOMER' AND product_version_id IS NULL))
 );
+
+CREATE FUNCTION funds.enforce_ledger_account_reference_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    IF NEW.account_scope IS DISTINCT FROM OLD.account_scope THEN
+        RAISE EXCEPTION 'ledger account scope is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.product_version_id IS DISTINCT FROM OLD.product_version_id THEN
+        RAISE EXCEPTION 'ledger account product version binding is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    RETURN NEW;
+END
+$function$;
+
+CREATE TRIGGER ledger_account_reference_immutable
+BEFORE UPDATE ON funds.ledger_account
+FOR EACH ROW
+EXECUTE FUNCTION funds.enforce_ledger_account_reference_immutability();
 
 CREATE TABLE funds.account_identifier (
     account_identifier_id uuid PRIMARY KEY,
@@ -118,7 +160,8 @@ CREATE TABLE funds.account_identifier (
     CHECK (valid_to IS NULL OR valid_to > valid_from),
     CHECK ((scheme = 'NUBAN' AND institution_code IS NOT NULL AND provider_id IS NULL
             AND normalised_value ~ '^[0-9]{10}$')
-        OR (scheme = 'PROVIDER_VIRTUAL_ACCOUNT' AND provider_id IS NOT NULL)
+        OR (scheme = 'PROVIDER_VIRTUAL_ACCOUNT' AND provider_id IS NOT NULL
+            AND institution_code IS NULL)
         OR (scheme = 'IBAN' AND false)),
     CHECK (scheme <> 'NUBAN' OR funds.is_valid_nuban(institution_code::text, normalised_value))
 );
@@ -149,14 +192,17 @@ CREATE FUNCTION funds.enforce_external_identifier_customer_scope()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
+DECLARE
+    referenced_account_scope text;
 BEGIN
+    SELECT account.account_scope
+    INTO referenced_account_scope
+    FROM funds.ledger_account account
+    WHERE account.account_id = NEW.account_id
+    FOR SHARE;
+
     IF NEW.routing_scope = 'EXTERNAL'
-       AND NOT EXISTS (
-           SELECT 1
-           FROM funds.ledger_account account
-           WHERE account.account_id = NEW.account_id
-             AND account.account_scope = 'CUSTOMER'
-       ) THEN
+       AND referenced_account_scope IS DISTINCT FROM 'CUSTOMER' THEN
         RAISE EXCEPTION 'external identifiers require a CUSTOMER ledger account'
             USING ERRCODE = '23514';
     END IF;
