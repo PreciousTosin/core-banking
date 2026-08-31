@@ -1,0 +1,9 @@
+FROM eclipse-temurin:25-jre
+WORKDIR /work
+COPY target/quarkus-app/lib/ /work/lib/
+COPY target/quarkus-app/*.jar /work/
+COPY target/quarkus-app/app/ /work/app/
+COPY target/quarkus-app/quarkus/ /work/quarkus/
+USER 10001
+ENV JAVA_TOOL_OPTIONS="-Xms128m -Xmx384m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m -Xss512k -XX:+ExitOnOutOfMemoryError"
+ENTRYPOINT ["java","-jar","/work/quarkus-run.jar"]
