@@ -135,8 +135,10 @@ class PostingConcurrencyIT {
         var observedDataSource = new ObservedDataSource(dataSource, 0);
         PostingService service = postingService(observedDataSource, observer);
         List<UUID> expectedCommands = new ArrayList<>(100);
+        List<Future<?>> futures = new ArrayList<>(100);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
 
-        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+        try {
             for (int pair = 0; pair < 50; pair++) {
                 int firstIndex = pair * 2;
                 int secondIndex = firstIndex + 1;
@@ -156,12 +158,16 @@ class PostingConcurrencyIT {
                 CountDownLatch ready = new CountDownLatch(2);
                 CountDownLatch start = new CountDownLatch(1);
                 Future<PostingResult> first = executor.submit(() -> postAfterStart(service, accountAB, ready, start));
+                futures.add(first);
                 Future<PostingResult> second = executor.submit(() -> postAfterStart(service, accountBA, ready, start));
+                futures.add(second);
                 assertTrue(ready.await(10, SECONDS), "reverse-order workers did not become ready");
                 start.countDown();
                 first.get(30, SECONDS);
                 second.get(30, SECONDS);
             }
+        } finally {
+            shutdownExecutor(executor, futures, "reverse-order executor");
         }
 
         List<UUID> canonicalAccounts = List.of(ACCOUNT_A, ACCOUNT_B).stream()
@@ -191,6 +197,55 @@ class PostingConcurrencyIT {
         }
     }
 
+    @Test
+    void boundedCleanupCancelsOutstandingFutureWithoutCallingExecutorClose() throws Exception {
+        ExecutorService delegate = Executors.newSingleThreadExecutor();
+        AtomicBoolean closeCalled = new AtomicBoolean();
+        ExecutorService executor = (ExecutorService) Proxy.newProxyInstance(
+            PostingConcurrencyIT.class.getClassLoader(),
+            new Class<?>[] {ExecutorService.class},
+            (proxy, method, arguments) -> {
+                if ("close".equals(method.getName())) {
+                    closeCalled.set(true);
+                    throw new AssertionError("bounded cleanup must not call ExecutorService.close()");
+                }
+                return invoke(delegate, method, arguments);
+            });
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch workerInterrupted = new CountDownLatch(1);
+        Future<?> future = executor.submit(() -> {
+            workerStarted.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException interrupted) {
+                workerInterrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+        });
+        List<Future<?>> futures = List.of(future);
+
+        try {
+            assertTrue(workerStarted.await(10, SECONDS), "cleanup-check worker did not start");
+            shutdownExecutor(executor, futures, "cleanup-check executor");
+            assertAll(
+                () -> assertTrue(future.isCancelled(), "outstanding future was not cancelled"),
+                () -> assertEquals(0, workerInterrupted.getCount(), "worker did not receive interruption"),
+                () -> assertTrue(delegate.isTerminated(), "executor did not terminate"),
+                () -> assertFalse(closeCalled.get(), "ExecutorService.close() was called"));
+        } finally {
+            if (!delegate.isTerminated()) {
+                future.cancel(true);
+                delegate.shutdownNow();
+                try {
+                    assertTrue(delegate.awaitTermination(10, SECONDS), "cleanup-check fallback did not terminate");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                }
+            }
+        }
+    }
+
     private List<Outcome> race(PostingCommand left, PostingCommand right) throws Exception {
         var observer = new FirstWriterGate(left.commandId());
         var observedDataSource = new ObservedDataSource(dataSource, 2);
@@ -198,9 +253,12 @@ class PostingConcurrencyIT {
         CountDownLatch ready = new CountDownLatch(2);
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(2);
-        Future<PostingResult> leftFuture = executor.submit(() -> postAfterStart(service, left, ready, start));
-        Future<PostingResult> rightFuture = executor.submit(() -> postAfterStart(service, right, ready, start));
+        List<Future<?>> futures = new ArrayList<>(2);
         try {
+            Future<PostingResult> leftFuture = executor.submit(() -> postAfterStart(service, left, ready, start));
+            futures.add(leftFuture);
+            Future<PostingResult> rightFuture = executor.submit(() -> postAfterStart(service, right, ready, start));
+            futures.add(rightFuture);
             assertTrue(ready.await(10, SECONDS), "racing workers did not become ready");
             start.countDown();
             assertTrue(observer.awaitWinner(), "no worker acquired the idempotency row");
@@ -219,8 +277,28 @@ class PostingConcurrencyIT {
             return List.of(outcome(leftFuture), outcome(rightFuture));
         } finally {
             observer.releaseWinner();
-            executor.shutdownNow();
-            assertTrue(executor.awaitTermination(10, SECONDS), "race executor did not terminate");
+            shutdownExecutor(executor, futures, "race executor");
+        }
+    }
+
+    private static void shutdownExecutor(
+        ExecutorService executor,
+        List<? extends Future<?>> futures,
+        String description
+    ) {
+        for (Future<?> future : futures) {
+            if (!future.isDone()) {
+                future.cancel(true);
+            }
+        }
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(10, SECONDS)) {
+                throw new AssertionError(description + " did not terminate within 10 seconds");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(description + " cleanup was interrupted", interrupted);
         }
     }
 

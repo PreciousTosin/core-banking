@@ -141,3 +141,63 @@ Testcontainers emitted its existing INFO-level unauthenticated-registry fallback
 ## Concerns
 
 None. The concurrency test intentionally uses PostgreSQL backend-state observation and JDBC proxies because transaction waiting and SQL bind order are the behaviors under proof; it introduces no production sleeps or test-only production branches.
+
+## Review fix round 1: bounded executor cleanup
+
+The reverse-order proof no longer uses Java 25's `ExecutorService.close()`, whose termination wait is unbounded. Both the 100-journal executor and the same-key race executor now:
+
+- retain every submitted future as soon as submission succeeds;
+- cancel every outstanding future with interruption during cleanup;
+- call `shutdownNow()` in `finally`;
+- wait at most 10 seconds for termination and raise a description-specific `AssertionError` if workers remain;
+- restore the current thread's interrupt status before raising a cleanup assertion when `awaitTermination` is interrupted.
+
+The 100-journal workload, per-future 30-second result bounds, canonical lock assertions, and independently replayed totals are unchanged.
+
+### Fix RED evidence
+
+A mutation-oriented test was added first. It runs an outstanding interruptible worker through an `ExecutorService` proxy whose `close()` throws immediately, then requires cancellation, worker interruption, and bounded termination. Before the cleanup helper existed, the focused build failed as expected:
+
+```text
+[ERROR] COMPILATION ERROR
+PostingConcurrencyIT.java:[223,13] cannot find symbol
+  symbol: method shutdownExecutor(ExecutorService,List<Future<?>>,String)
+[INFO] BUILD FAILURE
+```
+
+This test fails immediately if cleanup calls `close()`, fails if outstanding futures are not cancelled, and fails after the explicit 10-second bound if shutdown/termination handling is removed; it cannot turn a close mutation into an unbounded test hang.
+
+### Fix focused GREEN evidence
+
+Command:
+
+```bash
+cd services/funds-core
+newgrp docker -c 'for run in 1 2 3 4 5; do env JAVA_HOME=/tmp/core-banking-mise/installs/java/25.0.2 PATH=/tmp/core-banking-mise/installs/java/25.0.2/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin ./mvnw -Dmaven.repo.local=/tmp/core-banking-m2 -Dtest=PostingConcurrencyIT test || exit 1; done'
+```
+
+Result: five consecutive `BUILD SUCCESS` runs, each reporting:
+
+```text
+Tests run: 4, Failures: 0, Errors: 0, Skipped: 0
+```
+
+All five runs used `postgres:18.6-bookworm` and reported PostgreSQL 18.6.
+
+### Fix full-suite and scan evidence
+
+The full Java 25 suite, run after the five focused passes with the same provisioned toolchain/cache and Docker command shown above, reported:
+
+```text
+Tests run: 97, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+LedgerConstraintIT PostgreSQL server_version=18.6 (Debian 18.6-1.pgdg12+2)
+MigrationIT PostgreSQL server_version=18.6 (Debian 18.6-1.pgdg12+2)
+```
+
+The final Maven output contained no `WARN`/`WARNING` lines, and the Surefire failure/warning scan returned no matches. These lifecycle source scans also returned no matches:
+
+```bash
+rg -n 'try \(ExecutorService|executor\.close\(' src/test/java/com/corebanking/funds/application/PostingConcurrencyIT.java
+rg -n 'Thread\.sleep|pg_sleep|CyclicBarrier' src/test/java/com/corebanking/funds/application/PostingConcurrencyIT.java
+```
