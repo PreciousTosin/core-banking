@@ -4,7 +4,8 @@ status: current
 owners:
   - architecture
 last_verified: 2026-09-01
-related_adrs: []
+related_adrs:
+  - ADR-0008
 code_refs:
   - services/funds-core/Dockerfile.jvm
   - services/funds-core/scripts/prod-runtime-smoke.sh

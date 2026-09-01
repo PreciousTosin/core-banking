@@ -4,7 +4,12 @@ status: current
 owners:
   - architecture
 last_verified: 2026-09-01
-related_adrs: []
+related_adrs:
+  - ADR-0002
+  - ADR-0003
+  - ADR-0004
+  - ADR-0006
+  - ADR-0007
 code_refs:
   - services/funds-core/src/main/java/com/corebanking/funds/domain/
   - services/funds-core/src/main/java/com/corebanking/funds/application/

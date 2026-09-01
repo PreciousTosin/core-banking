@@ -4,7 +4,9 @@ status: current
 owners:
   - architecture
 last_verified: 2026-09-01
-related_adrs: []
+related_adrs:
+  - ADR-0007
+  - ADR-0008
 code_refs:
   - services/funds-core/README.md
   - infrastructure/kubernetes/

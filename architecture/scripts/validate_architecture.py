@@ -3,6 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 import html
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"links", "metadata", "migration", "structure"})
+CHECKS = frozenset({"adrs", "links", "metadata", "migration", "structure"})
 
 MIGRATION_SOURCE = "architecture/modern-core-banking-comprehensive-design-revised.md"
 MIGRATION_INVENTORY = "architecture/archive/comprehensive-design-migration-inventory.md"
@@ -736,8 +737,585 @@ def validate_migration_inventory(root: Path) -> list[str]:
                 errors.append(_migration_error(f"unexpected migration marker ({path_name}, {anchor or 'no-anchor'}, {source_key})"))
     return sorted(set(errors))
 
+ADR_STATUSES = frozenset({"Proposed", "Accepted", "Rejected", "Superseded", "Deprecated"})
+ADR_IMPLEMENTATION_STATUSES = frozenset({"Not started", "Partial", "Complete", "Not applicable"})
+ADR_FIELDS = (
+    "Status",
+    "Retrospective",
+    "Decision date",
+    "Deciders",
+    "Scope",
+    "Implementation status",
+    "Related proposals",
+    "Related implementation plans",
+    "Related pull requests",
+    "Related commits",
+    "Related architecture sections",
+    "Supersedes",
+    "Superseded by",
+)
+ADR_RELATIONSHIP_FIELDS = (
+    "Related proposals",
+    "Related implementation plans",
+    "Related pull requests",
+    "Related commits",
+    "Related architecture sections",
+    "Supersedes",
+    "Superseded by",
+)
+ADR_SUBSTANTIVE_HEADINGS = (
+    "## Context",
+    "## Decision drivers",
+    "## Considered options",
+    "## Decision",
+    "## Consequences",
+    "### Positive",
+    "### Negative",
+    "### Risks",
+    "## Compliance and verification",
+    "## Implementation evidence",
+)
+ADR_PROTECTED_SECTIONS = (
+    "## Context",
+    "## Decision drivers",
+    "## Considered options",
+    "## Decision",
+    "## Consequences",
+)
+ADR_EVIDENCE_LOCAL_RE = re.compile(
+    r"^- ([0-9a-f]{40}) (changed|snapshot): ([^;\n]+(?:; [^;\n]+)*)$"
+)
+ADR_EVIDENCE_PR_RE = re.compile(
+    r"^- https://github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)$", re.I
+)
+ADR_PATH_RE = re.compile(r"^(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$")
+ADR_BOOTSTRAP_PATH = "architecture/adr/0001-manage-architecture-as-versioned-code.md"
+ADR_BOOTSTRAP_TITLE = "# ADR-0001: Manage architecture as versioned code"
+ADR_BOOTSTRAP_DATE = "2026-09-01"
+ADR_BOOTSTRAP_SCOPE = "Architecture documentation and ADR framework governance"
+ADR_BOOTSTRAP_PLAN = "[Architecture Documentation and ADR Framework Implementation Plan](../../docs/superpowers/plans/2026-09-01-architecture-documentation-and-adr-framework-implementation.md)"
+ADR_BOOTSTRAP_PLAN_PATH = "docs/superpowers/plans/2026-09-01-architecture-documentation-and-adr-framework-implementation.md"
+ADR_BOOTSTRAP_PLAN_HEADER = "**Governing ADR:** [ADR-0001: Manage architecture as versioned code](../../../architecture/adr/0001-manage-architecture-as-versioned-code.md)"
+ADR_BOOTSTRAP_EVIDENCE = "- 0e46650dcb382bf4ddc040e0ec73e98675dff40b changed: docs/superpowers/specs/2026-09-01-architecture-documentation-and-adr-framework-design.md"
+ADR_BOOTSTRAP_DESIGN_HASH = "0e46650dcb382bf4ddc040e0ec73e98675dff40b"
+ADR_BOOTSTRAP_DESIGN_PATH = "docs/superpowers/specs/2026-09-01-architecture-documentation-and-adr-framework-design.md"
+
+@dataclass(frozen=True)
+class AdrRecord:
+    path: str
+    raw: bytes
+    title: str
+    identifier: str
+    number: int
+    fields: dict[str, str]
+    sections: dict[str, str]
+
+def _adr_error(path: str, message: str) -> str:
+    return f"{path}: {message}"
+
+def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+def _resolve_commit(root: Path, ref: str) -> tuple[str | None, str | None]:
+    result = _run_git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    commit = result.stdout.strip()
+    if result.returncode or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        return None, f"ADR Git ref does not resolve to a commit: {ref}"
+    return commit, None
+
+def _kebab_title(value: str) -> str:
+    value = value.casefold().replace("'", "")
+    return re.sub(r"^-|-$", "", re.sub(r"[^a-z0-9]+", "-", value))
+
+def _section_bodies(text: str) -> dict[str, str]:
+    lines = text.splitlines()
+    headings = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(#{2,3})\s+.+?\s*$", line)
+        if match:
+            headings.append((index, len(match.group(1)), line.strip()))
+    sections = {}
+    for position, (start, level, heading) in enumerate(headings):
+        end = len(lines)
+        for later_start, later_level, _ in headings[position + 1:]:
+            if later_level <= level:
+                end = later_start
+                break
+        sections[heading] = "\n".join(line.rstrip() for line in lines[start + 1:end]).strip()
+    return sections
+
+def _parse_adr(path: str, raw: bytes) -> AdrRecord | None:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    lines = text.splitlines()
+    title = lines[0].strip() if lines else ""
+    match = re.fullmatch(r"# (ADR-(\d{4})): (.+)", title)
+    if not match:
+        identifier, number = "", -1
+    else:
+        identifier, number = match.group(1), int(match.group(2))
+    fields = {}
+    for line in lines[1:]:
+        if line.startswith("## "):
+            break
+        field = re.match(r"^- ([A-Za-z ]+):\s*(.*)$", line)
+        if field:
+            fields[field.group(1)] = field.group(2).strip()
+    return AdrRecord(path, raw, title, identifier, number, fields, _section_bodies(text))
+
+def _adr_paths_filesystem(root: Path) -> dict[str, bytes]:
+    directory = root / "architecture/adr"
+    if not directory.is_dir():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(directory.glob("[0-9][0-9][0-9][0-9]-*.md"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+def _adr_paths_commit(root: Path, commit: str) -> dict[str, bytes]:
+    listing = _run_git(root, "ls-tree", "-r", "--name-only", commit, "--", "architecture/adr")
+    if listing.returncode:
+        return {}
+    result = {}
+    for path in listing.stdout.splitlines():
+        if not re.fullmatch(r"architecture/adr/[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*\.md", path):
+            continue
+        shown = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if shown.returncode == 0:
+            result[path] = shown.stdout
+    return result
+
+def _relationship_sequence(value: str) -> tuple[str, ...]:
+    if value == "None":
+        return ()
+    return tuple(item.strip() for item in value.split(";") if item.strip())
+
+def _body_sequence(body: str) -> tuple[str, ...]:
+    if body == "None":
+        return ()
+    return tuple(line.rstrip() for line in body.splitlines() if line.strip())
+
+def _is_prefix(parent: tuple[str, ...], child: tuple[str, ...]) -> bool:
+    return len(child) >= len(parent) and child[:len(parent)] == parent
+
+def _changed_paths(root: Path, commit: str) -> set[str] | None:
+    parents_result = _run_git(root, "rev-list", "--parents", "-n", "1", commit)
+    if parents_result.returncode:
+        return None
+    parts = parents_result.stdout.split()
+    parents = parts[1:]
+    if not parents:
+        diff = _run_git(root, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit)
+        return set(diff.stdout.splitlines()) if diff.returncode == 0 else None
+    changed = set()
+    for parent in parents:
+        diff = _run_git(root, "diff", "--name-only", "--no-renames", parent, commit)
+        if diff.returncode:
+            return None
+        changed.update(diff.stdout.splitlines())
+    return changed
+
+def _github_origin(root: Path) -> tuple[str, str] | None:
+    result = _run_git(root, "config", "--get", "remote.origin.url")
+    if result.returncode:
+        return None
+    value = result.stdout.strip()
+    match = re.fullmatch(r"git@github\.com:([^/]+)/(.+?)(?:\.git)?", value, re.I)
+    if not match:
+        match = re.fullmatch(r"https://github\.com/([^/]+)/(.+?)(?:\.git)?/?", value, re.I)
+    if not match:
+        return None
+    repository = match.group(2)
+    if repository.casefold().endswith(".git"):
+        repository = repository[:-4]
+    return match.group(1).casefold(), repository.casefold()
+
+def _evidence_entries(record: AdrRecord) -> tuple[list[tuple[str, str, tuple[str, ...]]], list[tuple[str, str]], list[str]]:
+    local = []
+    pull_requests = []
+    invalid = []
+    body = record.sections.get("## Implementation evidence", "")
+    if body == "None":
+        return local, pull_requests, invalid
+    for line in (line.strip() for line in body.splitlines() if line.strip()):
+        match = ADR_EVIDENCE_LOCAL_RE.fullmatch(line)
+        if match:
+            paths = tuple(item.strip() for item in match.group(3).split(";"))
+            if any(not item or Path(item).is_absolute() or ".." in Path(item).parts for item in paths):
+                invalid.append(line)
+            else:
+                local.append((match.group(1), match.group(2), paths))
+            continue
+        pr = ADR_EVIDENCE_PR_RE.fullmatch(line)
+        if pr:
+            pull_requests.append((pr.group(1), pr.group(2)))
+        else:
+            invalid.append(line)
+    return local, pull_requests, invalid
+
+def _validate_evidence(root: Path, record: AdrRecord) -> list[str]:
+    errors = []
+    local, pull_requests, invalid = _evidence_entries(record)
+    for line in invalid:
+        errors.append(_adr_error(record.path, f"Implementation evidence entry is invalid: {line}"))
+    for commit, mode, paths in local:
+        exists = _run_git(root, "cat-file", "-e", f"{commit}^{{commit}}")
+        if exists.returncode:
+            errors.append(_adr_error(record.path, f"evidence hash does not resolve to a commit: {commit}"))
+            continue
+        changed = _changed_paths(root, commit) if mode == "changed" else None
+        for evidence_path in paths:
+            tree = _run_git(root, "cat-file", "-e", f"{commit}:{evidence_path}")
+            if tree.returncode:
+                errors.append(_adr_error(record.path, f"evidence path does not exist at {commit}: {evidence_path}"))
+            elif mode == "changed" and changed is not None and evidence_path not in changed:
+                errors.append(_adr_error(record.path, f"evidence path was not changed by {commit}: {evidence_path}"))
+    origin = _github_origin(root)
+    for owner, repository in pull_requests:
+        if origin != (owner.casefold(), repository.casefold()):
+            errors.append(_adr_error(record.path, "pull-request evidence does not match a normalized GitHub origin"))
+    return errors
+
+def _resolve_markdown_targets(record: AdrRecord, field: str, root: Path) -> list[Path]:
+    targets = []
+    for item in _relationship_sequence(record.fields.get(field, "")):
+        links = extract_markdown_links(item)
+        if len(links) != 1:
+            continue
+        local = _local_destination(links[0].destination)
+        if local is None:
+            continue
+        destination, _ = local
+        targets.append(((root / record.path).parent / destination).resolve())
+    return targets
+
+def validate_adrs(root: Path) -> list[str]:
+    root = root.resolve()
+    raw_records = _adr_paths_filesystem(root)
+    records = []
+    errors = []
+    for path, raw in raw_records.items():
+        record = _parse_adr(path, raw)
+        if record is None:
+            errors.append(_adr_error(path, "ADR must be UTF-8 Markdown"))
+            continue
+        records.append(record)
+        filename = Path(path).name
+        match = ADR_PATH_RE.fullmatch(filename)
+        if not match or record.number != int(match.group(1)) or not record.identifier or _kebab_title(record.title.split(":", 1)[-1].strip()) != match.group(2):
+            errors.append(_adr_error(path, "ADR filename/title must agree on number and kebab-case title"))
+        for field in ADR_FIELDS:
+            if field not in record.fields or not record.fields[field]:
+                errors.append(_adr_error(path, f"{field} is required"))
+        if record.fields.get("Status") not in ADR_STATUSES:
+            errors.append(_adr_error(path, "Status must be one of Proposed, Accepted, Rejected, Superseded, Deprecated"))
+        if record.fields.get("Retrospective") not in {"Yes", "No"}:
+            errors.append(_adr_error(path, "Retrospective must be Yes or No"))
+        if record.fields.get("Implementation status") not in ADR_IMPLEMENTATION_STATUSES:
+            errors.append(_adr_error(path, "Implementation status must be one of Not started, Partial, Complete, Not applicable"))
+        decision_date = record.fields.get("Decision date", "")
+        try:
+            date.fromisoformat(decision_date)
+        except ValueError:
+            errors.append(_adr_error(path, "Decision date must use ISO YYYY-MM-DD"))
+        for field in ADR_RELATIONSHIP_FIELDS:
+            value = record.fields.get(field, "")
+            if value != "None" and not _relationship_sequence(value):
+                errors.append(_adr_error(path, f"{field} must be None or a non-empty ordered sequence"))
+        for heading in ADR_SUBSTANTIVE_HEADINGS:
+            if not record.sections.get(heading, "").strip():
+                errors.append(_adr_error(path, f"{heading} must not be empty"))
+        heading_lines = [line.strip() for line in raw.decode("utf-8").splitlines() if line.strip() in ADR_SUBSTANTIVE_HEADINGS]
+        if heading_lines != list(ADR_SUBSTANTIVE_HEADINGS):
+            errors.append(_adr_error(path, "ADR substantive headings must occur once in the required order"))
+        for field in ("Related architecture sections", "Related implementation plans"):
+            value = record.fields.get(field, "")
+            if value != "None":
+                for item in _relationship_sequence(value):
+                    links = extract_markdown_links(item)
+                    if len(links) != 1 or not re.fullmatch(r"\[[^]]+\]\((?:<[^>]+>|[^\s)]+)\)", item):
+                        errors.append(_adr_error(path, f"{field} must contain exact Markdown-link items separated by semicolon-space"))
+        evidence_body = record.sections.get("## Implementation evidence", "")
+        implementation = record.fields.get("Implementation status")
+        if evidence_body == "None" and implementation not in {"Not started", "Not applicable"}:
+            errors.append(_adr_error(path, "Implementation evidence may be None only for Not started or Not applicable"))
+        if evidence_body != "None" and implementation in {"Partial", "Complete"} and not _body_sequence(evidence_body):
+            errors.append(_adr_error(path, "Partial and Complete require implementation evidence"))
+        local, prs, invalid = _evidence_entries(record)
+        if evidence_body != "None" and not local and not prs:
+            errors.append(_adr_error(path, "Implementation evidence entry must use an exact path-bound local or pull-request form"))
+        if invalid:
+            for line in invalid:
+                errors.append(_adr_error(path, f"Implementation evidence entry is invalid: {line}"))
+        errors.extend(_validate_evidence(root, record))
+        if 1 <= record.number <= 8 and record.fields.get("Related architecture sections") == "None":
+            errors.append(_adr_error(path, "foundational ADR must link at least one architecture section"))
+
+    numbers = sorted(record.number for record in records if record.number >= 0)
+    if numbers and numbers != list(range(numbers[0], numbers[-1] + 1)):
+        errors.append("architecture/adr: ADR numbering must be contiguous")
+    by_id = {record.identifier: record for record in records if record.identifier}
+
+    arc42_dir = (root / "architecture/arc42").resolve()
+    for record in records:
+        for target in _resolve_markdown_targets(record, "Related architecture sections", root):
+            try:
+                relative = target.relative_to(arc42_dir)
+            except ValueError:
+                errors.append(_adr_error(record.path, f"architecture-section link is outside architecture/arc42: {target}")); continue
+            if not target.is_file() or target.parent != arc42_dir or target.suffix != ".md":
+                errors.append(_adr_error(record.path, f"architecture-section target does not exist: {relative.as_posix()}")); continue
+            related = parse_front_matter(target).get("related_adrs", [])
+            values = related if isinstance(related, list) else [related]
+            if record.identifier not in values:
+                errors.append(_adr_error(record.path, f"{target.relative_to(root).as_posix()} does not list {record.identifier}"))
+    if arc42_dir.is_dir():
+        for arc in sorted(arc42_dir.glob("*.md")):
+            related = parse_front_matter(arc).get("related_adrs", [])
+            for identifier in related if isinstance(related, list) else [related]:
+                record = by_id.get(identifier)
+                if record is None:
+                    errors.append(f"{arc.relative_to(root).as_posix()}: related_adrs references missing ADR target {identifier}")
+                elif arc.resolve() not in _resolve_markdown_targets(record, "Related architecture sections", root):
+                    errors.append(f"{arc.relative_to(root).as_posix()}: {identifier} does not link back to this exact architecture section")
+
+    plans_dir = (root / "docs/superpowers/plans").resolve()
+    adr_dir = (root / "architecture/adr").resolve()
+    for record in records:
+        for target in _resolve_markdown_targets(record, "Related implementation plans", root):
+            try:
+                target.relative_to(plans_dir)
+            except ValueError:
+                errors.append(_adr_error(record.path, f"implementation plan link is outside docs/superpowers/plans: {target}")); continue
+            if not target.is_file():
+                errors.append(_adr_error(record.path, f"implementation plan target does not exist: {target.name}")); continue
+            backlink = False
+            for destination in extract_markdown_destinations(target.read_text()):
+                local = _local_destination(destination)
+                if local is not None and (target.parent / local[0]).resolve() == (root / record.path).resolve():
+                    backlink = True
+            if not backlink:
+                errors.append(_adr_error(record.path, f"implementation plan does not link back to {record.identifier}: {target.relative_to(root).as_posix()}"))
+    if plans_dir.is_dir():
+        for plan in sorted(plans_dir.glob("*.md")):
+            for destination in extract_markdown_destinations(plan.read_text()):
+                local = _local_destination(destination)
+                if local is None:
+                    continue
+                target = (plan.parent / local[0]).resolve()
+                try:
+                    target.relative_to(adr_dir)
+                except ValueError:
+                    continue
+                if not target.is_file():
+                    errors.append(f"{plan.relative_to(root).as_posix()}: direct ADR target does not exist: {local[0]}"); continue
+                target_record = next((record for record in records if (root / record.path).resolve() == target), None)
+                if target_record and plan.resolve() not in _resolve_markdown_targets(target_record, "Related implementation plans", root):
+                    errors.append(f"{plan.relative_to(root).as_posix()}: ADR backlink is missing for {target_record.identifier}")
+
+    framework_plan = root / ADR_BOOTSTRAP_PLAN_PATH
+    bootstrap = by_id.get("ADR-0001")
+    if framework_plan.is_file() or (bootstrap and bootstrap.fields.get("Related implementation plans") == ADR_BOOTSTRAP_PLAN):
+        if bootstrap is None or bootstrap.fields.get("Related implementation plans") != ADR_BOOTSTRAP_PLAN:
+            errors.append(f"{ADR_BOOTSTRAP_PATH}: ADR-0001 must name the exact framework implementation plan")
+        if not framework_plan.is_file():
+            errors.append(f"{ADR_BOOTSTRAP_PLAN_PATH}: framework implementation plan is required")
+        elif _mask_markdown_code(framework_plan.read_text()).splitlines().count(ADR_BOOTSTRAP_PLAN_HEADER) != 1:
+            errors.append(f"{ADR_BOOTSTRAP_PLAN_PATH}: framework plan must contain exactly one governing ADR-0001 header")
+
+    graph = {}
+    for record in records:
+        successors = _relationship_sequence(record.fields.get("Superseded by", "None"))
+        predecessors = _relationship_sequence(record.fields.get("Supersedes", "None"))
+        if len(successors) > 1:
+            errors.append(_adr_error(record.path, "a predecessor may name only one successor"))
+        for field, targets in (("Superseded by", successors), ("Supersedes", predecessors)):
+            for target_id in targets:
+                if target_id == record.identifier:
+                    errors.append(_adr_error(record.path, f"{field} self-reference is forbidden")); continue
+                target = by_id.get(target_id)
+                if target is None:
+                    errors.append(_adr_error(record.path, f"{field} names missing ADR target {target_id}")); continue
+                if field == "Superseded by":
+                    graph[record.identifier] = target_id
+                    if record.fields.get("Status") != "Superseded": errors.append(_adr_error(record.path, "a predecessor with Superseded by must be Superseded"))
+                    if target.fields.get("Status") != "Accepted": errors.append(_adr_error(record.path, f"successor {target_id} must be Accepted"))
+                    if record.identifier not in _relationship_sequence(target.fields.get("Supersedes", "None")): errors.append(_adr_error(record.path, f"non-reciprocal supersession edge to {target_id}"))
+                else:
+                    graph[target_id] = record.identifier
+                    if target.fields.get("Superseded by") != record.identifier: errors.append(_adr_error(record.path, f"non-reciprocal supersession edge from {target_id}"))
+        if record.fields.get("Status") == "Deprecated" and successors:
+            errors.append(_adr_error(record.path, "Deprecated records must not name a superseding ADR"))
+    for start in sorted(graph):
+        seen = set(); current = start
+        while current in graph:
+            if current in seen:
+                errors.append("architecture/adr: supersession graph contains a cycle")
+                break
+            seen.add(current); current = graph[current]
+    return sorted(set(errors))
+
+def _qualified_historical_introduction(root: Path, record: AdrRecord, base_commit: str, child_commit: str | None) -> bool:
+    if record.fields.get("Retrospective") != "Yes":
+        return False
+    local, _, invalid = _evidence_entries(record)
+    if invalid:
+        return False
+    for commit, _mode, _paths in local:
+        if _validate_evidence(root, record):
+            return False
+        comparison = child_commit or base_commit
+        if commit == child_commit:
+            continue
+        ancestor = _run_git(root, "merge-base", "--is-ancestor", commit, comparison)
+        if ancestor.returncode == 0:
+            return True
+    return False
+
+def _bootstrap_introduction(root: Path, record: AdrRecord, base_commit: str, child_commit: str | None) -> bool:
+    if not (
+        record.path == ADR_BOOTSTRAP_PATH
+        and record.title == ADR_BOOTSTRAP_TITLE
+        and record.fields.get("Status") == "Accepted"
+        and record.fields.get("Retrospective") == "No"
+        and record.fields.get("Decision date") == ADR_BOOTSTRAP_DATE
+        and record.fields.get("Related implementation plans") == ADR_BOOTSTRAP_PLAN
+        and record.fields.get("Scope") == ADR_BOOTSTRAP_SCOPE
+        and _body_sequence(record.sections.get("## Implementation evidence", ""))[:1] == (ADR_BOOTSTRAP_EVIDENCE,)
+    ):
+        return False
+    if _validate_evidence(root, record):
+        return False
+    comparison = child_commit or base_commit
+    if ADR_BOOTSTRAP_DESIGN_HASH == child_commit:
+        return False
+    if _run_git(root, "merge-base", "--is-ancestor", ADR_BOOTSTRAP_DESIGN_HASH, comparison).returncode:
+        return False
+    design = _run_git(root, "show", f"{ADR_BOOTSTRAP_DESIGN_HASH}:{ADR_BOOTSTRAP_DESIGN_PATH}")
+    return design.returncode == 0 and "**Status:** Approved design" in design.stdout.splitlines()
+
+def _validate_adr_edge(root: Path, parent_commit: str, child_commit: str | None) -> list[str]:
+    parent_raw = _adr_paths_commit(root, parent_commit)
+    child_raw = _adr_paths_commit(root, child_commit) if child_commit else _adr_paths_filesystem(root)
+    parent_records = {path: _parse_adr(path, raw) for path, raw in parent_raw.items()}
+    child_records = {path: _parse_adr(path, raw) for path, raw in child_raw.items()}
+    errors = []
+    allowed = {
+        "Proposed": {"Proposed", "Accepted", "Rejected"},
+        "Accepted": {"Accepted", "Superseded", "Deprecated"},
+        "Superseded": {"Superseded"},
+        "Deprecated": {"Deprecated"},
+        "Rejected": {"Rejected"},
+    }
+    protected = {"Accepted", "Superseded", "Deprecated"}
+    for path, parent in parent_records.items():
+        if parent is None:
+            continue
+        child = child_records.get(path)
+        parent_status = parent.fields.get("Status", "")
+        if child is None:
+            if parent_status in protected | {"Rejected"}:
+                errors.append(_adr_error(path, f"{parent_status} ADR was deleted or renamed"))
+            continue
+        child_status = child.fields.get("Status", "")
+        if child_status not in allowed.get(parent_status, set()):
+            errors.append(_adr_error(path, f"forbidden ADR status edge {parent_status} -> {child_status}"))
+        if parent_status == "Rejected":
+            if parent.raw != child.raw:
+                errors.append(_adr_error(path, "Rejected record must remain byte-identical at the same path"))
+            continue
+        if parent_status == "Proposed":
+            continue
+        if parent_status in protected:
+            for heading in ADR_PROTECTED_SECTIONS:
+                if parent.sections.get(heading, "") != child.sections.get(heading, ""):
+                    excerpt = child.sections.get(heading, "").splitlines()[0] if child.sections.get(heading, "") else "empty"
+                    errors.append(_adr_error(path, f"immutable section changed: {heading} ({excerpt})"))
+            mutable_fields = set(ADR_RELATIONSHIP_FIELDS) | {"Status", "Implementation status"}
+            if parent.title != child.title:
+                errors.append(_adr_error(path, "accepted ADR title changed"))
+            for field in (set(parent.fields) | set(child.fields)) - mutable_fields:
+                if parent.fields.get(field) != child.fields.get(field):
+                    errors.append(_adr_error(path, f"accepted ADR field changed: {field}"))
+            parent_impl = parent.fields.get("Implementation status", "")
+            child_impl = child.fields.get("Implementation status", "")
+            if parent_impl == "Not applicable" or child_impl == "Not applicable":
+                if parent_impl != child_impl:
+                    errors.append(_adr_error(path, f"implementation status cannot change {parent_impl} -> {child_impl}"))
+            else:
+                order = {"Not started": 0, "Partial": 1, "Complete": 2}
+                if parent_impl not in order or child_impl not in order or order[child_impl] < order[parent_impl]:
+                    errors.append(_adr_error(path, f"implementation status cannot regress {parent_impl} -> {child_impl}"))
+            for field in ADR_RELATIONSHIP_FIELDS:
+                if not _is_prefix(_relationship_sequence(parent.fields.get(field, "None")), _relationship_sequence(child.fields.get(field, "None"))):
+                    errors.append(_adr_error(path, f"append-only sequence changed: {field}"))
+            for heading in ("## Compliance and verification", "## Implementation evidence"):
+                if not _is_prefix(_body_sequence(parent.sections.get(heading, "None")), _body_sequence(child.sections.get(heading, "None"))):
+                    errors.append(_adr_error(path, f"append-only sequence changed: {heading}"))
+            mutable_sections = set(ADR_PROTECTED_SECTIONS) | {"## Compliance and verification", "## Implementation evidence", "### Positive", "### Negative", "### Risks"}
+            for heading in (set(parent.sections) | set(child.sections)) - mutable_sections:
+                if parent.sections.get(heading) != child.sections.get(heading):
+                    errors.append(_adr_error(path, f"accepted ADR section changed: {heading}"))
+            errors.extend(_validate_evidence(root, child))
+    for path, child in child_records.items():
+        if path in parent_records or child is None:
+            continue
+        status = child.fields.get("Status")
+        if status == "Proposed":
+            continue
+        if status in {"Accepted", "Rejected"} and _qualified_historical_introduction(root, child, parent_commit, child_commit):
+            continue
+        if status == "Accepted" and _bootstrap_introduction(root, child, parent_commit, child_commit):
+            continue
+        errors.append(_adr_error(path, f"new ADR must be Proposed; unqualified direct introduction as {status or 'unknown'} is forbidden"))
+    return sorted(set(errors))
+
+def validate_accepted_adr_immutability(root: Path, base_ref: str, head_ref: str | None = None) -> list[str]:
+    base_commit, error = _resolve_commit(root, base_ref)
+    if error:
+        return [error]
+    head_commit = None
+    if head_ref is not None:
+        head_commit, error = _resolve_commit(root, head_ref)
+        if error:
+            return [error]
+    return _validate_adr_edge(root, base_commit, head_commit)
+
+def validate_accepted_adr_edge_range(root: Path, range_base: str, range_head: str) -> list[str]:
+    base_commit, base_error = _resolve_commit(root, range_base)
+    head_commit, head_error = _resolve_commit(root, range_head)
+    errors = [error for error in (base_error, head_error) if error]
+    if errors:
+        return errors
+    if _run_git(root, "merge-base", "--is-ancestor", base_commit, head_commit).returncode:
+        return [f"ADR edge range base is not an ancestor of head: {base_commit}..{head_commit}"]
+    history = _run_git(root, "rev-list", "--reverse", "--topo-order", "--parents", f"{base_commit}..{head_commit}")
+    if history.returncode:
+        return [f"unable to enumerate ADR edge range {base_commit}..{head_commit}"]
+    for line in history.stdout.splitlines():
+        parts = line.split()
+        child, parents = parts[0], parts[1:]
+        for parent in parents:
+            for diagnostic in _validate_adr_edge(root, parent, child):
+                errors.append(f"{parent} -> {child}: {diagnostic}")
+    return sorted(set(errors))
+
 Validator = Callable[[Path], list[str]]
-VALIDATORS: dict[str, Validator] = {"links": validate_links, "metadata": validate_metadata, "migration": validate_migration_inventory, "structure": validate_structure}
+VALIDATORS: dict[str, Validator] = {"adrs": validate_adrs, "links": validate_links, "metadata": validate_metadata, "migration": validate_migration_inventory, "structure": validate_structure}
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
     errors = []
@@ -748,11 +1326,23 @@ def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, default=Path(".")); parser.add_argument("--checks")
-    args = parser.parse_args(argv); checks = frozenset(args.checks.split(",")) if args.checks else CHECKS
+    parser.add_argument("--adr-base-ref"); parser.add_argument("--adr-head-ref")
+    parser.add_argument("--adr-edge-base-ref"); parser.add_argument("--adr-edge-head-ref")
+    args = parser.parse_args(argv)
+    if bool(args.adr_edge_base_ref) != bool(args.adr_edge_head_ref):
+        print("--adr-edge-base-ref and --adr-edge-head-ref must be provided together", file=sys.stderr); return 2
+    if args.adr_head_ref and not args.adr_base_ref:
+        print("--adr-head-ref requires --adr-base-ref", file=sys.stderr); return 2
+    git_aware = bool(args.adr_base_ref or args.adr_edge_base_ref)
+    checks = frozenset(args.checks.split(",")) if args.checks else (frozenset() if git_aware else CHECKS)
     unknown = sorted(checks - CHECKS)
     if unknown:
         print("unknown validation check(s): " + ", ".join(unknown), file=sys.stderr); return 2
     errors = validate_repository(args.root, checks)
+    if args.adr_base_ref:
+        errors.extend(validate_accepted_adr_immutability(args.root, args.adr_base_ref, args.adr_head_ref))
+    if args.adr_edge_base_ref:
+        errors.extend(validate_accepted_adr_edge_range(args.root, args.adr_edge_base_ref, args.adr_edge_head_ref))
     if errors:
         print("\n".join(errors), file=sys.stderr); return 1
     print("architecture validation passed"); return 0

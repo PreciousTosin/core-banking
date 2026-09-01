@@ -1,5 +1,7 @@
 import tempfile
+import subprocess
 import unittest
+import os
 from pathlib import Path
 
 from architecture.scripts import validate_architecture as validator
@@ -592,6 +594,455 @@ class ValidatorTest(unittest.TestCase):
         self.write_inventory(rows)
         errors = validator.validate_migration_inventory(self.root)
         self.assertFalse(any("missing migration row for source heading 13.08" in error for error in errors), errors)
+
+
+class AdrValidatorTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel: str, text: str) -> Path:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def git(self, *args: str, check: bool = True) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            check=check,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout.strip()
+
+    def init_git(self) -> None:
+        self.git("init", "-q")
+        self.git("config", "user.email", "architecture@example.invalid")
+        self.git("config", "user.name", "Architecture Tests")
+
+    def commit_all(self, message: str) -> str:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        commit = self.git("rev-parse", "HEAD")
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        return commit
+
+    def valid_adr(
+        self,
+        *,
+        number: int = 9,
+        title: str = "Test decision",
+        status: str = "Proposed",
+        retrospective: str = "No",
+        implementation_status: str = "Not started",
+        context: str = "Context version one.",
+        related_architecture: str = "None",
+        related_plans: str = "None",
+        related_pull_requests: str = "None",
+        related_commits: str = "None",
+        related_proposals: str = "None",
+        supersedes: str = "None",
+        superseded_by: str = "None",
+        compliance: str = "- Validation is pending.",
+        evidence: str = "None",
+    ) -> str:
+        return (
+            f"# ADR-{number:04d}: {title}\n\n"
+            f"- Status: {status}\n"
+            f"- Retrospective: {retrospective}\n"
+            "- Decision date: 2026-09-01\n"
+            "- Deciders: Architecture\n"
+            "- Scope: Test scope\n"
+            f"- Implementation status: {implementation_status}\n"
+            f"- Related proposals: {related_proposals}\n"
+            f"- Related implementation plans: {related_plans}\n"
+            f"- Related pull requests: {related_pull_requests}\n"
+            f"- Related commits: {related_commits}\n"
+            f"- Related architecture sections: {related_architecture}\n"
+            f"- Supersedes: {supersedes}\n"
+            f"- Superseded by: {superseded_by}\n\n"
+            "## Context\n\n"
+            f"{context}\n\n"
+            "## Decision drivers\n\n"
+            "- Preserve the contract.\n\n"
+            "## Considered options\n\n"
+            "- Keep the current boundary.\n"
+            "- Reject a weaker boundary.\n\n"
+            "## Decision\n\n"
+            "Use the governed boundary.\n\n"
+            "## Consequences\n\n"
+            "### Positive\n\n"
+            "The boundary is explicit.\n\n"
+            "### Negative\n\n"
+            "The contract requires maintenance.\n\n"
+            "### Risks\n\n"
+            "Drift is rejected by validation.\n\n"
+            "## Compliance and verification\n\n"
+            f"{compliance}\n\n"
+            "## Implementation evidence\n\n"
+            f"{evidence}\n"
+        )
+
+    def write_valid_adr(self, status: str, context: str) -> None:
+        self.write(
+            "architecture/adr/0009-test-decision.md",
+            self.valid_adr(
+                status=status,
+                implementation_status="Partial" if status != "Proposed" else "Not started",
+                context=context,
+                evidence="None" if status == "Proposed" else "- https://github.com/acme/bank/pull/1",
+            ),
+        )
+
+    def test_adr_contract_rejects_number_filename_title_fields_and_empty_sections(self):
+        self.write("architecture/adr/0001-wrong.md", self.valid_adr(number=2))
+        errors = validator.validate_adrs(self.root)
+        self.assertTrue(any("filename/title" in error or "ADR-0001" in error for error in errors), errors)
+
+        headings = (
+            "## Context",
+            "## Decision drivers",
+            "## Considered options",
+            "## Decision",
+            "### Positive",
+            "### Negative",
+            "### Risks",
+            "## Compliance and verification",
+            "## Implementation evidence",
+        )
+        for heading in headings:
+            with self.subTest(heading=heading):
+                self.root.joinpath("architecture/adr/0001-wrong.md").unlink(missing_ok=True)
+                text = self.valid_adr(number=1, title="Manage architecture as versioned code")
+                if heading == "## Consequences":
+                    text = text.replace("## Consequences\n\n", "## Consequences\n", 1)
+                else:
+                    body = validator._section_bodies(text)[heading]
+                    text = text.replace(f"{heading}\n\n{body}", heading, 1)
+                self.write("architecture/adr/0001-manage-architecture-as-versioned-code.md", text)
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any(f"{heading} must not be empty" in error for error in errors), errors)
+
+        text = self.valid_adr()
+        decision = validator._section_bodies(text)["## Decision"]
+        drivers = validator._section_bodies(text)["## Decision drivers"]
+        text = text.replace(f"## Decision drivers\n\n{drivers}", "SECTION-A", 1)
+        text = text.replace(f"## Decision\n\n{decision}", f"## Decision drivers\n\n{drivers}", 1)
+        text = text.replace("SECTION-A", f"## Decision\n\n{decision}", 1)
+        self.write("architecture/adr/0009-test-decision.md", text)
+        errors = validator.validate_adrs(self.root)
+        self.assertTrue(any("headings must occur once in the required order" in error for error in errors), errors)
+
+    def test_adr_contract_rejects_invalid_statuses_relationships_and_unbound_evidence(self):
+        cases = (
+            ("- Status: Proposed", "- Status: Draft", "Status must be one of"),
+            ("- Retrospective: No", "- Retrospective: Maybe", "Retrospective must be Yes or No"),
+            ("- Implementation status: Not started", "- Implementation status: Started", "Implementation status must be one of"),
+            ("- Related commits: None", "- Related commits: ", "Related commits must be None or"),
+            ("## Implementation evidence\n\nNone\n", "## Implementation evidence\n\ndeadbeef\n", "Implementation evidence entry"),
+            ("## Implementation evidence\n\nNone\n", "## Implementation evidence\n\n- 0000000000000000000000000000000000000000\n- path/to/file\n", "Implementation evidence entry"),
+        )
+        for old, new, fragment in cases:
+            with self.subTest(fragment=fragment):
+                self.root.joinpath("architecture/adr/0009-test-decision.md").unlink(missing_ok=True)
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr().replace(old, new, 1))
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_evidence_verifies_commit_tree_changed_mode_and_snapshot(self):
+        self.init_git()
+        self.write("evidence/changed.txt", "v1\n")
+        self.write("evidence/unchanged.txt", "stable\n")
+        root_commit = self.commit_all("evidence root")
+        self.write("evidence/changed.txt", "v2\n")
+        changed_commit = self.commit_all("change evidence")
+        evidence = (
+            f"- {changed_commit} changed: evidence/changed.txt\n"
+            f"- {changed_commit} snapshot: evidence/unchanged.txt"
+        )
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(implementation_status="Partial", evidence=evidence))
+        self.assertEqual([], validator.validate_adrs(self.root))
+
+        cases = (
+            (evidence.replace(changed_commit, "0" * 40, 1), "does not resolve to a commit"),
+            (evidence.replace("evidence/changed.txt", "evidence/missing.txt", 1), "does not exist at"),
+            (evidence.replace("evidence/changed.txt", "evidence/unchanged.txt", 1), "was not changed by"),
+        )
+        for invalid, fragment in cases:
+            with self.subTest(fragment=fragment):
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(implementation_status="Partial", evidence=invalid))
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+        self.assertRegex(root_commit, r"^[0-9a-f]{40}$")
+
+    def test_pull_request_evidence_requires_matching_normalized_github_origin(self):
+        for origin in ("git@github.com:Acme/Bank.git", "https://github.com/acme/bank.git"):
+            with self.subTest(origin=origin):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.init_git(); self.git("remote", "add", "origin", origin)
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(implementation_status="Partial", evidence="- https://github.com/ACME/BANK/pull/42"))
+                self.assertEqual([], validator.validate_adrs(self.root))
+        for origin in (None, "https://gitlab.com/acme/bank.git", "https://github.com/other/bank.git"):
+            with self.subTest(origin=origin):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.init_git()
+                if origin:
+                    self.git("remote", "add", "origin", origin)
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(implementation_status="Partial", evidence="- https://github.com/acme/bank/pull/42"))
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any("pull-request evidence" in error for error in errors), errors)
+
+    def test_architecture_and_plan_links_are_reciprocal_by_exact_pair(self):
+        arc1 = "[Arc one](../arc42/01-introduction-and-goals.md)"
+        arc2 = "[Arc two](../arc42/02-constraints.md)"
+        plan1 = "[Plan one](../../docs/superpowers/plans/one.md)"
+        plan2 = "[Plan two](../../docs/superpowers/plans/two.md)"
+        self.write("architecture/adr/0001-manage-architecture-as-versioned-code.md", self.valid_adr(number=1, title="Manage architecture as versioned code", related_architecture=arc1, related_plans=plan1))
+        self.write("architecture/adr/0002-second.md", self.valid_adr(number=2, title="Second", related_architecture=arc2, related_plans=plan2))
+        self.write("architecture/arc42/01-introduction-and-goals.md", "---\nrelated_adrs:\n  - ADR-0001\n---\n# One\n")
+        self.write("architecture/arc42/02-constraints.md", "---\nrelated_adrs:\n  - ADR-0002\n---\n# Two\n")
+        self.write("docs/superpowers/plans/one.md", "# One\n\n**Governing ADR:** [ADR-0001: Manage architecture as versioned code](../../../architecture/adr/0001-manage-architecture-as-versioned-code.md)\n")
+        self.write("docs/superpowers/plans/two.md", "# Two\n\n[ADR-0002](../../../architecture/adr/0002-second.md)\n")
+        self.assertEqual([], validator.validate_adrs(self.root))
+
+        mutations = (
+            ("architecture/arc42/01-introduction-and-goals.md", "ADR-0001", "ADR-0002", "does not list ADR-0001"),
+            ("docs/superpowers/plans/two.md", "0002-second", "missing", "direct ADR target does not exist"),
+            ("architecture/adr/0002-second.md", plan2, "[Missing](../../docs/superpowers/plans/missing.md)", "implementation plan target does not exist"),
+        )
+        for path, old, new, fragment in mutations:
+            with self.subTest(fragment=fragment):
+                original = (self.root / path).read_text()
+                (self.root / path).write_text(original.replace(old, new, 1))
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+                (self.root / path).write_text(original)
+
+    def test_adr_relationship_link_fields_reject_ambiguous_multiple_links(self):
+        self.write(
+            "architecture/adr/0009-test-decision.md",
+            self.valid_adr(
+                related_architecture="[One](../arc42/one.md) [Two](../arc42/two.md)",
+                related_plans="[One](../../docs/superpowers/plans/one.md) [Two](../../docs/superpowers/plans/two.md)",
+            ),
+        )
+        errors = validator.validate_adrs(self.root)
+        self.assertTrue(any("must contain exact Markdown-link items" in error for error in errors), errors)
+
+    def test_adr_validation_accepts_a_relative_repository_root(self):
+        relative_root = Path(os.path.relpath(self.root, Path.cwd()))
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr())
+        self.write(
+            "architecture/arc42/01-introduction-and-goals.md",
+            "---\nrelated_adrs:\n  - ADR-0009\n---\n# Arc\n",
+        )
+        errors = validator.validate_adrs(relative_root)
+        self.assertTrue(any("does not link back" in error for error in errors), errors)
+
+    def test_foundational_adr_requires_architecture_section(self):
+        self.write("architecture/adr/0001-manage-architecture-as-versioned-code.md", self.valid_adr(number=1, title="Manage architecture as versioned code"))
+        errors = validator.validate_adrs(self.root)
+        self.assertTrue(any("foundational ADR must link" in error for error in errors), errors)
+
+    def test_supersession_edges_require_targets_reciprocity_statuses_and_no_cycles(self):
+        self.write("architecture/adr/0009-old.md", self.valid_adr(number=9, title="Old", status="Superseded", superseded_by="ADR-0010"))
+        self.write("architecture/adr/0010-new.md", self.valid_adr(number=10, title="New", status="Accepted", supersedes="ADR-0009", implementation_status="Partial", evidence="- https://github.com/acme/bank/pull/1"))
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.assertEqual([], validator.validate_adrs(self.root))
+        cases = (
+            ("ADR-0010", "ADR-0011", "missing ADR target"),
+            ("ADR-0010", "ADR-0009", "self-reference"),
+            ("Supersedes: ADR-0009", "Supersedes: None", "non-reciprocal"),
+            ("Status: Accepted", "Status: Deprecated", "must be Accepted"),
+        )
+        for old, new, fragment in cases:
+            with self.subTest(fragment=fragment):
+                target = self.root / ("architecture/adr/0010-new.md" if old.startswith("Supersedes") or old.startswith("Status") else "architecture/adr/0009-old.md")
+                original = target.read_text(); target.write_text(original.replace(old, new, 1))
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+                target.write_text(original)
+        old = self.root / "architecture/adr/0009-old.md"
+        old.write_text(old.read_text().replace("Supersedes: None", "Supersedes: ADR-0010"))
+        errors = validator.validate_adrs(self.root)
+        self.assertTrue(any("cycle" in error for error in errors), errors)
+
+    def test_introduction_requires_proposed_or_qualified_historical_evidence(self):
+        self.init_git()
+        self.write("evidence/history.txt", "historical\n")
+        base = self.commit_all("historical evidence")
+        for status in ("Accepted", "Rejected"):
+            with self.subTest(status=status):
+                evidence = f"- {base} snapshot: evidence/history.txt"
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status=status, retrospective="Yes", implementation_status="Partial", evidence=evidence))
+                self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, base))
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status=status, retrospective="No", implementation_status="Partial", evidence=evidence))
+                errors = validator.validate_accepted_adr_immutability(self.root, base)
+                self.assertTrue(any("new ADR must be Proposed" in error for error in errors), errors)
+
+    def test_exact_adr_0001_bootstrap_exception_is_bound_to_approved_design(self):
+        repository = Path(__file__).resolve().parents[3]
+        path = "architecture/adr/0001-manage-architecture-as-versioned-code.md"
+        present_at_head = subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"HEAD:{path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        base = "HEAD^" if present_at_head else "HEAD"
+        errors = validator.validate_accepted_adr_immutability(repository, base, "HEAD" if present_at_head else None)
+        self.assertFalse(any(path in error and "new ADR must be Proposed" in error for error in errors), errors)
+
+    def test_accepted_content_status_and_sequences_are_protected_but_legal_appends_pass(self):
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write("evidence/changed.txt", "v1\n")
+        self.write("evidence/stable.txt", "stable\n")
+        self.write_valid_adr("Proposed", "context-v1")
+        base = self.commit_all("proposed")
+        self.write_valid_adr("Accepted", "context-v1")
+        accepted = self.commit_all("accepted")
+        self.write("evidence/changed.txt", "v2\n")
+        evidence_change = self.commit_all("change implementation evidence")
+        path = self.root / "architecture/adr/0009-test-decision.md"
+        text = path.read_text().replace("Implementation status: Partial", "Implementation status: Complete")
+        text = text.replace("- Validation is pending.", "- Validation is pending.\n- Validation completed successfully.")
+        text = text.replace(
+            "- https://github.com/acme/bank/pull/1",
+            "- https://github.com/acme/bank/pull/1\n"
+            f"- {evidence_change} changed: evidence/changed.txt\n"
+            f"- {evidence_change} snapshot: evidence/stable.txt",
+        )
+        path.write_text(text)
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, evidence_change))
+        self.assertEqual([], validator.validate_accepted_adr_edge_range(self.root, base, accepted))
+        for old, new, fragment in (
+            ("context-v1", "context-v2", "immutable section changed"),
+            ("Implementation status: Complete", "Implementation status: Not started", "implementation status"),
+            ("pull/1", "pull/9", "append-only sequence"),
+            ("- Scope: Test scope", "- Scope: Test scope\n- Extra accepted field: changed", "accepted ADR field changed"),
+            ("snapshot: evidence/stable.txt", "snapshot: evidence/stable.txt\n- invalid evidence", "Implementation evidence entry is invalid"),
+        ):
+            original = path.read_text(); path.write_text(original.replace(old, new, 1))
+            errors = validator.validate_accepted_adr_immutability(self.root, accepted)
+            self.assertTrue(any(fragment in error for error in errors), errors)
+            path.write_text(original)
+
+    def test_edge_range_protects_newly_accepted_adr_after_introduction(self):
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write("README.md", "base\n"); range_base = self.commit_all("base")
+        self.write_valid_adr("Proposed", "context-v1"); self.commit_all("introduce proposed")
+        self.write_valid_adr("Accepted", "context-v1"); accepted = self.commit_all("accept")
+        self.write_valid_adr("Accepted", "context-v2"); mutated = self.commit_all("mutate")
+        errors = validator.validate_accepted_adr_edge_range(self.root, range_base, mutated)
+        self.assertTrue(any(accepted in error and mutated in error and "context-v2" in error for error in errors), errors)
+
+    def test_edge_range_protects_proposed_adr_accepted_after_base(self):
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write_valid_adr("Proposed", "context-v1"); base = self.commit_all("base proposed")
+        self.write_valid_adr("Accepted", "context-v1"); accepted = self.commit_all("accept")
+        self.write_valid_adr("Accepted", "context-v2"); mutated = self.commit_all("mutate")
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, base, mutated))
+        errors = validator.validate_accepted_adr_edge_range(self.root, base, mutated)
+        self.assertTrue(any(accepted in error and mutated in error for error in errors), errors)
+
+    def test_superseded_and_deprecated_records_remain_protected(self):
+        for terminal in ("Superseded", "Deprecated"):
+            with self.subTest(terminal=terminal):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+                self.write_valid_adr("Accepted", "context-v1"); accepted = self.commit_all("accepted")
+                self.write_valid_adr(terminal, "context-v1"); terminal_commit = self.commit_all("terminal")
+                self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, accepted, terminal_commit))
+                path = self.root / "architecture/adr/0009-test-decision.md"
+                path.write_text(path.read_text().replace("Related commits: None", "Related commits: terminal-evidence"))
+                appended = self.commit_all("append terminal relationship")
+                self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, terminal_commit, appended))
+                self.write_valid_adr(terminal, "context-v2"); mutated = self.commit_all("mutate terminal")
+                errors = validator.validate_accepted_adr_edge_range(self.root, accepted, mutated)
+                self.assertTrue(any(appended in error and mutated in error for error in errors), errors)
+
+    def test_terminal_statuses_cannot_reverse_or_change_laterally(self):
+        pairs = (("Superseded", "Accepted"), ("Superseded", "Deprecated"), ("Deprecated", "Accepted"), ("Deprecated", "Superseded"), ("Rejected", "Accepted"), ("Rejected", "Proposed"))
+        for parent_status, child_status in pairs:
+            with self.subTest(pair=(parent_status, child_status)):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+                self.write_valid_adr(parent_status, "context-v1"); parent = self.commit_all("parent")
+                self.write_valid_adr(child_status, "context-v1")
+                errors = validator.validate_accepted_adr_immutability(self.root, parent)
+                self.assertTrue(any(f"{parent_status} -> {child_status}" in error for error in errors), errors)
+
+    def test_accepted_record_cannot_be_deleted_or_renamed(self):
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write_valid_adr("Accepted", "context-v1"); base = self.commit_all("accepted")
+        original = self.root / "architecture/adr/0009-test-decision.md"
+        content = original.read_text(); original.unlink()
+        errors = validator.validate_accepted_adr_immutability(self.root, base)
+        self.assertTrue(any("deleted or renamed" in error and "0009-test-decision.md" in error for error in errors), errors)
+        self.write("architecture/adr/0010-moved.md", content)
+        errors = validator.validate_accepted_adr_immutability(self.root, base)
+        self.assertTrue(any("deleted or renamed" in error and "0009-test-decision.md" in error for error in errors), errors)
+
+    def test_proposed_records_may_remain_unchanged_or_be_revised(self):
+        self.init_git()
+        self.write_valid_adr("Proposed", "context-v1"); base = self.commit_all("proposed")
+        self.write("unrelated.txt", "unchanged ADR\n"); unchanged = self.commit_all("unchanged proposed")
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, base, unchanged))
+        self.assertEqual([], validator.validate_accepted_adr_edge_range(self.root, base, unchanged))
+        text = self.valid_adr(context="context-v2", implementation_status="Not applicable", related_commits="abc", compliance="- revised", evidence="None")
+        self.write("architecture/adr/0009-test-decision.md", text)
+        revised = self.commit_all("revised proposed")
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, base, revised))
+        self.assertEqual([], validator.validate_accepted_adr_edge_range(self.root, base, revised))
+        self.assertNotEqual(base, unchanged)
+
+    def test_rejected_records_are_permanent_same_path_bytes(self):
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write_valid_adr("Proposed", "context-v1"); base = self.commit_all("proposed")
+        self.write_valid_adr("Rejected", "context-final"); rejected = self.commit_all("rejected")
+        self.write("unrelated.txt", "one\n"); unchanged = self.commit_all("unchanged rejected")
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, rejected, unchanged))
+        path = self.root / "architecture/adr/0009-test-decision.md"
+        original = path.read_bytes()
+        for name, mutate in (
+            ("rationale", lambda: path.write_bytes(original.replace(b"context-final", b"context-mutated"))),
+            ("relationship", lambda: path.write_bytes(original.replace(b"Related commits: None", b"Related commits: later"))),
+            ("evidence", lambda: path.write_bytes(original + b"\n- evidence append\n")),
+            ("deletion", lambda: path.unlink()),
+        ):
+            with self.subTest(name=name):
+                mutate(); errors = validator.validate_accepted_adr_immutability(self.root, rejected)
+                self.assertTrue(any("Rejected record must remain byte-identical" in error or "deleted or renamed" in error for error in errors), errors)
+                path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(original)
+        path.rename(self.root / "architecture/adr/0010-renamed.md")
+        errors = validator.validate_accepted_adr_immutability(self.root, rejected)
+        self.assertTrue(any("deleted or renamed" in error for error in errors), errors)
+        self.assertEqual([], validator.validate_accepted_adr_edge_range(self.root, base, unchanged))
+
+    def test_merge_checks_every_parent(self):
+        self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write_valid_adr("Accepted", "context-v1"); base = self.commit_all("accepted")
+        first_branch = self.git("branch", "--show-current") or "master"
+        self.git("checkout", "-q", "-b", "second")
+        self.write_valid_adr("Accepted", "context-v2"); second = self.commit_all("second mutates")
+        self.git("checkout", "-q", first_branch)
+        self.write("unrelated.txt", "first\n"); first = self.commit_all("first unrelated")
+        self.git("merge", "--no-commit", "--no-ff", "second", check=False)
+        self.git("checkout", first, "--", "architecture/adr/0009-test-decision.md")
+        self.git("add", "-A"); self.git("commit", "-q", "-m", "merge restored")
+        merge = self.git("rev-parse", "HEAD")
+        parents = self.git("show", "-s", "--format=%P", merge).split()
+        self.assertEqual([first, second], parents)
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, base, merge))
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, first, merge))
+        second_errors = validator.validate_accepted_adr_immutability(self.root, second, merge)
+        self.assertTrue(any("immutable section changed" in error for error in second_errors), second_errors)
+        errors = validator.validate_accepted_adr_edge_range(self.root, base, merge)
+        self.assertTrue(any(second in error and merge in error for error in errors), errors)
+
+    def test_cli_requires_paired_edge_refs(self):
+        self.assertEqual(2, validator.main(["--root", str(self.root), "--adr-edge-base-ref", "HEAD"]))
+        self.assertEqual(2, validator.main(["--root", str(self.root), "--adr-edge-head-ref", "HEAD"]))
 
 
 if __name__ == "__main__":
