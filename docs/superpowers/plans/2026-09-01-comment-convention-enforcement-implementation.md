@@ -244,7 +244,43 @@ CanaryProbe.java:6:8: First sentence of Javadoc is missing an ending period. [Su
 
 This is also the proof that `MissingJavadocMethod` is absent: the undocumented-method case is not reported, only the malformed-Javadoc case.
 
-- [ ] **Step 9: Remove the canary and confirm a clean run**
+- [ ] **Step 9: Canary the remaining three Javadoc rules**
+
+`JavadocContentLocation`, `NonEmptyAtclauseDescription` and `JavadocMissingWhitespaceAfterAsterisk` are shipped at `severity=error` like the rest, so they get the same proof. One probe fires all three. Overwrite `services/funds-core/src/main/java/com/corebanking/funds/CanaryProbe.java` with:
+
+```java
+package com.corebanking.funds;
+
+/** Canary type, deleted in the next step. */
+public class CanaryProbe {
+
+    /** Adds two numbers.
+     * @param a
+     *@param b the second addend.
+     * @return the sum.
+     */
+    public int add(int a, int b) {
+        return a + b;
+    }
+}
+```
+
+```bash
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
+./mvnw checkstyle:check
+```
+
+Expected: `BUILD FAILURE` with exactly these three, one per rule:
+
+```
+CanaryProbe.java:6:5: Javadoc content should start from the next line after /**. [JavadocContentLocation]
+CanaryProbe.java:7: At-clause should have a non-empty description. [NonEmptyAtclauseDescription]
+CanaryProbe.java:8:7: Missing a whitespace after the leading asterisk. [JavadocMissingWhitespaceAfterAsterisk]
+```
+
+Every rule in the configuration has now failed a build on purpose. A rule that cannot be made to fail is not enforcing anything, whatever the config says.
+
+- [ ] **Step 10: Remove the canary and confirm a clean run**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
@@ -254,7 +290,7 @@ rm src/main/java/com/corebanking/funds/CanaryProbe.java
 
 Expected: `BUILD SUCCESS`.
 
-- [ ] **Step 10: Prove the lifecycle binding, not just the goal**
+- [ ] **Step 11: Prove the lifecycle binding, not just the goal**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
@@ -263,7 +299,7 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 
 Expected: `BUILD SUCCESS`, and the log contains `--- checkstyle:3.6.0:check (check-comment-conventions) @ funds-core ---`. This also proves the enforcer accepted the JDK.
 
-- [ ] **Step 11: Confirm no canary survived, then commit**
+- [ ] **Step 12: Confirm no canary survived, then commit**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
@@ -273,6 +309,7 @@ git status --porcelain
 Expected: exactly two entries — `?? services/funds-core/config/` and ` M services/funds-core/pom.xml`. If `CanaryProbe.java` appears, delete it before continuing.
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 git add services/funds-core/config/checkstyle/checkstyle.xml services/funds-core/pom.xml
 git commit -m "Enforce Javadoc conventions on funds-core main sources"
 ```
@@ -439,6 +476,7 @@ git status --porcelain
 Expected: exactly two modified files, `services/funds-core/config/checkstyle/checkstyle.xml` and `services/funds-core/pom.xml`. No untracked file under `src/`.
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 git add services/funds-core/config/checkstyle/checkstyle.xml services/funds-core/pom.xml
 git commit -m "Enforce migration headers and the work-item ban"
 ```
@@ -678,9 +716,9 @@ Shell-script headers (the convention requires one and `services/funds-core/scrip
 The measurements in "Baseline evidence" were taken with the Checkstyle CLI, without Maven, so they can be reproduced against any checkout:
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 curl -L -o /tmp/checkstyle-14.1.0-all.jar \
   https://github.com/checkstyle/checkstyle/releases/download/checkstyle-14.1.0/checkstyle-14.1.0-all.jar
-cd "$(git rev-parse --show-toplevel)"
 java -jar /tmp/checkstyle-14.1.0-all.jar \
   -c services/funds-core/config/checkstyle/checkstyle.xml \
   services/funds-core/src/main/java \
