@@ -19,8 +19,9 @@ public final class PropertyCases {
         Long.MAX_VALUE / 2,
         Long.MAX_VALUE - 1
     };
-    // Omits Long.MAX_VALUE - 1: state-machine amounts accumulate across a history, and two posts of
-    // Long.MAX_VALUE / 2 to one account already reach the MONETARY_OVERFLOW outcome.
+    // Omits Long.MAX_VALUE - 1: state-machine amounts accumulate on the same accounts across a
+    // history, and Long.MAX_VALUE / 2 already reaches the MONETARY_OVERFLOW outcome (two of them
+    // plus the smaller boundaries exceed the signed range).
     private static final long[] STATE_MACHINE_MINOR_UNIT_BOUNDARIES = {
         1,
         2,
@@ -45,9 +46,9 @@ public final class PropertyCases {
 
     /**
      * Amount for one step of a generated history. Cycles through the boundary set by sample index
-     * and takes a random draw on every seventh slot, so each history hits every edge amount
-     * regardless of its seed. Boundary slots do not consume from {@code random}; the caller shares
-     * that stream with its operation-choice draws.
+     * and takes a random draw on every seventh slot, so the edge amounts recur throughout every
+     * history instead of depending on the seed. Boundary slots do not consume from {@code random};
+     * the caller shares that stream with its operation-choice draws.
      */
     public static long stateMachineMinorUnits(SplittableRandom random, long sampleIndex) {
         int slot = Math.floorMod(sampleIndex, STATE_MACHINE_MINOR_UNIT_BOUNDARIES.length + 1);

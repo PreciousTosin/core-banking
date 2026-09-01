@@ -297,7 +297,7 @@ class PackagingContractTest {
 
     // --- Runtime bounds: application.properties, pom.xml, Dockerfile.jvm ---
 
-    // Also proves no JDBC endpoint is baked into the image: production takes it from
+    // Also proves no JDBC endpoint is baked into application.properties: production takes it from
     // FUNDS_DB_JDBC_URL only (README "Database roles and startup").
     @Test
     void productionConfigurationHasOneEffectiveAssignmentForEveryBound() throws Exception {

@@ -125,7 +125,6 @@ class JournalValidatorTest {
             hasher.v2Sha256(differentBackfilledChart));
     }
 
-    /** Golden hashes for the current V2 journal scheme and the TYPED_V2 command hashes. */
     @Test
     void v2JournalAndTypedCommandSchemesRetainTheirGoldenBytes() {
         JournalDraft journal = fixtureJournal(
@@ -168,8 +167,8 @@ class JournalValidatorTest {
             () -> line(POSTING_A, ASSET_ACCOUNT, "NGN", Long.MIN_VALUE));
     }
 
-    // The three limits are mirrored by database CHECK constraints (ACC-20); this proves the service
-    // rejects one-past-the-limit before a transaction is opened.
+    // The three limits are mirrored by database CHECK constraints (ACC-20); this proves the
+    // validator alone rejects input beyond each limit, before the repository is reached.
     @Test
     void rejectsJournalAndDimensionInputsBeyondTheReversalEnvelope() {
         var tooManyPostings = new ArrayList<PostingLine>();

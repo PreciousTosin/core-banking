@@ -5,8 +5,8 @@ import java.util.UUID;
 /**
  * One step of a generated ledger history for AccountingStateMachineIT. Operations are produced
  * from a seeded SplittableRandom and carry their own command identities, so a failing history can
- * be replayed step for step from the seed. The sealed set fixes the five outcomes the
- * ReferenceLedgerModel can predict; the IT turns each into a concrete PostingCommand.
+ * be replayed step for step from the seed. The sealed set is the IT's whole operation vocabulary;
+ * it turns each into a concrete PostingCommand and checks the ReferenceLedgerModel's prediction.
  */
 public sealed interface GeneratedLedgerOperation {
     /** New balanced two-line journal; expected NEW_SUCCESS unless a running total overflows. */
