@@ -4,7 +4,7 @@
 
 **Goal:** Register the repository code comment convention, and the build gate that now enforces it, as retrospective ADR-0009 — accepted from birth, with historical evidence that predates the record, passing every architecture check including the git-history edge checks that police direct `Accepted` introduction.
 
-**Architecture:** One new file, `architecture/adr/0009-adopt-an-enforced-code-comment-convention.md`, plus a reciprocal registration in `architecture/arc42/09-decisions.md`. Both land in **one commit**, because the validator's ADR ↔ arc42 reciprocity check fails on any tree where an ADR links the decisions index but the index does not list it. The record is `Accepted`/`Retrospective: Yes`, which the validator permits only when at least one evidence commit is a strict ancestor of the commit that introduces the record — all eight evidence lines below already satisfy that.
+**Architecture:** One new file, `architecture/adr/0009-adopt-an-enforced-code-comment-convention.md`, plus two reciprocal registrations: `ADR-0009` in `architecture/arc42/09-decisions.md`, and a backlink to the record in the enforcement plan it names. All three land in **one commit**, because the validator checks both pairings against the tree as it stands: an ADR that links the decisions index while the index does not list it fails, and an ADR that names an implementation plan which does not link back fails. The record is `Accepted`/`Retrospective: Yes`, which the validator permits only when at least one evidence commit is a strict ancestor of the commit that introduces the record — all eight evidence lines below already satisfy that.
 
 **Tech Stack:** Python 3.12+ (`architecture/scripts/validate_architecture.py`, standard library only), git, Markdown.
 
@@ -15,7 +15,7 @@
 ## Global Constraints
 
 - Every command runs inside the checkout the executor was given — main checkout or worktree. Anchor each block with `cd "$(git rev-parse --show-toplevel)"`; never a literal absolute path.
-- **The ADR and the decisions-index edit are one commit.** Splitting them produces an intermediate tree that fails `validate_adrs` reciprocity. There is no valid ordering of two commits.
+- **The ADR, the decisions-index edit and the plan backlink are one commit.** Every split produces an intermediate tree that fails: the ADR alone fails both reciprocity checks, the backlink alone fails link resolution, the index alone fails nothing but proves nothing. There is no valid multi-commit ordering.
 - **If validation fails after the ADR is committed, fix it with `git commit --amend`, never a follow-up commit.** The record is `Accepted` from birth, and the validator freezes `Context`, `Decision drivers`, `Considered options`, `Decision` and `Consequences` byte-for-byte across every subsequent commit edge. A follow-up commit that edits those sections is an immutability violation that cannot be undone except by rewriting history.
 - Evidence hashes are **40 lowercase hex characters**. Uppercase fails the regex.
 - Relationship fields are separated by exactly `"; "` — one semicolon, one space. `;` alone or `;  ` fails.
@@ -48,6 +48,7 @@ Settled before writing. Do not re-open during execution.
 - **D3 — `Related architecture sections` links only the decisions index.** Linking `02-constraints.md` as well would be defensible, but every arc42 file linked must also list `ADR-0009` in its own `related_adrs` frontmatter, and the comment convention is a contributor-process rule rather than a runtime constraint on the system. Keep the reciprocal surface to one file.
 - **D4 — `Implementation status: Complete`, with the scope bounded in the `Scope` field.** The decision as scoped — a documented convention plus mechanized enforcement of its mechanizable subset in the only module that has code — is fully delivered. The limits (shell scripts, future modules, and the judgement rules a tool cannot check) are stated in `### Negative` rather than hidden behind a softer status.
 - **D5 — Amend, never follow up.** See Global Constraints.
+- **D6 — `Related implementation plans` names the enforcement plan only, not this registration plan.** The enforcement plan delivered the decision; this one files the record. Naming both would be defensible but would require a backlink in this file too, and a plan whose only content is "create the ADR" is not an implementation of the decision the ADR records. Setting the field to `None` instead — which would sidestep the backlink rule entirely — was rejected: it would discard the one traceability link between the record and the work that delivered it, which is the whole point of the field.
 
 ### A note on the ADR threshold
 
@@ -57,6 +58,19 @@ Settled before writing. Do not re-open during execution.
 
 - Create `architecture/adr/0009-adopt-an-enforced-code-comment-convention.md` — the record. Nothing else in the repository states this decision.
 - Modify `architecture/arc42/09-decisions.md` — add `ADR-0009` to the `related_adrs` frontmatter (machine-checked) and a bullet to the index list (convention, not machine-checked, but the list is the human entry point and an index missing a record is exactly the rot this framework exists to prevent).
+- Modify `docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md` — add the backlink to ADR-0009. This is not optional bookkeeping: the validator requires every plan named in `Related implementation plans` to link back to the record (see the ADR ↔ plan rule below).
+
+### The ADR ↔ plan link rule
+
+`validate_adrs` enforces the pairing in **both** directions:
+
+- For every target of an ADR's `Related implementation plans`, that plan file must contain a Markdown link resolving to the ADR's own path, or the run fails with `implementation plan does not link back to ADR-0009: <plan>`.
+- For every Markdown link from any file in `docs/superpowers/plans/` to any file in `architecture/adr/`, that ADR must name the linking plan in its `Related implementation plans`, or the run fails with `<plan>: ADR backlink is missing for ADR-0009`.
+
+Two consequences the executor must respect:
+
+1. The backlink and the ADR land in the **same commit**. The backlink is a Markdown link, and `validate_links` requires its target to exist, so adding it before the ADR file exists fails too. There is no valid ordering other than one commit.
+2. **Do not turn any mention of ADR-0009 in this registration plan into a Markdown link.** Every reference here is a code span on purpose. Linking it would oblige ADR-0009 to name this plan as well, which it deliberately does not (D6).
 
 ---
 
@@ -64,6 +78,7 @@ Settled before writing. Do not re-open during execution.
 
 **Files:**
 - Create: `architecture/adr/0009-adopt-an-enforced-code-comment-convention.md`
+- Modify: `docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md`
 - Modify: `architecture/arc42/09-decisions.md`
 
 **Interfaces:**
@@ -186,7 +201,19 @@ violations before being enabled.
 - f70e19610dc12dfe3748b29e70dbebac3c232740 changed: AGENTS.md; docs/conventions/code-comments.md
 ```
 
-- [ ] **Step 2: Add ADR-0009 to the decisions index frontmatter**
+- [ ] **Step 2: Add the backlink to the enforcement plan**
+
+In `docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md`, insert this line immediately after the `# Comment Convention Enforcement Implementation Plan` title line, followed by a blank line:
+
+```markdown
+**Retrospective ADR:** [ADR-0009](../../../architecture/adr/0009-adopt-an-enforced-code-comment-convention.md)
+```
+
+This is the same placement and shape the accounting-kernel plan uses for its `**Retrospective ADRs:**` line. The `../../../` prefix is correct: the file sits at `docs/superpowers/plans/`, so three levels up is the repository root.
+
+Without this line the validator fails with `implementation plan does not link back to ADR-0009`. With it, and without the ADR file, `validate_links` fails because the target does not exist. Both files must therefore be committed together.
+
+- [ ] **Step 3: Add ADR-0009 to the decisions index frontmatter**
 
 This is the half the validator checks. In `architecture/arc42/09-decisions.md`, extend the `related_adrs` list:
 
@@ -205,7 +232,7 @@ related_adrs:
 
 Leave `last_verified: 2026-09-01` as it is. Do not set it to a future date: `--report-stale` fails a build on a `last_verified` that is in the future, while a stale past date is only a warning.
 
-- [ ] **Step 3: Add the index bullet**
+- [ ] **Step 4: Add the index bullet**
 
 Append to the list at the end of `architecture/arc42/09-decisions.md`:
 
@@ -215,7 +242,7 @@ Append to the list at the end of `architecture/arc42/09-decisions.md`:
 
 The validator does not check this list — only the frontmatter drives reciprocity — but an index that omits a record is the decay this framework exists to prevent, and the link itself is checked for existence by `validate_links`.
 
-- [ ] **Step 4: Validate before committing**
+- [ ] **Step 5: Validate before committing**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
@@ -224,29 +251,41 @@ python3 architecture/scripts/validate_architecture.py --root .
 
 Expected: `architecture validation passed`, exit 0.
 
-If it reports `does not list ADR-0009`, Step 2 was missed. If it reports `does not link back to this exact architecture section`, the ADR's `Related architecture sections` does not point at `09-decisions.md`. If it reports a heading or field error, compare against the exact block in Step 1 — the field order and heading order are checked as sequences, not as sets.
+Failure messages and what each means:
 
-- [ ] **Step 5: Confirm the change is only these two files, then commit both together**
+| Message | Cause |
+|---|---|
+| `implementation plan does not link back to ADR-0009` | Step 2 was missed, or the inserted link does not resolve to the ADR's exact path |
+| `ADR backlink is missing for ADR-0009` | Some file under `docs/superpowers/plans/` links to the ADR without being named in `Related implementation plans` — most likely a mention in this registration plan was turned into a Markdown link |
+| `does not list ADR-0009` | Step 3 was missed: the `related_adrs` frontmatter |
+| `does not link back to this exact architecture section` | The ADR's `Related architecture sections` does not point at `09-decisions.md` |
+| A heading or field error | Compare against the exact block in Step 1; field order and heading order are checked as sequences, not sets |
+| `does not exist` on a link | The three files were not all created before validating |
+
+- [ ] **Step 6: Confirm the change is only these three files, then commit them together**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 git status --porcelain
 ```
 
-Expected exactly:
+Expected — three entries, in any order:
 
 ```
  M architecture/arc42/09-decisions.md
+ M docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md
 ?? architecture/adr/0009-adopt-an-enforced-code-comment-convention.md
 ```
 
+Exactly three, nothing else. Running `validate_architecture.py` as a script creates no `__pycache__`, so at this point the status is clean apart from these files. Any other entry means something unplanned changed — stop and investigate.
+
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-git add architecture/adr/0009-adopt-an-enforced-code-comment-convention.md architecture/arc42/09-decisions.md
+git add architecture/adr/0009-adopt-an-enforced-code-comment-convention.md architecture/arc42/09-decisions.md docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md
 git commit -m "Register the code comment convention as ADR-0009"
 ```
 
-One commit. See Global Constraints for why.
+One commit. See the ADR ↔ plan link rule for why all three must land together.
 
 ---
 
@@ -282,8 +321,8 @@ Expected: `architecture validation passed`. This walks each commit edge from the
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-# edit the ADR, then:
-git add architecture/adr/0009-adopt-an-enforced-code-comment-convention.md architecture/arc42/09-decisions.md
+# edit the ADR, then re-stage all three paths so the amend keeps the set intact:
+git add architecture/adr/0009-adopt-an-enforced-code-comment-convention.md architecture/arc42/09-decisions.md docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md
 git commit --amend --no-edit
 ```
 
@@ -300,7 +339,9 @@ cd "$(git rev-parse --show-toplevel)"
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py'
 ```
 
-Expected: `OK`. This does not test the new ADR; it proves the validator you just trusted is itself intact.
+Expected: `Ran 151 tests`, `OK`. This does not test the new ADR; it proves the validator you just trusted is itself intact.
+
+This step imports the validator, so it leaves untracked `architecture/scripts/__pycache__/` and `architecture/scripts/tests/__pycache__/` behind — `.gitignore` does not cover them. They are harmless, are never staged by this plan (every `git add` names explicit paths), and account for the two extra lines in Step 3's status.
 
 - [ ] **Step 2: Every check, plus the staleness pass CI runs**
 
@@ -313,7 +354,7 @@ python3 architecture/scripts/validate_architecture.py --root . --report-stale --
 
 Expected: `architecture validation passed` three times. The third may print `WARNING:`/`::warning` lines for arc42 files whose `last_verified` is more than 90 days old; warnings do not fail the run. A `last_verified` in the future does fail it.
 
-- [ ] **Step 3: Nothing outside the two files moved**
+- [ ] **Step 3: Nothing outside the three files moved**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
@@ -321,7 +362,7 @@ git diff dfc7521..HEAD --stat -- services/ docs/conventions/ AGENTS.md
 git status --porcelain
 ```
 
-Expected: the `services/` and convention diffs contain only what the enforcement branch already landed before this plan started — this plan adds nothing there — and a clean status.
+Expected: the `services/` and convention diffs contain only what the enforcement branch already landed before this plan started — this plan adds nothing there — and a status that is clean apart from the untracked `architecture/scripts/**/__pycache__/` directories the validator leaves behind.
 
 - [ ] **Step 4: The funds-core gate is untouched**
 
@@ -356,7 +397,7 @@ After it is merged, it cannot be deleted or renamed: `Accepted` records are perm
 |---|---|
 | The record is born `Accepted` and its core sections freeze on the next commit | Task 2 runs the edge checks immediately, and Step 3 amends rather than appending. Nothing is pushed until both checks pass |
 | A naive structural-only run gives false confidence | Task 2 exists precisely because `validate_architecture.py --root .` alone cannot see the introduction rule |
-| Committing the ADR without the index edit | D1 and Task 1 Step 5 keep them in one commit; Step 4 catches the mismatch before any commit exists |
+| Committing the ADR without one of its two reciprocal registrations | D1 and Task 1 Step 6 keep all three files in one commit; Step 5 catches either mismatch, by name, before any commit exists |
 | Evidence that looks right but is not | All eight lines were checked against the validator's own grammar and against each commit's real diff before this plan was written |
 | An extra heading added for readability | Global Constraints forbid it: extra headings fall outside the mutable-section allowlist and freeze forever |
 
