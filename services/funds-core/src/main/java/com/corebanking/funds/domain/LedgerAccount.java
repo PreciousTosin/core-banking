@@ -3,6 +3,12 @@ package com.corebanking.funds.domain;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * The balance-bearing financial identity. Postings, locks and materialised balances key on
+ * this UUID; addresses such as NUBANs only resolve to it. Currency is fixed for life and
+ * every posting must match it; controlAccountCode groups the account into the per-book,
+ * per-currency control projection used by the independent proofs.
+ */
 public record LedgerAccount(
     UUID id,
     Book book,
@@ -22,6 +28,7 @@ public record LedgerAccount(
         status = Objects.requireNonNull(status, "status");
     }
 
+    /** Signed posting total as the balance this account's normal side would report. */
     public long bookedNaturalBalance(long signedTotal) {
         return normalBalance.toNatural(signedTotal);
     }

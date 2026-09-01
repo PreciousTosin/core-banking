@@ -6,6 +6,18 @@ import java.time.LocalDate;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * Command to post the exact negation of an existing journal. ReversalService rebuilds every
+ * original posting with its sign flipped, links the new journal through reversalOfJournalId,
+ * and posts it into currentPeriodId (which may differ from the original's period) at this
+ * request's own bookingTime and valueDate. reason becomes the reversal journal's narration.
+ *
+ * <p>requestHash must equal CanonicalCommandHasher.reversalV2 of this record, which pins every
+ * other field: commandId, originalJournalId, correlationId, businessTransactionId,
+ * currentPeriodId, bookingTime, valueDate and reason. A mismatch is reported as
+ * IdempotencyConflictException. commandId also seeds the deterministic journal and posting IDs
+ * of the reversal, so a replay reproduces the same journal.
+ */
 public record ReversalRequest(
     UUID commandId,
     String requestHash,
@@ -36,6 +48,8 @@ public record ReversalRequest(
         if (reason.isBlank()) {
             throw new IllegalArgumentException("reason must not be blank");
         }
+        // reason is persisted as journal.narration, whose CHECK is octet_length <= 512, so the
+        // limit is measured in UTF-8 bytes rather than characters.
         if (reason.getBytes(StandardCharsets.UTF_8).length > 512) {
             throw new IllegalArgumentException("reason must not exceed 512 UTF-8 bytes");
         }
