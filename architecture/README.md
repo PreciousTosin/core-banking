@@ -32,6 +32,14 @@ diagrams at delivery milestones; and review accepted ADRs, risks, technical
 debt, deployment assumptions, and resource budgets quarterly or before a
 production-readiness claim.
 
+Staleness is report-only: an arc42 or Mermaid artifact is reported after more
+than 90 calendar days since `last_verified`, without blocking validation. Use
+an explicit date for deterministic local or CI output:
+
+```bash
+python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of 2026-09-01
+```
+
 Archive material only after its current replacements, decision rationale,
 proposals, plans, or historical status have been reviewed and linked. Archived
 material remains history, never current authority.

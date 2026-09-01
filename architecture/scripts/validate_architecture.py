@@ -3,6 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -129,6 +130,13 @@ class MaterialHeading:
     source_key: str
     heading: str
     blocks: tuple[str, ...]
+
+@dataclass(frozen=True)
+class StaleWarning:
+    path: Path
+    last_verified: date
+    age_days: int
+    threshold_days: int
 
 def _mask_markdown_code(text: str) -> str:
     chars = list(text)
@@ -736,6 +744,53 @@ def validate_diagrams(root: Path) -> list[str]:
         errors.append("architecture/scripts/render-diagrams.sh must be executable")
     errors.extend(validate_render_script_contract(root))
     return sorted(set(errors))
+
+def _verified_dates(root: Path) -> Iterator[tuple[Path, date]]:
+    arc42 = root / "architecture/arc42"
+    for name in sorted(ARC42_FILENAMES):
+        path = arc42 / name
+        if not path.is_file():
+            continue
+        verified = parse_front_matter(path).get("last_verified")
+        if not isinstance(verified, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", verified):
+            continue
+        try:
+            parsed = date.fromisoformat(verified)
+        except ValueError:
+            continue
+        yield path, parsed
+
+    diagrams = root / "architecture/diagrams"
+    for name in sorted(DIAGRAM_FILENAMES):
+        path = diagrams / name
+        if not path.is_file():
+            continue
+        verified = _diagram_metadata(path, root)[0].get("last_verified", "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", verified):
+            continue
+        try:
+            parsed = date.fromisoformat(verified)
+        except ValueError:
+            continue
+        yield path, parsed
+
+def report_stale(root: Path, as_of: date, threshold_days: int = 90) -> list[StaleWarning]:
+    warnings = []
+    for path, last_verified in _verified_dates(root):
+        age_days = (as_of - last_verified).days
+        if age_days > threshold_days:
+            warnings.append(StaleWarning(path, last_verified, age_days, threshold_days))
+    return sorted(warnings, key=lambda warning: warning.path.relative_to(root).as_posix())
+
+def validate_stale_dates(root: Path, as_of: date) -> list[str]:
+    errors = []
+    for path, last_verified in _verified_dates(root):
+        if last_verified > as_of:
+            relative = path.relative_to(root).as_posix()
+            errors.append(
+                f"{relative}: last_verified {last_verified.isoformat()} is in the future relative to {as_of.isoformat()}"
+            )
+    return sorted(errors)
 
 def _load_json(path: Path, label: str, errors: list[str]) -> object | None:
     if not path.is_file():
@@ -2474,6 +2529,8 @@ def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, default=Path(".")); parser.add_argument("--checks")
+    parser.add_argument("--report-stale", action="store_true")
+    parser.add_argument("--as-of")
     parser.add_argument("--adr-base-ref"); parser.add_argument("--adr-head-ref")
     parser.add_argument("--adr-edge-base-ref"); parser.add_argument("--adr-edge-head-ref")
     parser.add_argument("--proposal-base-ref"); parser.add_argument("--proposal-head-ref")
@@ -2487,6 +2544,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("--proposal-edge-base-ref and --proposal-edge-head-ref must be provided together", file=sys.stderr); return 2
     if args.proposal_head_ref and not args.proposal_base_ref:
         print("--proposal-head-ref requires --proposal-base-ref", file=sys.stderr); return 2
+    if args.report_stale and not args.as_of:
+        print("--report-stale requires --as-of YYYY-MM-DD", file=sys.stderr); return 2
+    as_of = None
+    if args.as_of:
+        try:
+            as_of = date.fromisoformat(args.as_of)
+        except ValueError:
+            print("--as-of must use ISO YYYY-MM-DD", file=sys.stderr); return 2
     checks = frozenset(args.checks.split(",")) if args.checks else CHECKS
     unknown = sorted(checks - CHECKS)
     if unknown:
@@ -2500,6 +2565,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         errors.extend(validate_proposal_history(args.root, args.proposal_base_ref, args.proposal_head_ref))
     if args.proposal_edge_base_ref:
         errors.extend(validate_proposal_edge_range(args.root, args.proposal_edge_base_ref, args.proposal_edge_head_ref))
+    warnings = report_stale(args.root, as_of) if args.report_stale else []
+    if args.report_stale:
+        errors.extend(validate_stale_dates(args.root, as_of))
+        github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+        for warning in warnings:
+            relative = warning.path.relative_to(args.root).as_posix()
+            message = f"last_verified {warning.last_verified.isoformat()} is {warning.age_days} days old (threshold: {warning.threshold_days})"
+            if github_actions:
+                print(f"::warning file={relative}::{message}")
+            else:
+                print(f"WARNING: {relative}: {message}")
     if errors:
         print("\n".join(errors), file=sys.stderr); return 1
     print("architecture validation passed"); return 0

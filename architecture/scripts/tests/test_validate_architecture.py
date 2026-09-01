@@ -4,6 +4,10 @@ import unittest
 import os
 import re
 import json
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import FrozenInstanceError
+from datetime import date
+from io import StringIO
 from unittest import mock
 from pathlib import Path
 
@@ -261,6 +265,84 @@ class ValidatorTest(unittest.TestCase):
         self.assertTrue(any("02-constraints.md: owners must not be empty" in error for error in errors))
         self.assertTrue(any("03-context-and-scope.md: code_refs path does not exist: missing/source" in error for error in errors))
         self.assertTrue(any("04-solution-strategy.md: last_verified must use ISO YYYY-MM-DD" in error for error in errors))
+
+    def test_report_stale_uses_explicit_calendar_age_and_sorted_paths(self):
+        self.write_arc42("02-constraints.md", last_verified="2026-06-03")
+        stale_path = self.write_arc42("01-introduction-and-goals.md", last_verified="2026-06-02")
+        self.write_arc42("03-context-and-scope.md", last_verified="2026-09-02")
+        self.write_arc42("04-solution-strategy.md", last_verified="2026-9-1")
+
+        warnings = validator.report_stale(self.root, date(2026, 9, 1))
+
+        self.assertEqual(1, len(warnings))
+        self.assertEqual(stale_path, warnings[0].path)
+        self.assertEqual(date(2026, 6, 2), warnings[0].last_verified)
+        self.assertEqual(91, warnings[0].age_days)
+        self.assertEqual(90, warnings[0].threshold_days)
+        with self.assertRaises(FrozenInstanceError):
+            warnings[0].age_days = 92
+
+    def test_report_stale_cli_warns_without_blocking_and_formats_local_output(self):
+        for required in validator.REQUIRED_GOVERNANCE_FILES:
+            self.write(required, "# fixture\n")
+        self.write_arc42("01-introduction-and-goals.md", last_verified="2026-06-02")
+        stdout = StringIO()
+        stderr = StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = validator.main([
+                "--root", str(self.root), "--checks", "structure",
+                "--report-stale", "--as-of", "2026-09-01",
+            ])
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "WARNING: architecture/arc42/01-introduction-and-goals.md: last_verified 2026-06-02 is 91 days old (threshold: 90)",
+            stdout.getvalue(),
+        )
+        self.assertEqual("", stderr.getvalue())
+
+    def test_report_stale_cli_uses_github_warning_annotation(self):
+        for required in validator.REQUIRED_GOVERNANCE_FILES:
+            self.write(required, "# fixture\n")
+        self.write_arc42("01-introduction-and-goals.md", last_verified="2026-06-02")
+        stdout = StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False), redirect_stdout(stdout):
+            result = validator.main([
+                "--root", str(self.root), "--checks", "structure",
+                "--report-stale", "--as-of", "2026-09-01",
+            ])
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "::warning file=architecture/arc42/01-introduction-and-goals.md::last_verified 2026-06-02 is 91 days old (threshold: 90)",
+            stdout.getvalue(),
+        )
+
+    def test_report_stale_future_date_is_a_blocking_validation_error(self):
+        for required in validator.REQUIRED_GOVERNANCE_FILES:
+            self.write(required, "# fixture\n")
+        self.write_arc42("01-introduction-and-goals.md", last_verified="2026-09-02")
+        stderr = StringIO()
+
+        with redirect_stderr(stderr):
+            result = validator.main([
+                "--root", str(self.root), "--checks", "structure",
+                "--report-stale", "--as-of", "2026-09-01",
+            ])
+
+        self.assertEqual(1, result)
+        self.assertIn(
+            "architecture/arc42/01-introduction-and-goals.md: last_verified 2026-09-02 is in the future relative to 2026-09-01",
+            stderr.getvalue(),
+        )
+
+    def test_report_stale_requires_explicit_as_of_date(self):
+        with redirect_stderr(StringIO()) as stderr:
+            result = validator.main(["--root", str(self.root), "--checks", "structure", "--report-stale"])
+
+        self.assertEqual(2, result)
+        self.assertIn("--report-stale requires --as-of YYYY-MM-DD", stderr.getvalue())
 
     def test_metadata_accepts_deprecated_arc42_with_existing_replacement_link(self):
         self.write_complete_arc42()
@@ -1499,6 +1581,16 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
         (self.root / "architecture/diagrams/context.mmd").unlink()
         errors = validator.validate_diagrams(self.root)
         self.assertTrue(any("context.mmd is required" in error for error in errors), errors)
+
+    def test_report_stale_includes_mermaid_metadata(self):
+        self.write_complete_diagram_fixture()
+        self.write_diagram("context.mmd", last_verified="2026-06-02")
+
+        warnings = validator.report_stale(self.root, date(2026, 9, 1))
+
+        self.assertEqual(["architecture/diagrams/context.mmd"], [
+            warning.path.relative_to(self.root).as_posix() for warning in warnings
+        ])
 
     def test_diagrams_reject_non_executable_render_script_and_missing_reciprocal_link(self):
         script = self.write_complete_diagram_fixture()
