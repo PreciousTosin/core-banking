@@ -14,8 +14,16 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the ACC-25 worker-pool boundary: the Quarkus global executor is bounded to 2–8 threads
+ * plus a 32-task queue and rejects the first task beyond that capacity with a
+ * {@link RejectedExecutionException} instead of growing, blocking or dropping it silently. Catches
+ * a configuration drift that would let request load allocate unbounded threads or queue memory
+ * inside the 640 MiB container budget described in the README memory boundary.
+ */
 @QuarkusTest
 class WorkerPoolBoundsIT {
+    // Mirror quarkus.thread-pool.core-threads/max-threads/queue-size in application.properties.
     private static final int CORE_THREADS = 2;
     private static final int MAX_THREADS = 8;
     private static final int QUEUE_CAPACITY = 32;
@@ -24,6 +32,8 @@ class WorkerPoolBoundsIT {
     void globalWorkerPoolHasAFiniteQueueAndRejectsBeyondItsDeclaredCapacity() throws Exception {
         var executor = ExecutorRecorder.getCurrent();
 
+        // Eight blockers occupy every worker and hold it; the next 32 fill the queue; task 41
+        // has nowhere to go and must be rejected deterministically.
         int capacity = MAX_THREADS + QUEUE_CAPACITY;
         var release = new CountDownLatch(1);
         var started = new CountDownLatch(MAX_THREADS);

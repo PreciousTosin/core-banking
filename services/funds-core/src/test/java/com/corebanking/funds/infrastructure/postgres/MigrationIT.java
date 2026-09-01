@@ -21,6 +21,17 @@ import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the migrated schema on the Quarkus test datasource (a fresh Testcontainers PostgreSQL
+ * migrated by Flyway under the test profile): reference-table shape, the V003.2 finality trigger
+ * and single-reversal index, the ACC-24 role model, and the ACC-38/ACC-40/ACC-42 reference
+ * constraints (NUBAN check digits, identifier cardinality and immutability, product-version
+ * binding, period exclusion). Role tests read the catalog ACLs and then switch the session with
+ * {@code SET ROLE funds_app} / {@code SET ROLE funds_proof_reader} to observe real 42501 denials.
+ * Every test runs inside one rolled-back transaction except the lock test, which needs two
+ * connections. Catches a migration that widens a grant, moves ownership or drops a constraint the
+ * kernel relies on.
+ */
 @QuarkusTest
 class MigrationIT {
     private static final UUID BOOK_ID = uuid(1);
@@ -86,6 +97,8 @@ class MigrationIT {
                   AND trigger.tgname = 'posting_requires_in_progress_command'
                   AND NOT trigger.tgisinternal
                 """));
+            // V005 re-keys the index on the link alone: a second linked journal must not escape
+            // uniqueness by carrying a transaction_type other than REVERSAL.
             assertEquals(1, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_indexes
@@ -98,6 +111,15 @@ class MigrationIT {
         });
     }
 
+    /**
+     * Catalog proof of MIGRATION-ROLES.md: three NOLOGIN capability roles with no memberships,
+     * every funds object owned by {@code funds_migrator}, nothing granted to PUBLIC,
+     * {@code funds_app} limited to exactly five executable functions, column-limited INSERT on
+     * journal and outbox and USAGE-only on the journal sequence, {@code funds_proof_reader}
+     * limited to column SELECTs. Then, as {@code funds_app}, chart lifecycle UPDATE and
+     * {@code rotate_chart_version} are denied, and, as {@code funds_migrator}, freshly created
+     * objects inherit the hardened default privileges.
+     */
     @Test
     void installsHardenedRoleOwnershipAndExactPrivileges() throws Exception {
         inTransaction(connection -> {
@@ -131,6 +153,8 @@ class MigrationIT {
                 ) owned_object
                 WHERE owned_object.owner <> 'funds_migrator'::regrole
                 """));
+            // SECURITY DEFINER is permitted on exactly the trigger and lock functions; on any
+            // other function it would be an escalation path for funds_app.
             assertEquals(0, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_proc procedure
@@ -149,6 +173,8 @@ class MigrationIT {
                           'lock_period_for_posting',
                           'lock_account_mapping_for_posting'))
                 """));
+            // A pinned search_path on every function stops a definer from resolving an
+            // attacker-created object ahead of the funds one.
             assertEquals(0, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_proc procedure
@@ -323,6 +349,8 @@ class MigrationIT {
                 execute(connection, "RESET ROLE");
             }
 
+            // Default privileges must cover objects a later migration creates, not only the
+            // ones V004 revoked explicitly.
             execute(connection, "SET ROLE funds_migrator");
             try {
                 execute(connection, """
@@ -383,6 +411,13 @@ class MigrationIT {
         });
     }
 
+    /**
+     * Reads {@code V004__application_roles.sql} as text. It requires exactly three stripped lines
+     * matching {@code CREATE ROLE funds_(migrator|app|proof_reader)...} and forbids the substrings
+     * {@code IF NOT EXISTS}, {@code ALTER ROLE funds_}, {@code pg_auth_members} and
+     * {@code REVOKE %I FROM %I} anywhere in the file, comments included. Anyone editing V004,
+     * even to add a comment quoting one of those phrases, will fail this test by design.
+     */
     @Test
     void roleBootstrapIsFailClosedAndNeverAltersExistingClusterRoles() throws Exception {
         try (var input = MigrationIT.class.getResourceAsStream(
@@ -401,6 +436,11 @@ class MigrationIT {
         }
     }
 
+    /**
+     * The two queries are the exact per-book trial-balance and control-projection proof shapes;
+     * they touch only the columns V005 grants to {@code funds_proof_reader}, so a proof job needs
+     * nothing more, and the denials show it can get nothing more.
+     */
     @Test
     void proofReaderCanRunExactProofsButCannotReadOperationalOrPolicyPayloads()
         throws Exception {
@@ -628,6 +668,8 @@ class MigrationIT {
         });
     }
 
+    // 000011/0000014579 is the published check-digit worked example; 000000/0000000017 is the
+    // deterministic SIMULATOR_ONLY fixture named in the README and is not production-routable.
     @Test
     void sqlNubanValidatorAcceptsPublishedAndSyntheticFixtures() throws Exception {
         inTransaction(connection -> {
@@ -804,6 +846,12 @@ class MigrationIT {
         });
     }
 
+    /**
+     * Two sessions: the first inserts an external identifier and keeps its transaction open, so
+     * the scope trigger's lock on the ledger-account row is still held; the second, under a
+     * 250 ms lock_timeout, must fail (55P03) to update that account rather than race the scope
+     * check.
+     */
     @Test
     void externalIdentifierInsertLocksLedgerRowAgainstConcurrentUpdate() throws Exception {
         truncateReferenceTables();
@@ -888,6 +936,7 @@ class MigrationIT {
         });
     }
 
+    // Always rolled back: tests leave no rows behind and share the migrated database safely.
     private void inTransaction(SqlConsumer action) throws Exception {
         try (var connection = dataSource.getConnection()) {
             connection.setAutoCommit(false);
@@ -1044,6 +1093,8 @@ class MigrationIT {
                 routingScope, lifecycleStatus, primary, EVIDENCE_HASH);
     }
 
+    // Accepts any constraint-class rejection: string truncation, FK, unique, CHECK, exclusion,
+    // trigger-raised 55000 or lock timeout. Use assertSqlStateRejected when the exact code matters.
     private static void assertSqlRejected(Connection connection, String sql) throws SQLException {
         Savepoint beforeViolation = connection.setSavepoint();
         try {
