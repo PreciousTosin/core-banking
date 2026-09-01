@@ -6,7 +6,7 @@
 - Deciders: Architecture maintainers
 - Scope: Architecture documentation and ADR framework governance
 - Implementation status: Partial
-- Related proposals: None
+- Related proposals: [Full PoC platform](../proposals/README.md#full-poc-platform); [Production platform](../proposals/README.md#production-platform)
 - Related implementation plans: [Architecture Documentation and ADR Framework Implementation Plan](../../docs/superpowers/plans/2026-09-01-architecture-documentation-and-adr-framework-implementation.md)
 - Related pull requests: None
 - Related commits: None

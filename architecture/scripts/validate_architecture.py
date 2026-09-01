@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"adrs", "diagrams", "links", "metadata", "migration", "structure", "tooling"})
+CHECKS = frozenset({"adrs", "diagrams", "links", "metadata", "migration", "structure", "tooling", "traceability"})
 
 MIGRATION_SOURCE = "architecture/modern-core-banking-comprehensive-design-revised.md"
 MIGRATION_INVENTORY = "architecture/archive/comprehensive-design-migration-inventory.md"
@@ -55,7 +55,34 @@ ARC42_FILENAMES = frozenset({
 })
 ARC42_REQUIRED_FIELDS = ("title", "status", "owners", "last_verified", "related_adrs", "code_refs")
 ARC42_STATUSES = frozenset({"current", "deprecated"})
+PROPOSAL_IDENTITIES = (
+    "account-identifiers-and-nip-inbound",
+    "conventional-deposit-products-and-accrual",
+    "non-interest-banking-products",
+    "full-poc-platform",
+    "production-platform",
+    "providers-and-reconciliation",
+)
+PROPOSAL_STATUSES = frozenset({"draft", "proposed", "approved", "implementing", "implemented", "rejected", "superseded"})
+ACTIVE_PROPOSAL_STATUSES = PROPOSAL_STATUSES - frozenset({"implemented", "rejected", "superseded"})
 TERMINAL_PROPOSAL_STATUSES = frozenset({"implemented", "rejected", "superseded"})
+PROPOSAL_REQUIRED_FIELDS = ("title", "status", "owners", "target_release", "related_adrs", "related_plans")
+PROPOSAL_PLANS = {
+    "account-identifiers-and-nip-inbound": "docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md",
+    "conventional-deposit-products-and-accrual": "docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md",
+    "non-interest-banking-products": "docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md",
+}
+PROPOSAL_ADRS = {
+    "account-identifiers-and-nip-inbound": ("ADR-0002", "ADR-0004", "ADR-0006", "ADR-0007"),
+    "conventional-deposit-products-and-accrual": ("ADR-0002", "ADR-0003", "ADR-0004", "ADR-0005", "ADR-0006"),
+    "non-interest-banking-products": ("ADR-0002", "ADR-0003", "ADR-0004", "ADR-0005", "ADR-0006"),
+    "full-poc-platform": ("ADR-0001", "ADR-0002", "ADR-0004", "ADR-0006", "ADR-0008"),
+    "production-platform": ("ADR-0001", "ADR-0004", "ADR-0008"),
+    "providers-and-reconciliation": ("ADR-0002", "ADR-0004", "ADR-0006", "ADR-0007", "ADR-0008"),
+}
+ACCOUNTING_PLAN = "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md"
+FRAMEWORK_PLAN = "docs/superpowers/plans/2026-09-01-architecture-documentation-and-adr-framework-implementation.md"
+GOVERNED_PLANS = (FRAMEWORK_PLAN, ACCOUNTING_PLAN, *PROPOSAL_PLANS.values())
 DIAGRAM_FILENAMES = frozenset({
     "containers.mmd",
     "context.mmd",
@@ -307,6 +334,195 @@ def _validate_arc42_document(path: Path, root: Path) -> list[str]:
                 errors.append(_metadata_error(path, root, f"deprecated replacement {replacement_error}"))
     return errors
 
+def _proposal_registry_target(root: Path, identity: str, errors: list[str] | None = None) -> Path | None:
+    registry = root / "architecture/proposals/README.md"
+    prefix = f"architecture/proposals/README.md#{identity}"
+    if not registry.is_file():
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry is required")
+        return None
+    text = registry.read_text()
+    section = re.search(r"^## Governed proposal registry\s*$", _mask(text), re.M)
+    anchor_lines = _explicit_anchor_lines(text).get(identity, [])
+    if len(anchor_lines) != 1:
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry anchor must occur exactly once")
+        return None
+    if section is None:
+        if errors is not None:
+            errors.append(f"{prefix}: ## Governed proposal registry section is required")
+        return None
+    section_line = _mask(text)[:section.start()].count("\n")
+    next_section = next(
+        (index for index, line in enumerate(_mask(text).splitlines()[section_line + 1:], section_line + 1) if re.match(r"^##\s+", line)),
+        len(text.splitlines()),
+    )
+    if not section_line < anchor_lines[0] < next_section:
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry anchor must be inside ## Governed proposal registry")
+        return None
+    pointer = _proposal_registry_pointer(root, identity)
+    if pointer is None:
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry pointer must occur exactly once immediately after the anchor")
+        return None
+    local = _local_destination(pointer)
+    if local is None or local[1]:
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry pointer must be a fragment-free local link")
+        return None
+    destination, _ = local
+    if Path(destination).name != f"{identity}.md":
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry pointer basename must be {identity}.md")
+        return None
+    target = (registry.parent / destination).resolve()
+    allowed = {
+        (root / "architecture/proposals" / f"{identity}.md").resolve(),
+        (root / "architecture/archive/proposals" / f"{identity}.md").resolve(),
+    }
+    if target not in allowed:
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry pointer must name the active or archive same-basename record")
+        return None
+    if not target.is_file():
+        if errors is not None:
+            errors.append(f"{prefix}: proposal registry pointer target does not exist: {destination}")
+        return None
+    return target
+
+def _proposal_locations(root: Path, identity: str) -> tuple[Path, Path, list[Path]]:
+    active = root / "architecture/proposals" / f"{identity}.md"
+    archive = root / "architecture/archive/proposals" / f"{identity}.md"
+    return active, archive, [path for path in (active, archive) if path.is_file()]
+
+def _proposal_values(metadata: dict[str, str | list[str]], field: str) -> list[str] | None:
+    value = metadata.get(field)
+    if value == "None":
+        return None
+    if isinstance(value, list) and value and all(item.strip() for item in value):
+        return value
+    return []
+
+def _replacement_targets(path: Path, value: str | list[str] | None, root: Path) -> tuple[list[Path], str | None]:
+    values = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    if not values:
+        return [], "must contain one or more local Markdown links"
+    targets = []
+    for item in values:
+        links = extract_markdown_links(item)
+        if len(links) != 1 or not re.fullmatch(r"\s*\[[^]]+\]\((?:<[^>]+>|[^\s)]+)\)\s*", item):
+            return [], "must contain only local Markdown links"
+        local = _local_destination(links[0].destination)
+        if local is None:
+            return [], "must contain only local Markdown links"
+        destination, _ = local
+        target = path if not destination else (path.parent / destination).resolve()
+        if not target.is_file():
+            return [], f"target does not exist: {destination}"
+        targets.append(target)
+    return targets, None
+
+def _valid_proposal_evidence(root: Path, path: Path, value: str | list[str] | None) -> bool:
+    entries = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    if not entries or any(not entry.strip() for entry in entries):
+        return False
+    origin = _github_origin(root)
+    for entry in entries:
+        links = extract_markdown_links(entry)
+        destinations = [link.destination for link in links]
+        if not destinations:
+            match = re.fullmatch(r"(?:[0-9a-f]{7,40}\s+(?:changed|snapshot):\s+)?(.+)", entry.strip())
+            if not match:
+                return False
+            destinations = [item.strip() for item in match.group(1).split(";")]
+        valid_entry = False
+        for destination in destinations:
+            if re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/[1-9]\d*", destination):
+                match = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/[1-9]\d*", destination)
+                if origin and (match.group(1).casefold(), match.group(2).casefold()) == (origin[0].casefold(), origin[1].casefold()):
+                    valid_entry = True
+                continue
+            local = _local_destination(destination)
+            if local is None:
+                continue
+            destination_path, _ = local
+            target = (root / destination_path).resolve() if destination_path.startswith(("architecture/", "docs/", "services/", "infrastructure/", "contracts/", "test/")) else (path.parent / destination_path).resolve()
+            try:
+                target.relative_to(root.resolve())
+            except ValueError:
+                continue
+            if target.exists():
+                valid_entry = True
+        if not valid_entry:
+            return False
+    return True
+
+def _validate_proposal_document(path: Path, identity: str, archived: bool, root: Path) -> list[str]:
+    metadata = parse_front_matter(path)
+    errors = []
+    for field in PROPOSAL_REQUIRED_FIELDS:
+        if field not in metadata:
+            errors.append(_metadata_error(path, root, f"{field} is required"))
+    for field in ("title", "owners", "target_release"):
+        if field in metadata and not _has_values(metadata[field]):
+            errors.append(_metadata_error(path, root, f"{field} must not be empty"))
+    status = metadata.get("status")
+    if status not in PROPOSAL_STATUSES:
+        errors.append(_metadata_error(path, root, f"invalid proposal status: {status or 'missing'}"))
+    elif archived and status not in TERMINAL_PROPOSAL_STATUSES:
+        errors.append(_metadata_error(path, root, f"status {status} is not terminal"))
+    elif not archived and status not in ACTIVE_PROPOSAL_STATUSES:
+        errors.append(_metadata_error(path, root, f"terminal status {status} belongs in architecture/archive/proposals/"))
+    adrs = _proposal_values(metadata, "related_adrs")
+    if not adrs:
+        errors.append(_metadata_error(path, root, "related_adrs must contain one or more ADR IDs"))
+    else:
+        known = _adr_ids(root)
+        for adr in adrs:
+            if not re.fullmatch(r"ADR-\d{4}", adr) or adr not in known:
+                errors.append(_metadata_error(path, root, f"related_adrs ID does not exist: {adr}"))
+    plans = _proposal_values(metadata, "related_plans")
+    if plans == []:
+        errors.append(_metadata_error(path, root, "related_plans must be a non-empty list or literal None"))
+    elif plans:
+        for plan in plans:
+            if plan.startswith("/") or ".." in Path(plan).parts or not (root / plan).is_file():
+                errors.append(_metadata_error(path, root, f"related_plans path does not exist: {plan}"))
+    expected_plan = PROPOSAL_PLANS.get(identity)
+    if expected_plan and plans != [expected_plan]:
+        errors.append(_metadata_error(path, root, f"related_plans must retain the governed delivery plan {expected_plan}"))
+    if status in {"implementing", "implemented"} and not plans:
+        errors.append(_metadata_error(path, root, f"{status} proposal requires one or more related_plans because delivery began"))
+    if status in TERMINAL_PROPOSAL_STATUSES:
+        for field in ("implementation_status", "replacement", "implementation_evidence"):
+            if field not in metadata:
+                errors.append(_metadata_error(path, root, f"terminal proposal {field} is required"))
+        implementation_status = metadata.get("implementation_status")
+        replacement = metadata.get("replacement")
+        if status == "implemented":
+            if implementation_status != "Complete":
+                errors.append(_metadata_error(path, root, "implemented proposal implementation_status must be Complete"))
+            targets, replacement_error = _replacement_targets(path, replacement, root)
+            arc42 = (root / "architecture/arc42").resolve()
+            if replacement_error or not targets or any(target.parent != arc42 or target.suffix != ".md" for target in targets):
+                errors.append(_metadata_error(path, root, f"implemented replacement must link existing architecture/arc42 documents{': ' + replacement_error if replacement_error else ''}"))
+        elif status == "superseded":
+            if implementation_status != "Not applicable":
+                errors.append(_metadata_error(path, root, "superseded proposal implementation_status must be Not applicable"))
+            targets, replacement_error = _replacement_targets(path, replacement, root)
+            allowed_parents = {(root / "architecture/proposals").resolve(), (root / "architecture/archive/proposals").resolve()}
+            if replacement_error or not targets or any(target.parent not in allowed_parents or target.name == path.name for target in targets):
+                errors.append(_metadata_error(path, root, f"superseded replacement must link existing proposal records{': ' + replacement_error if replacement_error else ''}"))
+        elif status == "rejected":
+            if implementation_status != "Not applicable":
+                errors.append(_metadata_error(path, root, "rejected proposal implementation_status must be Not applicable"))
+            if replacement != "None":
+                errors.append(_metadata_error(path, root, "rejected proposal replacement must be literal None"))
+        if not _valid_proposal_evidence(root, path, metadata.get("implementation_evidence")):
+            errors.append(_metadata_error(path, root, "terminal proposal implementation_evidence must contain valid path-bound local or same-repository pull-request evidence"))
+    return errors
+
 def validate_metadata(root: Path) -> list[str]:
     errors = []
     arc42 = root / "architecture/arc42"
@@ -319,13 +535,23 @@ def validate_metadata(root: Path) -> list[str]:
     for name in sorted(expected & arc42_files):
         errors.extend(_validate_arc42_document(arc42 / name, root))
 
-    active = root / "architecture/proposals"
-    archive = root / "architecture/archive/proposals"
-    for directory, archived in ((active, False), (archive, True)):
+    governed_paths = set()
+    if (root / "architecture/proposals/README.md").is_file():
+        for identity in PROPOSAL_IDENTITIES:
+            active, archive, locations = _proposal_locations(root, identity)
+            governed_paths.update(path.resolve() for path in locations)
+            if len(locations) != 1:
+                errors.append(f"architecture/proposals/README.md#{identity}: proposal registry identity must have one sole active or archive record")
+            target = _proposal_registry_target(root, identity, errors)
+            if target is not None and (len(locations) != 1 or target != locations[0].resolve()):
+                errors.append(f"architecture/proposals/README.md#{identity}: proposal registry pointer must resolve to the sole record")
+            for path in locations:
+                errors.extend(_validate_proposal_document(path, identity, path == archive, root))
+    for directory, archived in ((root / "architecture/proposals", False), (root / "architecture/archive/proposals", True)):
         if not directory.is_dir():
             continue
         for path in sorted(directory.rglob("*.md")):
-            if path.name == "README.md":
+            if path.name == "README.md" or path.resolve() in governed_paths:
                 continue
             status = parse_front_matter(path).get("status")
             if archived and status not in TERMINAL_PROPOSAL_STATUSES:
@@ -1578,6 +1804,202 @@ def validate_accepted_adr_edge_range(root: Path, range_base: str, range_head: st
                 errors.append(f"{parent} -> {child}: {diagnostic}")
     return sorted(set(errors))
 
+def validate_proposal_bootstrap(root: Path) -> list[str]:
+    """Assert the one-time Task 7 state in which all governed records are active."""
+    errors = []
+    for identity in PROPOSAL_IDENTITIES:
+        active, archive, _ = _proposal_locations(root, identity)
+        target = _proposal_registry_target(root, identity, errors)
+        if not active.is_file():
+            errors.append(f"architecture/proposals/{identity}.md: active bootstrap proposal is required")
+        if archive.is_file():
+            errors.append(f"architecture/archive/proposals/{identity}.md: archive record is forbidden during proposal bootstrap")
+        if target is not None and target != active.resolve():
+            errors.append(f"architecture/proposals/README.md#{identity}: bootstrap pointer must resolve to the active record")
+    return sorted(errors)
+
+def _path_destinations(path: Path, root: Path) -> set[Path]:
+    if not path.is_file():
+        return set()
+    result = set()
+    for destination in extract_markdown_destinations(path.read_text()):
+        local = _local_destination(destination)
+        if local is None:
+            continue
+        name, _ = local
+        target = path.resolve() if not name else (path.parent / name).resolve()
+        try:
+            target.relative_to(root.resolve())
+        except ValueError:
+            continue
+        result.add(target)
+    return result
+
+def _label_destinations(path: Path, label: str) -> set[Path]:
+    if not path.is_file():
+        return set()
+    result = set()
+    pattern = re.compile(rf"^\*\*{re.escape(label)}:\*\*\s*(.*)$")
+    for line in _mask_markdown_code(path.read_text()).splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        for destination in extract_markdown_destinations(match.group(1)):
+            local = _local_destination(destination)
+            if local is not None:
+                name, _ = local
+                result.add(path.resolve() if not name else (path.parent / name).resolve())
+    return result
+
+def _adr_field_destinations(path: Path, field: str) -> set[Path]:
+    if not path.is_file():
+        return set()
+    result = set()
+    prefix = f"- {field}:"
+    for line in _mask_markdown_code(path.read_text()).splitlines():
+        if not line.startswith(prefix):
+            continue
+        for destination in extract_markdown_destinations(line[len(prefix):]):
+            local = _local_destination(destination)
+            if local is not None:
+                name, _ = local
+                result.add(path.resolve() if not name else (path.parent / name).resolve())
+    return result
+
+def _link_resolves(path: Path, destination: str, target: Path, fragment: str = "") -> bool:
+    local = _local_destination(destination)
+    if local is None:
+        return False
+    name, actual_fragment = local
+    actual_target = path.resolve() if not name else (path.parent / name).resolve()
+    return actual_target == target.resolve() and actual_fragment == fragment
+
+def _document_has_link(path: Path, target: Path, fragment: str = "") -> bool:
+    return path.is_file() and any(
+        _link_resolves(path, destination, target, fragment)
+        for destination in extract_markdown_destinations(path.read_text())
+    )
+
+def _label_has_link(path: Path, label: str, target: Path, fragment: str = "") -> bool:
+    if not path.is_file():
+        return False
+    pattern = re.compile(rf"^\*\*{re.escape(label)}:\*\*\s*(.*)$")
+    return any(
+        _link_resolves(path, destination, target, fragment)
+        for line in _mask_markdown_code(path.read_text()).splitlines()
+        for match in [pattern.match(line)]
+        if match
+        for destination in extract_markdown_destinations(match.group(1))
+    )
+
+def _adr_field_has_link(path: Path, field: str, target: Path, fragment: str = "") -> bool:
+    if not path.is_file():
+        return False
+    prefix = f"- {field}:"
+    return any(
+        _link_resolves(path, destination, target, fragment)
+        for line in _mask_markdown_code(path.read_text()).splitlines()
+        if line.startswith(prefix)
+        for destination in extract_markdown_destinations(line[len(prefix):])
+    )
+
+def _adr_path(root: Path, adr_id: str) -> Path | None:
+    matches = sorted((root / "architecture/adr").glob(f"{adr_id[4:]}-*.md"))
+    return matches[0] if len(matches) == 1 else None
+
+def _validate_infrastructure_traceability(root: Path) -> list[str]:
+    rel = "architecture/infrastructure/infra-ubuntu24.04-poc.md"
+    path = root / rel
+    if not path.is_file():
+        return [f"{rel}: governed full-PoC infrastructure detail is required"]
+    metadata = parse_front_matter(path)
+    errors = []
+    if metadata.get("status") != "proposed":
+        errors.append(f"{rel}: status must be proposed")
+    if metadata.get("owners") != ["platform"]:
+        errors.append(f"{rel}: owners must contain only platform")
+    if metadata.get("related_adrs") != ["ADR-0008"]:
+        errors.append(f"{rel}: related_adrs must contain only ADR-0008")
+    stable = "architecture/proposals/README.md#full-poc-platform"
+    if metadata.get("related_proposals") != [stable]:
+        errors.append(f"{rel}: related_proposals must contain only {stable}")
+    if "> **Architecture state: PROPOSED — non-current.**" not in path.read_text():
+        errors.append(f"{rel}: visible marker PROPOSED — non-current is required")
+    proposal = _proposal_registry_target(root, "full-poc-platform", errors)
+    if proposal is not None and not _document_has_link(proposal, path):
+        errors.append(f"{rel}: full-PoC proposal must link directly to the infrastructure document")
+    registry = (root / "architecture/proposals/README.md").resolve()
+    if not _document_has_link(path, registry, "full-poc-platform"):
+        errors.append(f"{rel}: infrastructure document must link directly to the full-PoC stable identity")
+    adr = _adr_path(root, "ADR-0008")
+    if adr is None or not _adr_field_has_link(adr, "Related proposals", registry, "full-poc-platform"):
+        errors.append(f"{rel}: ADR-0008 Related proposals must link the full-PoC stable identity")
+    return errors
+
+def validate_traceability(root: Path) -> list[str]:
+    errors = []
+    registry = (root / "architecture/proposals/README.md").resolve()
+    for identity in PROPOSAL_IDENTITIES:
+        target = _proposal_registry_target(root, identity, errors)
+        if target is None:
+            continue
+        metadata = parse_front_matter(target)
+        stable_fragment = f"architecture/proposals/README.md#{identity}"
+        adrs = _proposal_values(metadata, "related_adrs") or []
+        plans = _proposal_values(metadata, "related_plans")
+        if tuple(adrs) != PROPOSAL_ADRS[identity]:
+            errors.append(f"{target.relative_to(root).as_posix()}: related_adrs must match the governed {identity} mapping exactly")
+        expected_plan = PROPOSAL_PLANS.get(identity)
+        if expected_plan and plans != [expected_plan]:
+            errors.append(f"{target.relative_to(root).as_posix()}: related_plans must name only {expected_plan}")
+        record_destinations = _path_destinations(target, root)
+        for adr_id in adrs:
+            adr = _adr_path(root, adr_id)
+            if adr is None:
+                errors.append(f"{target.relative_to(root).as_posix()}: related ADR does not resolve uniquely: {adr_id}")
+                continue
+            if adr.resolve() not in record_destinations:
+                errors.append(f"{target.relative_to(root).as_posix()}: proposal must retain a direct link to {adr_id}")
+            if not _adr_field_has_link(adr, "Related proposals", registry, identity):
+                errors.append(f"{adr.relative_to(root).as_posix()}: Related proposals must link {stable_fragment}")
+        for plan_name in plans or []:
+            plan = root / plan_name
+            if not plan.is_file():
+                errors.append(f"{target.relative_to(root).as_posix()}: related plan does not exist: {plan_name}")
+                continue
+            if plan.resolve() not in record_destinations:
+                errors.append(f"{target.relative_to(root).as_posix()}: proposal must retain a direct link to {plan_name}")
+            if not _label_has_link(plan, "Proposal", registry, identity):
+                errors.append(f"{plan_name}: proposal backlink must link {stable_fragment}")
+
+    adr_dir = (root / "architecture/adr").resolve()
+    for plan_name in GOVERNED_PLANS:
+        plan = root / plan_name
+        if not plan.is_file():
+            continue
+        direct_adrs = {path for path in _path_destinations(plan, root) if path.parent == adr_dir and re.match(r"^\d{4}-.*\.md$", path.name)}
+        for adr in direct_adrs:
+            if plan.resolve() not in _adr_field_destinations(adr, "Related implementation plans"):
+                errors.append(f"{plan_name}: direct ADR link has no ADR plan backlink: {adr.relative_to(root).as_posix()}")
+        for adr in sorted((root / "architecture/adr").glob("[0-9][0-9][0-9][0-9]-*.md")):
+            if plan.resolve() in _adr_field_destinations(adr, "Related implementation plans") and adr.resolve() not in direct_adrs:
+                errors.append(f"{adr.relative_to(root).as_posix()}: ADR plan backlink has no direct plan link: {plan_name}")
+
+    accounting = root / ACCOUNTING_PLAN
+    if accounting.is_file():
+        expected_current = {(root / f"architecture/arc42/{name}").resolve() for name in ("05-building-block-view.md", "06-runtime-view.md", "08-crosscutting-concepts.md")}
+        if _label_destinations(accounting, "Current architecture") != expected_current:
+            errors.append(f"{ACCOUNTING_PLAN}: Current architecture must link arc42 sections 05, 06, and 08 exactly")
+        retrospective = _label_destinations(accounting, "Retrospective ADRs")
+        retrospective_ids = {f"ADR-{path.name[:4]}" for path in retrospective if re.match(r"^\d{4}-", path.name)}
+        if retrospective_ids != {f"ADR-{number:04d}" for number in range(2, 7)}:
+            errors.append(f"{ACCOUNTING_PLAN}: Retrospective ADRs must link ADR-0002 through ADR-0006 exactly")
+        if re.search(r"^\*\*Proposal:\*\*", _mask_markdown_code(accounting.read_text()), re.M):
+            errors.append(f"{ACCOUNTING_PLAN}: implemented accounting-kernel plan must not have a Proposal backlink")
+
+    errors.extend(_validate_infrastructure_traceability(root))
+    return sorted(set(errors))
+
 Validator = Callable[[Path], list[str]]
 VALIDATORS: dict[str, Validator] = {
     "adrs": validate_adrs,
@@ -1587,6 +2009,7 @@ VALIDATORS: dict[str, Validator] = {
     "migration": validate_migration_inventory,
     "structure": validate_structure,
     "tooling": validate_tooling,
+    "traceability": validate_traceability,
 }
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:

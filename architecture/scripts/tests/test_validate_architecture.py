@@ -198,6 +198,283 @@ class ValidatorTest(unittest.TestCase):
         self.assertTrue(any("architecture/proposals/active.md: terminal status implemented belongs in architecture/archive/proposals/" in error for error in errors))
         self.assertTrue(any("architecture/archive/proposals/archive.md: status proposed is not terminal" in error for error in errors))
 
+    PROPOSAL_IDENTITIES = (
+        "account-identifiers-and-nip-inbound",
+        "conventional-deposit-products-and-accrual",
+        "non-interest-banking-products",
+        "full-poc-platform",
+        "production-platform",
+        "providers-and-reconciliation",
+    )
+
+    PROPOSAL_PLANS = {
+        "account-identifiers-and-nip-inbound": "docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md",
+        "conventional-deposit-products-and-accrual": "docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md",
+        "non-interest-banking-products": "docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md",
+    }
+
+    PROPOSAL_ADRS = {
+        "account-identifiers-and-nip-inbound": ("ADR-0002", "ADR-0004", "ADR-0006", "ADR-0007"),
+        "conventional-deposit-products-and-accrual": ("ADR-0002", "ADR-0003", "ADR-0004", "ADR-0005", "ADR-0006"),
+        "non-interest-banking-products": ("ADR-0002", "ADR-0003", "ADR-0004", "ADR-0005", "ADR-0006"),
+        "full-poc-platform": ("ADR-0001", "ADR-0002", "ADR-0004", "ADR-0006", "ADR-0008"),
+        "production-platform": ("ADR-0001", "ADR-0004", "ADR-0008"),
+        "providers-and-reconciliation": ("ADR-0002", "ADR-0004", "ADR-0006", "ADR-0007", "ADR-0008"),
+    }
+
+    def proposal_record(
+        self,
+        identity,
+        *,
+        status=None,
+        related_plans=None,
+        related_adrs=None,
+        implementation_status=None,
+        replacement=None,
+        implementation_evidence=None,
+        extra_body="",
+    ):
+        status = status or ("approved" if identity in self.PROPOSAL_PLANS else "proposed")
+        related_plans = related_plans if related_plans is not None else self.PROPOSAL_PLANS.get(identity, "None")
+        related_adrs = related_adrs if related_adrs is not None else self.PROPOSAL_ADRS[identity]
+        plan_lines = f"  - {related_plans}" if related_plans != "None" else "None"
+        adr_lines = "\n".join(f"  - {adr}" for adr in related_adrs) if related_adrs != "None" else "None"
+        terminal = ""
+        if implementation_status is not None:
+            terminal += f"implementation_status: {implementation_status}\n"
+        if replacement is not None:
+            terminal += f"replacement: {replacement}\n"
+        if implementation_evidence is not None:
+            terminal += f"implementation_evidence:\n  - {implementation_evidence}\n"
+        return (
+            "---\n"
+            f"title: {identity}\n"
+            f"status: {status}\n"
+            "owners:\n  - architecture\n"
+            "target_release: undecided\n"
+            f"related_adrs:\n{adr_lines}\n"
+            f"related_plans: {plan_lines if plan_lines == 'None' else ''}\n"
+            + (f"{plan_lines}\n" if plan_lines != "None" else "")
+            + terminal
+            + "---\n"
+            + f"# {identity}\n\n{extra_body}"
+        )
+
+    def write_proposal_registry(self, pointers=None, markers=None):
+        pointers = pointers or {identity: f"{identity}.md" for identity in self.PROPOSAL_IDENTITIES}
+        markers = markers or {}
+        entries = []
+        for identity in self.PROPOSAL_IDENTITIES:
+            entries.append(f'<a id="{identity}"></a>')
+            entries.extend(f"<!-- migration-source: {marker} -->" for marker in markers.get(identity, ()))
+            pointer = pointers.get(identity)
+            if pointer:
+                entries.append(f"[{identity}]({pointer})")
+            entries.append("")
+        self.write("architecture/proposals/README.md", "# Proposals\n\n## Governed proposal registry\n\n" + "\n".join(entries))
+
+    def write_proposal_fixture(self):
+        self.write_proposal_registry()
+        for identity in self.PROPOSAL_IDENTITIES:
+            body = "## Relationships\n\n" + ", ".join(
+                f"[{adr}](../adr/{adr[4:]}-test.md)" for adr in self.PROPOSAL_ADRS[identity]
+            ) + "\n"
+            if identity in self.PROPOSAL_PLANS:
+                body += f"\n[Implementation plan](../../{self.PROPOSAL_PLANS[identity]})\n"
+            if identity == "full-poc-platform":
+                body += "\n[Infrastructure](../infrastructure/infra-ubuntu24.04-poc.md)\n"
+            self.write(f"architecture/proposals/{identity}.md", self.proposal_record(identity, extra_body=body))
+        for identity, plan in self.PROPOSAL_PLANS.items():
+            proposal = f"architecture/proposals/README.md#{identity}"
+            adrs = self.PROPOSAL_ADRS[identity]
+            self.write(plan, f"# Plan\n\n**Proposal:** [Proposal](../../../{proposal})\n\n**Related ADRs:** " + ", ".join(f"[x](../../../architecture/adr/{adr[4:]}-test.md)" for adr in adrs) + "\n")
+        self.write(
+            "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md",
+            "# Accounting\n\n"
+            "**Current architecture:** [05](../../../architecture/arc42/05-building-block-view.md), [06](../../../architecture/arc42/06-runtime-view.md), [08](../../../architecture/arc42/08-crosscutting-concepts.md)\n\n"
+            "**Retrospective ADRs:** [2](../../../architecture/adr/0002-test.md), [3](../../../architecture/adr/0003-test.md), [4](../../../architecture/adr/0004-test.md), [5](../../../architecture/adr/0005-test.md), [6](../../../architecture/adr/0006-test.md)\n",
+        )
+        for name in ("05-building-block-view.md", "06-runtime-view.md", "08-crosscutting-concepts.md"):
+            self.write(f"architecture/arc42/{name}", "# Arc42\n")
+        for number in range(1, 9):
+            adr = f"ADR-{number:04d}"
+            proposal_links = []
+            plan_links = []
+            for identity in self.PROPOSAL_IDENTITIES:
+                if adr in self.PROPOSAL_ADRS[identity]:
+                    proposal_links.append(f"[Proposal](../proposals/README.md#{identity})")
+            for identity, plan in self.PROPOSAL_PLANS.items():
+                if adr in self.PROPOSAL_ADRS[identity]:
+                    plan_links.append(f"[Plan](../../{plan})")
+            if 2 <= number <= 6:
+                plan_links.append("[Accounting](../../docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md)")
+            self.write(
+                f"architecture/adr/{number:04d}-test.md",
+                f"# {adr}\n\n- Related proposals: {', '.join(proposal_links) or 'None'}\n"
+                f"- Related implementation plans: {', '.join(plan_links) or 'None'}\n",
+            )
+        self.write(
+            "architecture/infrastructure/infra-ubuntu24.04-poc.md",
+            "---\nstatus: proposed\nowners:\n  - platform\nrelated_adrs:\n  - ADR-0008\nrelated_proposals:\n  - architecture/proposals/README.md#full-poc-platform\n---\n"
+            "> **Architecture state: PROPOSED — non-current.**\n\n"
+            "[Full PoC proposal](../proposals/README.md#full-poc-platform)\n",
+        )
+
+    def traceability_errors(self):
+        self.assertTrue(hasattr(validator, "validate_traceability"), "validate_traceability must be implemented")
+        return validator.validate_traceability(self.root)
+
+    def test_proposal_bootstrap_requires_all_six_active_registry_targets_but_is_not_permanent(self):
+        self.write_proposal_fixture()
+        self.assertTrue(hasattr(validator, "validate_proposal_bootstrap"), "validate_proposal_bootstrap must be implemented")
+        self.assertEqual([], validator.validate_proposal_bootstrap(self.root))
+        self.assertNotIn("proposal-bootstrap", validator.CHECKS)
+        self.assertNotIn("proposal-bootstrap", getattr(validator, "VALIDATORS", {}))
+        identity = self.PROPOSAL_IDENTITIES[0]
+        active = self.root / f"architecture/proposals/{identity}.md"
+        archive = self.root / f"architecture/archive/proposals/{identity}.md"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        active.replace(archive)
+        pointers = {name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}
+        pointers[identity] = f"../archive/proposals/{identity}.md"
+        self.write_proposal_registry(pointers)
+        self.assertTrue(validator.validate_proposal_bootstrap(self.root))
+
+    def test_metadata_requires_six_unique_same_basename_registry_locations(self):
+        self.write_proposal_fixture()
+        self.assertFalse(any("proposal registry" in error for error in validator.validate_metadata(self.root)))
+        identity = self.PROPOSAL_IDENTITIES[0]
+        cases = {
+            "missing": (lambda: (self.root / f"architecture/proposals/{identity}.md").unlink(), "must have one sole active or archive record"),
+            "active-and-archive": (lambda: self.write(f"architecture/archive/proposals/{identity}.md", self.proposal_record(identity, status="rejected", related_plans="None", implementation_status="Not applicable", replacement="None", implementation_evidence="architecture/proposals/README.md")), "must have one sole active or archive record"),
+            "stale-pointer": (lambda: self.write_proposal_registry({**{name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}, identity: f"../archive/proposals/{identity}.md"}), "pointer target does not exist"),
+            "duplicate-anchor": (lambda: self.write("architecture/proposals/README.md", (self.root / "architecture/proposals/README.md").read_text() + f'\n<a id="{identity}"></a>\n'), "must occur exactly once"),
+            "wrong-basename": (lambda: self.write_proposal_registry({**{name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}, identity: "full-poc-platform.md"}), "pointer basename"),
+        }
+        for name, (mutate, fragment) in cases.items():
+            with self.subTest(name=name):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.write_proposal_fixture(); mutate()
+                errors = validator.validate_metadata(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_metadata_enforces_proposal_required_fields_status_and_delivery_plan(self):
+        self.write_proposal_fixture()
+        identity = "full-poc-platform"
+        cases = {
+            "status": (self.proposal_record(identity, status="current"), "invalid proposal status"),
+            "owners": (self.proposal_record(identity).replace("owners:\n  - architecture\n", ""), "owners is required"),
+            "target": (self.proposal_record(identity).replace("target_release: undecided\n", ""), "target_release is required"),
+            "adrs": (self.proposal_record(identity, related_adrs="None"), "related_adrs must contain"),
+            "plans": (self.proposal_record(identity).replace("related_plans: None\n", ""), "related_plans is required"),
+            "implementing-plan": (self.proposal_record(identity, status="implementing", related_plans="None"), "implementing proposal requires"),
+        }
+        for name, (record, fragment) in cases.items():
+            with self.subTest(name=name):
+                self.write(f"architecture/proposals/{identity}.md", record)
+                errors = validator.validate_metadata(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_metadata_accepts_terminal_proposal_variants_and_rejects_invalid_contracts(self):
+        self.write_proposal_fixture()
+        identity = "account-identifiers-and-nip-inbound"
+        active = self.root / f"architecture/proposals/{identity}.md"
+        archive_path = f"architecture/archive/proposals/{identity}.md"
+        plan = self.PROPOSAL_PLANS[identity]
+        implemented = self.proposal_record(identity, status="implemented", implementation_status="Complete", replacement="[Current](../../arc42/05-building-block-view.md)", implementation_evidence="docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md")
+        active.unlink(); self.write(archive_path, implemented)
+        pointers = {name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}; pointers[identity] = f"../archive/proposals/{identity}.md"; self.write_proposal_registry(pointers)
+        self.assertFalse(any(identity in error for error in validator.validate_metadata(self.root)), validator.validate_metadata(self.root))
+        for status, plans, replacement in (("rejected", plan, "None"), ("superseded", plan, "[Next](../../proposals/full-poc-platform.md)")):
+            with self.subTest(status=status, plans=plans):
+                self.write(archive_path, self.proposal_record(identity, status=status, related_plans=plans, implementation_status="Not applicable", replacement=replacement, implementation_evidence="architecture/proposals/README.md"))
+                self.assertFalse(any(identity in error for error in validator.validate_metadata(self.root)), validator.validate_metadata(self.root))
+        active_identity = "production-platform"
+        (self.root / f"architecture/proposals/{active_identity}.md").unlink()
+        none_archive = f"architecture/archive/proposals/{active_identity}.md"
+        pointers[active_identity] = f"../archive/proposals/{active_identity}.md"
+        self.write_proposal_registry(pointers)
+        for status, replacement in (("rejected", "None"), ("superseded", "[Next](../../proposals/full-poc-platform.md)")):
+            with self.subTest(status=status, plans="None"):
+                self.write(none_archive, self.proposal_record(active_identity, status=status, related_plans="None", implementation_status="Not applicable", replacement=replacement, implementation_evidence="architecture/proposals/README.md"))
+                self.assertFalse(any(active_identity in error for error in validator.validate_metadata(self.root)), validator.validate_metadata(self.root))
+        invalid = {
+            "implementation-status": self.proposal_record(identity, status="implemented", implementation_status="Partial", replacement="[Current](../../arc42/05-building-block-view.md)", implementation_evidence="architecture/proposals/README.md"),
+            "replacement": self.proposal_record(identity, status="rejected", related_plans="None", implementation_status="Not applicable", replacement="[Wrong](../../arc42/05-building-block-view.md)", implementation_evidence="architecture/proposals/README.md"),
+            "evidence": self.proposal_record(identity, status="rejected", related_plans="None", implementation_status="Not applicable", replacement="None"),
+        }
+        for name, record in invalid.items():
+            with self.subTest(name=name):
+                self.write(archive_path, record)
+                errors = validator.validate_metadata(self.root)
+                self.assertTrue(any(identity in error for error in errors), errors)
+
+    def test_traceability_enforces_proposal_plan_and_adr_reciprocity(self):
+        self.write_proposal_fixture()
+        self.assertEqual([], self.traceability_errors())
+        identity = "account-identifiers-and-nip-inbound"
+        plan = self.root / self.PROPOSAL_PLANS[identity]
+        plan.write_text(plan.read_text().replace("**Proposal:**", "**Former proposal:**"))
+        self.assertTrue(any("proposal backlink" in error for error in self.traceability_errors()))
+        self.write_proposal_fixture()
+        adr = self.root / "architecture/adr/0002-test.md"
+        adr.write_text(adr.read_text().replace(f"[Proposal](../proposals/README.md#{identity}), ", ""))
+        self.assertTrue(any("Related proposals" in error for error in self.traceability_errors()))
+
+    def test_traceability_enforces_direct_plan_adr_reciprocity_both_directions(self):
+        self.write_proposal_fixture()
+        plan = self.root / self.PROPOSAL_PLANS["conventional-deposit-products-and-accrual"]
+        plan.write_text(plan.read_text().replace("[x](../../../architecture/adr/0003-test.md), ", ""))
+        self.assertTrue(any("ADR plan backlink has no direct plan link" in error for error in self.traceability_errors()))
+        self.write_proposal_fixture()
+        adr = self.root / "architecture/adr/0003-test.md"
+        target = "[Plan](../../docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md), "
+        adr.write_text(adr.read_text().replace(target, ""))
+        self.assertTrue(any("direct ADR link has no ADR plan backlink" in error for error in self.traceability_errors()))
+
+    def test_traceability_enforces_accounting_kernel_current_and_retrospective_links_without_proposal(self):
+        self.write_proposal_fixture()
+        accounting = self.root / "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md"
+        accounting.write_text(accounting.read_text().replace("[05](../../../architecture/arc42/05-building-block-view.md), ", ""))
+        self.assertTrue(any("Current architecture" in error for error in self.traceability_errors()))
+        self.write_proposal_fixture(); accounting = self.root / "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md"
+        accounting.write_text(accounting.read_text().replace("[2](../../../architecture/adr/0002-test.md), ", ""))
+        self.assertTrue(any("Retrospective ADRs" in error for error in self.traceability_errors()))
+        self.write_proposal_fixture(); accounting = self.root / "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md"
+        accounting.write_text(accounting.read_text() + "\n**Proposal:** [Wrong](../../../architecture/proposals/README.md#full-poc-platform)\n")
+        self.assertTrue(any("must not have a Proposal backlink" in error for error in self.traceability_errors()))
+
+    def test_infrastructure_governance_contract_is_exact_and_reciprocal(self):
+        self.write_proposal_fixture()
+        self.assertFalse(any("infra-ubuntu24.04-poc.md" in error for error in self.traceability_errors()))
+        infra = self.root / "architecture/infrastructure/infra-ubuntu24.04-poc.md"
+        cases = {
+            "marker": (lambda text: text.replace("> **Architecture state: PROPOSED — non-current.**", "> **Architecture state: CURRENT.**"), "PROPOSED — non-current"),
+            "absent-marker": (lambda text: text.replace("> **Architecture state: PROPOSED — non-current.**\n\n", ""), "PROPOSED — non-current"),
+            "status": (lambda text: text.replace("status: proposed", "status: current"), "status must be proposed"),
+            "owner": (lambda text: text.replace("  - platform", "  - operations"), "owners must contain only platform"),
+            "adr": (lambda text: text.replace("  - ADR-0008", "  - ADR-0007"), "related_adrs must contain only ADR-0008"),
+            "proposal": (lambda text: text.replace("#full-poc-platform", "#production-platform"), "related_proposals must contain only"),
+        }
+        original = infra.read_text()
+        for name, (mutate, fragment) in cases.items():
+            with self.subTest(name=name):
+                infra.write_text(mutate(original))
+                self.assertTrue(any(fragment in error for error in self.traceability_errors()))
+                infra.write_text(original)
+        proposal = self.root / "architecture/proposals/full-poc-platform.md"
+        proposal.write_text(proposal.read_text().replace("[Infrastructure](../infrastructure/infra-ubuntu24.04-poc.md)\n", ""))
+        self.assertTrue(any("full-PoC proposal must link" in error for error in self.traceability_errors()))
+        self.write_proposal_fixture()
+        pointers = {identity: f"{identity}.md" for identity in self.PROPOSAL_IDENTITIES}
+        pointers["full-poc-platform"] = "../archive/proposals/full-poc-platform.md"
+        self.write_proposal_registry(pointers)
+        self.assertTrue(any("pointer target does not exist" in error for error in self.traceability_errors()))
+        self.write_proposal_fixture()
+        adr = self.root / "architecture/adr/0008-test.md"
+        adr.write_text(adr.read_text().replace("[Proposal](../proposals/README.md#full-poc-platform), ", ""))
+        self.assertTrue(any("ADR-0008 Related proposals" in error for error in self.traceability_errors()))
+
     def test_required_governance_files(self):
         errors = validator.validate_structure(self.root)
         self.assertEqual(

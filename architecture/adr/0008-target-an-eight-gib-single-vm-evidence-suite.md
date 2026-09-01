@@ -6,7 +6,7 @@
 - Deciders: Architecture and funds-core maintainers
 - Scope: PoC resource budget and evidence boundary
 - Implementation status: Partial
-- Related proposals: None
+- Related proposals: [Full PoC platform](../proposals/README.md#full-poc-platform); [Production platform](../proposals/README.md#production-platform); [Providers and reconciliation](../proposals/README.md#providers-and-reconciliation)
 - Related implementation plans: None
 - Related pull requests: None
 - Related commits: None

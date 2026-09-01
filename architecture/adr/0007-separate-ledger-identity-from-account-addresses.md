@@ -6,8 +6,8 @@
 - Deciders: Funds-core maintainers
 - Scope: Ledger account identity and external account-address foundations
 - Implementation status: Partial
-- Related proposals: None
-- Related implementation plans: None
+- Related proposals: [Account identifiers and NIP inbound](../proposals/README.md#account-identifiers-and-nip-inbound); [Providers and reconciliation](../proposals/README.md#providers-and-reconciliation)
+- Related implementation plans: [Account identifiers and NIP inbound plan](../../docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md)
 - Related pull requests: None
 - Related commits: None
 - Related architecture sections: [Constraints](../arc42/02-constraints.md); [Context and scope](../arc42/03-context-and-scope.md); [Building-block view](../arc42/05-building-block-view.md); [Crosscutting concepts](../arc42/08-crosscutting-concepts.md); [Decisions index](../arc42/09-decisions.md); [Quality requirements](../arc42/10-quality-requirements.md); [Risks and technical debt](../arc42/11-risks-and-technical-debt.md); [Glossary](../arc42/12-glossary.md)

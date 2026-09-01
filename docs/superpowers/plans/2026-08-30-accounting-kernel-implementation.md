@@ -1,5 +1,9 @@
 # Accounting Kernel Implementation Plan
 
+**Current architecture:** [Building-block view](../../../architecture/arc42/05-building-block-view.md), [Runtime view](../../../architecture/arc42/06-runtime-view.md), and [Crosscutting concepts](../../../architecture/arc42/08-crosscutting-concepts.md)
+
+**Retrospective ADRs:** [ADR-0002](../../../architecture/adr/0002-centralize-financial-invariants-in-funds-core.md), [ADR-0003](../../../architecture/adr/0003-use-signed-integer-minor-units.md), [ADR-0004](../../../architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md), [ADR-0005](../../../architecture/adr/0005-use-immutable-journals-and-additive-corrections.md), and [ADR-0006](../../../architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the Java `funds-core` accounting kernel that owns books, chart-of-accounts reference data, immutable account-address and product-version foundations, immutable balanced journals, checked monetary arithmetic, idempotent posting, materialised balances, outbox facts, accounting periods, reversals, trial-balance proof and subledger/control-account proof.

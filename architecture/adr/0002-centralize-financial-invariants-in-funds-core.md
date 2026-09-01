@@ -6,8 +6,8 @@
 - Deciders: Funds-core maintainers
 - Scope: Financial invariant ownership and proof boundaries
 - Implementation status: Complete
-- Related proposals: None
-- Related implementation plans: None
+- Related proposals: [Account identifiers and NIP inbound](../proposals/README.md#account-identifiers-and-nip-inbound); [Conventional deposit products and accrual](../proposals/README.md#conventional-deposit-products-and-accrual); [Non-interest banking products](../proposals/README.md#non-interest-banking-products); [Full PoC platform](../proposals/README.md#full-poc-platform); [Providers and reconciliation](../proposals/README.md#providers-and-reconciliation)
+- Related implementation plans: [Account identifiers and NIP inbound plan](../../docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md); [Accounting kernel plan](../../docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md); [Conventional deposit products and accrual plan](../../docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md); [Non-interest banking products plan](../../docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md)
 - Related pull requests: None
 - Related commits: None
 - Related architecture sections: [Introduction and goals](../arc42/01-introduction-and-goals.md); [Solution strategy](../arc42/04-solution-strategy.md); [Building-block view](../arc42/05-building-block-view.md); [Runtime view](../arc42/06-runtime-view.md); [Crosscutting concepts](../arc42/08-crosscutting-concepts.md); [Decisions index](../arc42/09-decisions.md); [Quality requirements](../arc42/10-quality-requirements.md)

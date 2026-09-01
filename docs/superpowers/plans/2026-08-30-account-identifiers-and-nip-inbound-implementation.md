@@ -1,5 +1,9 @@
 # Account Identifiers and Simulated NIP Inbound Implementation Plan
 
+**Proposal:** [Account identifiers and simulated NIP inbound](../../../architecture/proposals/README.md#account-identifiers-and-nip-inbound)
+
+**Related ADRs:** [ADR-0002](../../../architecture/adr/0002-centralize-financial-invariants-in-funds-core.md), [ADR-0004](../../../architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md), [ADR-0006](../../../architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md), and [ADR-0007](../../../architecture/adr/0007-separate-ledger-identity-from-account-addresses.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Keep checkbox state in this file.
 
 **Goal:** Let one customer ledger account safely own a primary synthetic NUBAN and multiple provider virtual-account aliases, expose account details, and process simulated NIP/provider inbound credits exactly once without confusing an account address with transaction identity.

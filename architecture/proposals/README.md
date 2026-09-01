@@ -17,22 +17,15 @@ registry anchor so they continue to identify the same proposal across a move.
 Proposal records link their ADRs and implementation plans. Implemented,
 rejected, and superseded records are archived under the same basename.
 
-## Provisional migration destinations
-
-These temporary governance anchors classify unimplemented material until Task
-7 creates the six governed proposal identities and remaps the inventory to
-their permanent registry anchors. They are not proposal records and do not
-claim that any design or manifest is deployed.
-
-<a id="migration-provisional-account-identifiers-and-nip-inbound"></a>
+<a id="account-identifiers-and-nip-inbound"></a>
 <!-- migration-source: 12.01.01 -->
-Account identifiers and simulated NIP inbound proposal material.
+[Account identifiers and simulated NIP inbound](account-identifiers-and-nip-inbound.md)
 
-<a id="migration-provisional-conventional-deposit-products-and-accrual"></a>
+<a id="conventional-deposit-products-and-accrual"></a>
 <!-- migration-source: 08.15 -->
-Conventional deposit products and accrual proposal material.
+[Conventional deposit products and accrual](conventional-deposit-products-and-accrual.md)
 
-<a id="migration-provisional-full-poc-platform"></a>
+<a id="full-poc-platform"></a>
 <!-- migration-source: 01::03 -->
 <!-- migration-source: 02.02 -->
 <!-- migration-source: 03.01 -->
@@ -101,13 +94,13 @@ Conventional deposit products and accrual proposal material.
 <!-- migration-source: 23.05 -->
 <!-- migration-source: 24 -->
 <!-- migration-source: 27 -->
-Full single-VPS PoC platform proposal material.
+[Full single-VM proof-of-concept platform](full-poc-platform.md)
 
-<a id="migration-provisional-non-interest-banking-products"></a>
+<a id="non-interest-banking-products"></a>
 <!-- migration-source: 08.16 -->
-Non-interest banking products proposal material.
+[Non-interest banking products](non-interest-banking-products.md)
 
-<a id="migration-provisional-production-platform"></a>
+<a id="production-platform"></a>
 <!-- migration-source: 02.01 -->
 <!-- migration-source: 04.06 -->
 <!-- migration-source: 13.07 -->
@@ -122,9 +115,9 @@ Non-interest banking products proposal material.
 <!-- migration-source: 20.01 -->
 <!-- migration-source: 20.02 -->
 <!-- migration-source: 20.03 -->
-Production-platform proposal material.
+[Production platform](production-platform.md)
 
-<a id="migration-provisional-providers-and-reconciliation"></a>
+<a id="providers-and-reconciliation"></a>
 <!-- migration-source: 04.05 -->
 <!-- migration-source: 10.01 -->
 <!-- migration-source: 10.02 -->
@@ -150,4 +143,4 @@ Production-platform proposal material.
 <!-- migration-source: 15.07 -->
 <!-- migration-source: 15.08 -->
 <!-- migration-source: 22 -->
-Provider, transaction-state, routing, settlement, and reconciliation proposal material.
+[Providers and reconciliation](providers-and-reconciliation.md)
