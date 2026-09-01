@@ -17,6 +17,10 @@ import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.UUID;
@@ -93,6 +97,52 @@ class AcceptanceHardeningIT {
                     WHERE product_id = ?
                     """, TestPostingStack.PRODUCT_ID));
         }
+    }
+
+    @Test
+    void newFactsCannotClaimLegacyHashSchemes() throws SQLException {
+        UUID commandId = TestPostingStack.uuid(995);
+        UUID journalId = TestPostingStack.uuid(996);
+        try (var connection = dataSource.getConnection()) {
+            assertConstraint("new_command_hash_scheme", () -> executeInRollback(connection, """
+                INSERT INTO funds.idempotency_command
+                    (command_id, request_hash, request_hash_scheme, state, created_at)
+                VALUES (?, ?, 'V004_OPAQUE', 'IN_PROGRESS', CURRENT_TIMESTAMP)
+                """, commandId, "a".repeat(64)));
+            execute(connection, """
+                INSERT INTO funds.idempotency_command
+                    (command_id, request_hash, state, created_at)
+                VALUES (?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)
+                """, commandId, "a".repeat(64));
+            assertConstraint("new_journal_hash_scheme", () -> executeInRollback(connection, """
+                INSERT INTO funds.journal
+                    (journal_id, command_id, correlation_id, business_transaction_id,
+                     legal_entity_id, book_id, chart_version_id, period_id, transaction_type,
+                     narration, booking_time, value_date, policy_version, canonical_hash,
+                     canonical_hash_scheme)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DIRECT', 'legacy scheme injection',
+                        TIMESTAMPTZ '2026-01-15 10:00:00+00', DATE '2026-01-15', 1, ?,
+                        'V004_V1')
+                """, journalId, commandId, TestPostingStack.uuid(997),
+                TestPostingStack.uuid(998), TestPostingStack.LEGAL_ENTITY_ID,
+                TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                TestPostingStack.PERIOD_ID, "b".repeat(64)));
+        }
+    }
+
+    @Test
+    void completedCommandsMustIdentifyTheirOwnExactJournalResult() throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            assertConstraint("completed_command_result_consistency",
+                () -> attemptIncoherentCompletion(
+                    connection, TestPostingStack.uuid(980), TestPostingStack.uuid(981),
+                    TestPostingStack.uuid(982), false));
+            assertConstraint("completed_command_result_consistency",
+                () -> attemptIncoherentCompletion(
+                    connection, TestPostingStack.uuid(983), TestPostingStack.uuid(984),
+                    TestPostingStack.uuid(983), true));
+        }
+        assertEquals(0, count("funds.journal"));
     }
 
     @Test
@@ -206,10 +256,12 @@ class AcceptanceHardeningIT {
                 """, nextChart, TestPostingStack.BOOK_ID);
             execute(connection, """
                 INSERT INTO funds.ledger_account_chart_mapping
-                    (account_id, book_id, chart_version_id, account_code, account_class,
+                    (account_id, book_id, chart_version_id, account_code, account_currency,
+                     account_class,
                      normal_balance, control_account_code, account_role, currency_policy,
                      permitted_direction)
-                SELECT account_id, book_id, ?, account_code, account_class, normal_balance,
+                SELECT account_id, book_id, ?, account_code, account_currency, account_class,
+                       normal_balance,
                        control_account_code, account_role, currency_policy, permitted_direction
                 FROM funds.ledger_account_chart_mapping
                 WHERE chart_version_id = ?
@@ -232,11 +284,27 @@ class AcceptanceHardeningIT {
                 WHERE chart_version_id = ?
                 """, nextChart);
             connection.commit();
-            assertConstraint("ledger_account_chart_mapping_immutable",
+            assertConstraint("ledger_account_chart_mapping_frozen",
                 () -> executeInRollback(connection, """
                     UPDATE funds.ledger_account_chart_mapping SET account_class = 'EQUITY'
                     WHERE account_id = ? AND chart_version_id = ?
-                    """, TestPostingStack.CUSTOMER_LIABILITY,
+                    """, TestPostingStack.CUSTOMER_LIABILITY, nextChart));
+            assertConstraint("ledger_account_chart_mapping_frozen",
+                () -> executeInRollback(connection, """
+                    DELETE FROM funds.ledger_account_chart_mapping
+                    WHERE account_id = ? AND chart_version_id = ?
+                    """, TestPostingStack.CUSTOMER_LIABILITY, nextChart));
+            assertConstraint("ledger_account_chart_mapping_frozen",
+                () -> executeInRollback(connection, """
+                    INSERT INTO funds.ledger_account_chart_mapping
+                        (account_id, book_id, chart_version_id, account_code,
+                         account_currency, account_class, normal_balance,
+                         control_account_code, account_role)
+                    SELECT account_id, book_id, ?, account_code, account_currency,
+                           account_class, normal_balance, control_account_code, account_role
+                    FROM funds.ledger_account_chart_mapping
+                    WHERE account_id = ? AND chart_version_id = ?
+                    """, nextChart, TestPostingStack.PROVIDER_ASSET,
                     TestPostingStack.CHART_VERSION_ID));
         }
 
@@ -257,25 +325,156 @@ class AcceptanceHardeningIT {
             JOIN funds.ledger_account_chart_mapping mapping
               ON mapping.account_id = posting.account_id
              AND mapping.chart_version_id = journal.chart_version_id
+             AND mapping.account_currency = posting.currency
             WHERE journal.journal_id = ? AND posting.account_id = ?
             """, historical.journalId(), TestPostingStack.CUSTOMER_LIABILITY));
     }
 
     @Test
-    void everyDirectPostingMustResolveThroughTheJournalChartVersion() throws SQLException {
+    void chartActivationRequiresCompleteMappingsAndDraftCreation() throws SQLException {
         UUID partialChart = TestPostingStack.uuid(1_150);
-        activateChartWithProviderMappingOnly(partialChart);
-        PostingCommand mixed = command(
-            TestPostingStack.uuid(1_151), TestPostingStack.uuid(1_152), partialChart,
-            Instant.parse("2026-01-15T10:00:00Z"), LocalDate.of(2026, 1, 15), null, 100);
-
-        assertThrows(InvalidJournalException.class, () -> postingService.post(mixed));
         try (var connection = dataSource.getConnection()) {
-            assertConstraint("posting_chart_mapping", () -> insertDirectBalancedJournal(
-                connection, TestPostingStack.uuid(1_153), TestPostingStack.uuid(1_154),
-                partialChart));
+            assertConstraint("active_chart_account_onboarding_deferred",
+                () -> executeInRollback(connection, """
+                    INSERT INTO funds.ledger_account
+                        (account_id, book_id, account_scope, product_version_id,
+                         currency, status, created_at)
+                    VALUES (?, ?, 'INTERNAL', NULL, 'NGN', 'OPEN', CURRENT_TIMESTAMP)
+                    """, TestPostingStack.uuid(1_148), TestPostingStack.BOOK_ID));
+            assertConstraint("chart_version_must_start_draft", () -> executeInRollback(
+                connection, """
+                    INSERT INTO funds.chart_version
+                        (chart_version_id, book_id, version, status, activated_at,
+                         approval_reference)
+                    VALUES (?, ?, 9, 'ACTIVE', TIMESTAMPTZ '2026-01-10 00:00:00+00',
+                            'APP-DIRECT-ACTIVE')
+                    """, TestPostingStack.uuid(1_149), TestPostingStack.BOOK_ID));
+
+            createChartWithProviderMappingOnly(connection, partialChart);
+            assertConstraint("chart_mapping_incomplete", () -> executeInRollback(connection, """
+                UPDATE funds.chart_version
+                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                WHERE chart_version_id = ?
+                """, partialChart));
+            execute(connection, """
+                INSERT INTO funds.ledger_account_chart_mapping
+                    (account_id, book_id, chart_version_id, account_code, account_currency,
+                     account_class, normal_balance, control_account_code, account_role,
+                     currency_policy, permitted_direction)
+                SELECT account_id, book_id, ?, account_code, account_currency, account_class,
+                       normal_balance, control_account_code, account_role, currency_policy,
+                       permitted_direction
+                FROM funds.ledger_account_chart_mapping
+                WHERE chart_version_id = ? AND account_id = ?
+                """, partialChart, TestPostingStack.CHART_VERSION_ID,
+                TestPostingStack.CUSTOMER_LIABILITY);
+            connection.setAutoCommit(false);
+            execute(connection, """
+                UPDATE funds.chart_version
+                SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                WHERE chart_version_id = ?
+                """, TestPostingStack.CHART_VERSION_ID);
+            execute(connection, """
+                UPDATE funds.chart_version
+                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                WHERE chart_version_id = ?
+                """, partialChart);
+            connection.commit();
         }
-        assertEquals(0, count("funds.journal"));
+
+        PostingResult governed = postingService.post(command(
+            TestPostingStack.uuid(1_151), TestPostingStack.uuid(1_152), partialChart,
+            Instant.parse("2026-01-15T10:00:00Z"), LocalDate.of(2026, 1, 15), null, 100));
+        assertEquals(partialChart, queryUuid(
+            "SELECT chart_version_id FROM funds.journal WHERE journal_id = ?",
+            governed.journalId()));
+    }
+
+    @Test
+    void repeatableReadActivationSerializesAgainstAConcurrentMappingDeletion()
+        throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_160);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidateAndRetireCurrent(connection, candidateChart);
+        }
+
+        SQLException activationFailure = raceRepeatableReadActivation(
+            candidateChart, connection -> execute(connection, """
+                DELETE FROM funds.ledger_account_chart_mapping
+                WHERE account_id = ? AND chart_version_id = ?
+                """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
+        assertTrue(activationFailure != null,
+            "snapshot-isolated activation committed from a stale complete mapping view");
+        assertEquals("40001", activationFailure.getSQLState());
+
+        assertEquals("DRAFT", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            candidateChart));
+        try (var connection = dataSource.getConnection()) {
+            assertEquals(1, queryLong(connection, """
+                SELECT count(*) FROM funds.ledger_account_chart_mapping
+                WHERE chart_version_id = ?
+                """, candidateChart));
+        }
+    }
+
+    @Test
+    void repeatableReadActivationSerializesAgainstConcurrentOpenAccountCreation()
+        throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_170);
+        UUID newAccount = TestPostingStack.uuid(1_171);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidateAndRetireCurrent(connection, candidateChart);
+        }
+
+        SQLException activationFailure = raceRepeatableReadActivation(
+            candidateChart, connection -> execute(connection, """
+                INSERT INTO funds.ledger_account
+                    (account_id, book_id, account_scope, product_version_id,
+                     currency, status, created_at)
+                VALUES (?, ?, 'INTERNAL', NULL, 'NGN', 'OPEN', CURRENT_TIMESTAMP)
+                """, newAccount, TestPostingStack.BOOK_ID));
+        assertTrue(activationFailure != null,
+            "snapshot-isolated activation ignored the concurrently created open account");
+        assertEquals("40001", activationFailure.getSQLState());
+        assertEquals("DRAFT", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            candidateChart));
+        try (var connection = dataSource.getConnection()) {
+            assertEquals(1, queryLong(connection, """
+                SELECT count(*) FROM funds.ledger_account WHERE account_id = ?
+                """, newAccount));
+            assertEquals(0, queryLong(connection, """
+                SELECT count(*) FROM funds.ledger_account_chart_mapping
+                WHERE chart_version_id = ? AND account_id = ?
+                """, candidateChart, newAccount));
+        }
+    }
+
+    @Test
+    void readCommittedActivationRevalidatesAfterConcurrentMappingDeletion()
+        throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_180);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidateAndRetireCurrent(connection, candidateChart);
+        }
+
+        SQLException activationFailure = raceActivation(
+            candidateChart, Connection.TRANSACTION_READ_COMMITTED,
+            connection -> execute(connection, """
+                DELETE FROM funds.ledger_account_chart_mapping
+                WHERE account_id = ? AND chart_version_id = ?
+                """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
+        assertTrue(activationFailure instanceof PSQLException,
+            () -> "expected PostgreSQL activation rejection but received "
+                + activationFailure);
+        PSQLException postgresFailure = (PSQLException) activationFailure;
+        assertEquals("23514", postgresFailure.getSQLState());
+        assertEquals("chart_mapping_incomplete",
+            postgresFailure.getServerErrorMessage().getConstraint());
+        assertEquals("DRAFT", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            candidateChart));
     }
 
     @Test
@@ -313,6 +512,9 @@ class AcceptanceHardeningIT {
             assertConstraint("posting_dimensions_bytes_check",
                 () -> insertDirectPostingFixture(connection, TestPostingStack.uuid(1_224),
                     TestPostingStack.uuid(1_225), 1, tooManyBytes));
+            assertConstraint("posting_dimensions_string_values_check",
+                () -> insertDirectPostingFixture(connection, TestPostingStack.uuid(1_226),
+                    TestPostingStack.uuid(1_227), 1, "{\"numeric\":1}"));
         }
         assertEquals(0, count("funds.journal"));
     }
@@ -367,7 +569,7 @@ class AcceptanceHardeningIT {
                     TestPostingStack.PROVIDER_ASSET, NGN, amount, 0, Map.of()),
                 new PostingLine(TestPostingStack.uuid(journalId.getLeastSignificantBits() + 21),
                     TestPostingStack.CUSTOMER_LIABILITY, NGN, -amount, 0, Map.of())));
-        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV1(draft), draft);
+        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV2(draft), draft);
     }
 
     private static void insertDirectJournal(
@@ -461,9 +663,12 @@ class AcceptanceHardeningIT {
                 UPDATE funds.idempotency_command
                 SET state = 'COMPLETED', journal_id = ?, completed_at = CURRENT_TIMESTAMP,
                     result_json = jsonb_build_object(
-                        'journalId', ?::text, 'journalSequence', 999, 'canonicalHash', ?::text)
+                        'journalId', ?::text,
+                        'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                            WHERE journal_id = ?),
+                        'canonicalHash', ?::text)
                 WHERE command_id = ?
-                """, journalId, journalId, "b".repeat(64), commandId);
+                """, journalId, journalId, journalId, "b".repeat(64), commandId);
             connection.commit();
         } catch (SQLException failure) {
             connection.rollback();
@@ -587,6 +792,44 @@ class AcceptanceHardeningIT {
             transactionType, originalJournalId, "d".repeat(64));
     }
 
+    private static void attemptIncoherentCompletion(
+        Connection connection,
+        UUID journalOwnerCommandId,
+        UUID journalId,
+        UUID completedCommandId,
+        boolean corruptResult
+    ) throws SQLException {
+        connection.setAutoCommit(false);
+        try {
+            insertDirectHeader(
+                connection, journalOwnerCommandId, journalId, null, "DIRECT");
+            if (!completedCommandId.equals(journalOwnerCommandId)) {
+                execute(connection, """
+                    INSERT INTO funds.idempotency_command
+                        (command_id, request_hash, state, created_at)
+                    VALUES (?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)
+                    """, completedCommandId, "e".repeat(64));
+            }
+            execute(connection, """
+                UPDATE funds.idempotency_command
+                SET state = 'COMPLETED', journal_id = ?, completed_at = CURRENT_TIMESTAMP,
+                    result_json = jsonb_build_object(
+                        'journalId', ?::text,
+                        'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                            WHERE journal_id = ?),
+                        'canonicalHash', ?::text)
+                WHERE command_id = ?
+                """, journalId, journalId, journalId,
+                corruptResult ? "e".repeat(64) : "d".repeat(64), completedCommandId);
+            connection.commit();
+        } catch (SQLException failure) {
+            connection.rollback();
+            throw failure;
+        } finally {
+            connection.setAutoCommit(true);
+        }
+    }
+
     private static void completeDirectCommand(
         Connection connection,
         UUID commandId,
@@ -596,49 +839,59 @@ class AcceptanceHardeningIT {
             UPDATE funds.idempotency_command
             SET state = 'COMPLETED', journal_id = ?, completed_at = CURRENT_TIMESTAMP,
                 result_json = jsonb_build_object(
-                    'journalId', ?::text, 'journalSequence', 999, 'canonicalHash', ?::text)
+                    'journalId', ?::text,
+                    'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                        WHERE journal_id = ?),
+                    'canonicalHash', ?::text)
             WHERE command_id = ?
-            """, journalId, journalId, "d".repeat(64), commandId);
+            """, journalId, journalId, journalId, "d".repeat(64), commandId);
     }
 
-    private void activateChartWithProviderMappingOnly(UUID chartVersionId) throws SQLException {
-        try (var connection = dataSource.getConnection()) {
-            connection.setAutoCommit(false);
-            try {
-                execute(connection, """
-                    INSERT INTO funds.chart_version
-                        (chart_version_id, book_id, version, status, approval_reference)
-                    VALUES (?, ?, 2, 'DRAFT', 'APP-PARTIAL-CHART')
-                    """, chartVersionId, TestPostingStack.BOOK_ID);
-                execute(connection, """
-                    INSERT INTO funds.ledger_account_chart_mapping
-                        (account_id, book_id, chart_version_id, account_code, account_class,
-                         normal_balance, control_account_code, account_role,
-                         currency_policy, permitted_direction)
-                    SELECT account_id, book_id, ?, account_code, account_class, normal_balance,
-                           control_account_code, account_role, currency_policy, permitted_direction
-                    FROM funds.ledger_account_chart_mapping
-                    WHERE chart_version_id = ? AND account_id = ?
-                    """, chartVersionId, TestPostingStack.CHART_VERSION_ID,
-                    TestPostingStack.PROVIDER_ASSET);
-                execute(connection, """
-                    UPDATE funds.chart_version
-                    SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-                    WHERE chart_version_id = ?
-                    """, TestPostingStack.CHART_VERSION_ID);
-                execute(connection, """
-                    UPDATE funds.chart_version
-                    SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-                    WHERE chart_version_id = ?
-                    """, chartVersionId);
-                connection.commit();
-            } catch (SQLException failure) {
-                connection.rollback();
-                throw failure;
-            } finally {
-                connection.setAutoCommit(true);
-            }
-        }
+    private static void createChartWithProviderMappingOnly(
+        Connection connection,
+        UUID chartVersionId
+    ) throws SQLException {
+        execute(connection, """
+            INSERT INTO funds.chart_version
+                (chart_version_id, book_id, version, status, approval_reference)
+            VALUES (?, ?, 2, 'DRAFT', 'APP-PARTIAL-CHART')
+            """, chartVersionId, TestPostingStack.BOOK_ID);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_currency,
+                 account_class, normal_balance, control_account_code, account_role,
+                 currency_policy, permitted_direction)
+            SELECT account_id, book_id, ?, account_code, account_currency, account_class,
+                   normal_balance, control_account_code, account_role, currency_policy,
+                   permitted_direction
+            FROM funds.ledger_account_chart_mapping
+            WHERE chart_version_id = ? AND account_id = ?
+            """, chartVersionId, TestPostingStack.CHART_VERSION_ID,
+            TestPostingStack.PROVIDER_ASSET);
+    }
+
+    private static void createCompleteCandidateAndRetireCurrent(
+        Connection connection,
+        UUID chartVersionId
+    ) throws SQLException {
+        createChartWithProviderMappingOnly(connection, chartVersionId);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_currency,
+                 account_class, normal_balance, control_account_code, account_role,
+                 currency_policy, permitted_direction)
+            SELECT account_id, book_id, ?, account_code, account_currency, account_class,
+                   normal_balance, control_account_code, account_role, currency_policy,
+                   permitted_direction
+            FROM funds.ledger_account_chart_mapping
+            WHERE chart_version_id = ? AND account_id = ?
+            """, chartVersionId, TestPostingStack.CHART_VERSION_ID,
+            TestPostingStack.CUSTOMER_LIABILITY);
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+            WHERE chart_version_id = ?
+            """, TestPostingStack.CHART_VERSION_ID);
     }
 
     private static void insertDirectBalancedJournal(
@@ -696,14 +949,19 @@ class AcceptanceHardeningIT {
             """, bookId, TestPostingStack.uuid(bookId.getLeastSignificantBits() + 100));
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-OTHER')
+                (chart_version_id, book_id, version, status, approval_reference)
+            VALUES (?, ?, 1, 'DRAFT', 'APP-OTHER')
             """, chartVersionId, bookId);
         execute(connection, """
             INSERT INTO funds.accounting_period
                 (period_id, book_id, business_date_from, business_date_to, status)
             VALUES (?, ?, DATE '2026-01-01', DATE '2026-01-31', 'OPEN')
             """, periodId, bookId);
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+            WHERE chart_version_id = ?
+            """, chartVersionId);
     }
 
     private static PSQLException assertConstraint(String expected, SqlAction action) {
@@ -775,6 +1033,77 @@ class AcceptanceHardeningIT {
         }
     }
 
+    private void awaitBackendLock(int backendPid, Future<?> operation) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (operation.isDone()) {
+                throw new AssertionError(
+                    "activation completed without waiting for the mapping mutation");
+            }
+            try (var connection = dataSource.getConnection()) {
+                if (queryLong(connection, """
+                    SELECT count(*) FROM pg_stat_activity
+                    WHERE pid = ? AND wait_event_type = 'Lock'
+                    """, backendPid) == 1) {
+                    return;
+                }
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("activation did not block on the chart governance row");
+    }
+
+    private SQLException raceRepeatableReadActivation(
+        UUID chartVersionId,
+        ConnectionSqlAction concurrentMutation
+    ) throws Exception {
+        return raceActivation(
+            chartVersionId, Connection.TRANSACTION_REPEATABLE_READ, concurrentMutation);
+    }
+
+    private SQLException raceActivation(
+        UUID chartVersionId,
+        int transactionIsolation,
+        ConnectionSqlAction concurrentMutation
+    ) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<SQLException> activation = null;
+        try (var mutationConnection = dataSource.getConnection();
+             var activationConnection = dataSource.getConnection()) {
+            mutationConnection.setAutoCommit(false);
+            concurrentMutation.run(mutationConnection);
+
+            activationConnection.setTransactionIsolation(transactionIsolation);
+            activationConnection.setAutoCommit(false);
+            int activationBackendPid = (int) queryLong(
+                activationConnection, "SELECT pg_backend_pid()");
+            activation = executor.submit(() -> {
+                try {
+                    execute(activationConnection, """
+                        UPDATE funds.chart_version
+                        SET status = 'ACTIVE',
+                            activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                        WHERE chart_version_id = ?
+                        """, chartVersionId);
+                    activationConnection.commit();
+                    return null;
+                } catch (SQLException failure) {
+                    activationConnection.rollback();
+                    return failure;
+                }
+            });
+
+            awaitBackendLock(activationBackendPid, activation);
+            mutationConnection.commit();
+            return activation.get(5, TimeUnit.SECONDS);
+        } finally {
+            if (activation != null && !activation.isDone()) {
+                activation.cancel(true);
+            }
+            executor.shutdownNow();
+        }
+    }
+
     private static String queryString(Connection connection, String sql, Object... values)
         throws SQLException {
         try (var statement = connection.prepareStatement(sql)) {
@@ -791,5 +1120,10 @@ class AcceptanceHardeningIT {
     @FunctionalInterface
     private interface SqlAction {
         void run() throws SQLException;
+    }
+
+    @FunctionalInterface
+    private interface ConnectionSqlAction {
+        void run(Connection connection) throws SQLException;
     }
 }

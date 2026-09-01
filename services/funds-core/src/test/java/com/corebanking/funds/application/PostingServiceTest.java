@@ -171,7 +171,7 @@ class PostingServiceTest {
             original.journal().periodId(), "NOT_A_REVERSAL", original.journal().narration(),
             original.journal().bookingTime(), original.journal().valueDate(), uuid(99),
             original.journal().policyVersion(), original.journal().postings());
-        String hash = new CanonicalCommandHasher().postingV1(disguised);
+        String hash = new CanonicalCommandHasher().postingV2(disguised);
 
         assertThrows(InvalidJournalException.class,
             () -> dependencies.service().post(new PostingCommand(original.commandId(), hash, disguised)));
@@ -207,7 +207,7 @@ class PostingServiceTest {
             List.of(
                 new PostingLine(uuid(8), uuid(10), NGN, debit, 0, Map.of()),
                 new PostingLine(uuid(9), uuid(11), NGN, credit, 0, Map.of())));
-        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV1(journal), journal);
+        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV2(journal), journal);
     }
 
     private static UUID uuid(long value) {
@@ -305,8 +305,7 @@ class PostingServiceTest {
         @Override
         public Optional<PostingResult> findCompleted(
             Connection connection,
-            UUID commandId,
-            String requestHash
+            PostingCommand command
         ) {
             preflightCalls++;
             return completed;

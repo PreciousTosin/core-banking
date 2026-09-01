@@ -65,7 +65,7 @@ public class ReversalService {
 
     public PostingResult reverse(ReversalRequest request) {
         Objects.requireNonNull(request, "request");
-        if (!request.requestHash().equals(commandHasher.reversalV1(request))) {
+        if (!request.requestHash().equals(commandHasher.reversalV2(request))) {
             throw new IdempotencyConflictException(request.commandId());
         }
         LoadOutcome loaded = loadCoherentFact(request);
@@ -182,12 +182,13 @@ public class ReversalService {
         }
     }
 
-    private static Optional<PostingResult> preflightCompleted(
+    private Optional<PostingResult> preflightCompleted(
         Connection connection,
         ReversalRequest request
     ) throws SQLException {
         try (var statement = connection.prepareStatement("""
-            SELECT command.request_hash, command.state, command.journal_id,
+            SELECT command.request_hash, command.request_hash_scheme, command.state,
+                   command.journal_id,
                    command.result_json ->> 'journalId' AS stored_journal_id,
                    command.result_json ->> 'journalSequence' AS stored_journal_sequence,
                    command.result_json ->> 'canonicalHash' AS stored_canonical_hash,
@@ -206,10 +207,13 @@ public class ReversalService {
                 if (!rows.next()) {
                     return Optional.empty();
                 }
-                if (!request.requestHash().equals(rows.getString("request_hash"))) {
-                    throw new IdempotencyConflictException(request.commandId());
-                }
-                if (!"COMPLETED".equals(rows.getString("state"))) {
+                String requestHashScheme = rows.getString("request_hash_scheme");
+                boolean completed = "COMPLETED".equals(rows.getString("state"));
+                if (!completed) {
+                    if (!"TYPED_V2".equals(requestHashScheme)
+                        || !request.requestHash().equals(rows.getString("request_hash"))) {
+                        throw new IdempotencyConflictException(request.commandId());
+                    }
                     return Optional.empty();
                 }
                 UUID commandJournalId = rows.getObject("journal_id", UUID.class);
@@ -226,7 +230,100 @@ public class ReversalService {
                     throw new InvalidJournalException(
                         "completed command has inconsistent stored result: " + request.commandId());
                 }
+                if ("TYPED_V2".equals(requestHashScheme)) {
+                    if (!request.requestHash().equals(rows.getString("request_hash"))) {
+                        throw new IdempotencyConflictException(request.commandId());
+                    }
+                } else if ("V004_OPAQUE".equals(requestHashScheme)) {
+                    verifyLegacyCompletedReversal(connection, request, commandJournalId);
+                } else {
+                    throw new IdempotencyConflictException(request.commandId());
+                }
                 return Optional.of(new PostingResult(storedJournalId, storedSequence, storedHash));
+            }
+        }
+    }
+
+    private void verifyLegacyCompletedReversal(
+        Connection connection,
+        ReversalRequest request,
+        UUID journalId
+    ) throws SQLException {
+        OriginalJournalHeader header = loadCompletedHistoricalHeader(connection, journalId);
+        if (!"V004_V1".equals(header.canonicalHashScheme())
+            || !"REVERSAL".equals(header.transactionType())
+            || header.reversalOfJournalId() == null) {
+            throw new IdempotencyConflictException(request.commandId());
+        }
+        List<PostingLine> postings = loadBoundedPostings(connection, journalId);
+        assembleAndVerifyOriginal(header, postings);
+
+        ReversalRequest persistedRequest = new ReversalRequest(
+            header.commandId(),
+            "0".repeat(64),
+            header.reversalOfJournalId(),
+            header.correlationId(),
+            header.businessTransactionId(),
+            header.periodId(),
+            header.bookingTime(),
+            header.valueDate(),
+            header.narration());
+        if (!request.requestHash().equals(commandHasher.reversalV2(persistedRequest))) {
+            throw new IdempotencyConflictException(request.commandId());
+        }
+    }
+
+    private static OriginalJournalHeader loadCompletedHistoricalHeader(
+        Connection connection,
+        UUID journalId
+    ) throws SQLException {
+        try (var statement = connection.prepareStatement("""
+            SELECT journal.journal_id, journal.command_id, journal.journal_sequence,
+                   journal.correlation_id, journal.business_transaction_id,
+                   journal.legal_entity_id, journal.book_id, journal.period_id,
+                   journal.chart_version_id, journal.transaction_type, journal.narration,
+                   journal.booking_time, journal.value_date,
+                   journal.reversal_of_journal_id, journal.policy_version,
+                   journal.canonical_hash, journal.canonical_hash_scheme,
+                   command.state AS command_state,
+                   command.journal_id AS completed_journal_id
+            FROM funds.journal journal
+            JOIN funds.idempotency_command command
+              ON command.command_id = journal.command_id
+             AND command.journal_id = journal.journal_id
+            WHERE journal.journal_id = ?
+            """)) {
+            statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
+            statement.setObject(1, journalId);
+            try (var rows = statement.executeQuery()) {
+                if (!rows.next()
+                    || !"COMPLETED".equals(rows.getString("command_state"))
+                    || !journalId.equals(rows.getObject("completed_journal_id", UUID.class))) {
+                    throw new InvalidJournalException(
+                        "legacy completed reversal has no coherent journal: " + journalId);
+                }
+                UUID historicalChart = rows.getObject("chart_version_id", UUID.class);
+                int historicalPolicy = rows.getInt("policy_version");
+                return new OriginalJournalHeader(
+                    rows.getObject("journal_id", UUID.class),
+                    rows.getObject("command_id", UUID.class),
+                    rows.getLong("journal_sequence"),
+                    rows.getObject("correlation_id", UUID.class),
+                    rows.getObject("business_transaction_id", UUID.class),
+                    rows.getObject("legal_entity_id", UUID.class),
+                    rows.getObject("book_id", UUID.class),
+                    historicalChart,
+                    rows.getObject("period_id", UUID.class),
+                    rows.getString("transaction_type"),
+                    rows.getString("narration"),
+                    rows.getObject("booking_time", OffsetDateTime.class).toInstant(),
+                    rows.getObject("value_date", LocalDate.class),
+                    rows.getObject("reversal_of_journal_id", UUID.class),
+                    historicalPolicy,
+                    rows.getString("canonical_hash"),
+                    rows.getString("canonical_hash_scheme"),
+                    historicalPolicy,
+                    historicalChart);
             }
         }
     }
@@ -241,6 +338,7 @@ public class ReversalService {
                    journal.transaction_type, journal.narration, journal.booking_time,
                    journal.value_date, journal.reversal_of_journal_id,
                    journal.policy_version, journal.canonical_hash,
+                   journal.canonical_hash_scheme,
                    command.state AS command_state,
                    command.journal_id AS completed_journal_id,
                    book.accounting_policy_version AS current_policy_version,
@@ -283,6 +381,7 @@ public class ReversalService {
                     rows.getObject("reversal_of_journal_id", UUID.class),
                     rows.getInt("policy_version"),
                     rows.getString("canonical_hash"),
+                    rows.getString("canonical_hash_scheme"),
                     rows.getInt("current_policy_version"),
                     rows.getObject("current_chart_version_id", UUID.class));
             }
@@ -407,7 +506,13 @@ public class ReversalService {
             header.historicalPolicyVersion(),
             postings);
         validator.validate(persisted);
-        if (!header.canonicalHash().equals(hasher.sha256(persisted))) {
+        String verifiedHash = switch (header.canonicalHashScheme()) {
+            case "V004_V1" -> hasher.v004Sha256(persisted);
+            case "V2" -> hasher.v2Sha256(persisted);
+            default -> throw new InvalidJournalException(
+                "unsupported journal hash scheme: " + header.canonicalHashScheme());
+        };
+        if (!header.canonicalHash().equals(verifiedHash)) {
             throw new InvalidJournalException(
                 "original journal canonical hash does not match its persisted postings: "
                     + header.journalId());
@@ -537,6 +642,7 @@ public class ReversalService {
         UUID reversalOfJournalId,
         int historicalPolicyVersion,
         String canonicalHash,
+        String canonicalHashScheme,
         int currentPolicyVersion,
         UUID currentChartVersionId) {}
 

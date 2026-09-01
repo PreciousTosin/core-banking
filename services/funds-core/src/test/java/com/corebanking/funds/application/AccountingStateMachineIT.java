@@ -370,7 +370,7 @@ class AccountingStateMachineIT {
     }
 
     private static PostingCommand command(JournalDraft draft) {
-        return new PostingCommand(draft.commandId(), new CanonicalCommandHasher().postingV1(draft), draft);
+        return new PostingCommand(draft.commandId(), new CanonicalCommandHasher().postingV2(draft), draft);
     }
 
     private static UUID randomUuid(SplittableRandom random) {
@@ -410,8 +410,8 @@ class AccountingStateMachineIT {
                 """, fixture.bookId(), fixture.legalEntityId());
             execute(connection, """
                 INSERT INTO funds.chart_version
-                    (chart_version_id, book_id, version, status, activated_at, approval_reference)
-                VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', ?)
+                    (chart_version_id, book_id, version, status, approval_reference)
+                VALUES (?, ?, 1, 'DRAFT', ?)
                 """, fixture.chartVersionId(), fixture.bookId(), "CHART-" + seedIndex);
             execute(connection, """
                 INSERT INTO funds.accounting_period
@@ -438,6 +438,11 @@ class AccountingStateMachineIT {
                 "ASSET", "DEBIT", "ASSET-CONTROL");
             insertAccount(connection, fixture, fixture.creditAccountId(), "CREDIT", "CUSTOMER",
                 fixture.productVersionId(), "LIABILITY", "CREDIT", "LIABILITY-CONTROL");
+            execute(connection, """
+                UPDATE funds.chart_version
+                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+                WHERE chart_version_id = ?
+                """, fixture.chartVersionId());
         }
     }
 
@@ -463,9 +468,10 @@ class AccountingStateMachineIT {
             productVersionId);
         execute(connection, """
             INSERT INTO funds.ledger_account_chart_mapping
-                (account_id, book_id, chart_version_id, account_code, account_class,
+                (account_id, book_id, chart_version_id, account_code, account_currency,
+                 account_class,
                  normal_balance, control_account_code, account_role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'NGN', ?, ?, ?, ?)
             """,
             accountId,
             fixture.bookId(),
@@ -637,6 +643,7 @@ class AccountingStateMachineIT {
               ON mapping.account_id = posting.account_id
              AND mapping.book_id = journal.book_id
              AND mapping.chart_version_id = journal.chart_version_id
+             AND mapping.account_currency = posting.currency
             WHERE journal.book_id = ?
             GROUP BY mapping.control_account_code, posting.currency
             ORDER BY mapping.control_account_code, posting.currency

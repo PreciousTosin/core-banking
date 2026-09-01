@@ -11,22 +11,22 @@ import java.util.Objects;
 
 /** Versioned, domain-separated hashes for typed financial commands. */
 public final class CanonicalCommandHasher {
-    private static final String POSTING_V1 = "funds-core/posting-command/v1";
-    private static final String REVERSAL_V1 = "funds-core/reversal-command/v1";
+    private static final String POSTING_V2 = "funds-core/posting-command/v2";
+    private static final String REVERSAL_V2 = "funds-core/reversal-command/v2";
     private final CanonicalJournalHasher journalHasher = new CanonicalJournalHasher();
 
-    public String postingV1(JournalDraft journal) {
+    public String postingV2(JournalDraft journal) {
         Objects.requireNonNull(journal, "journal");
         var digest = digest();
-        field(digest, "domain", POSTING_V1);
-        field(digest, "journalHash", journalHasher.sha256(journal));
+        field(digest, "domain", POSTING_V2);
+        field(digest, "journalHash", journalHasher.v2Sha256(journal));
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    public String reversalV1(ReversalRequest request) {
+    public String reversalV2(ReversalRequest request) {
         Objects.requireNonNull(request, "request");
         var digest = digest();
-        field(digest, "domain", REVERSAL_V1);
+        field(digest, "domain", REVERSAL_V2);
         field(digest, "commandId", request.commandId());
         field(digest, "originalJournalId", request.originalJournalId());
         field(digest, "correlationId", request.correlationId());

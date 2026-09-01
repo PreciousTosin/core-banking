@@ -20,6 +20,20 @@ public class CanonicalJournalHasher {
         .thenComparing(PostingLine::postingId, Comparator.nullsFirst(UUID_CANONICAL_ORDER));
 
     public String sha256(JournalDraft draft) {
+        return v2Sha256(draft);
+    }
+
+    /** Exact verifier for journal facts written by the V004 canonical algorithm. */
+    public String v004Sha256(JournalDraft draft) {
+        return hash(draft, false);
+    }
+
+    /** Current journal-fact hash. V2 pins the governed chart version. */
+    public String v2Sha256(JournalDraft draft) {
+        return hash(draft, true);
+    }
+
+    private static String hash(JournalDraft draft, boolean includeChartVersion) {
         Objects.requireNonNull(draft, "draft");
         var encoder = new CanonicalEncoder(sha256Digest());
 
@@ -29,7 +43,9 @@ public class CanonicalJournalHasher {
         encoder.field("businessTransactionId", draft.businessTransactionId());
         encoder.field("legalEntityId", draft.legalEntityId());
         encoder.field("bookId", draft.bookId());
-        encoder.field("chartVersionId", draft.chartVersionId());
+        if (includeChartVersion) {
+            encoder.field("chartVersionId", draft.chartVersionId());
+        }
         encoder.field("periodId", draft.periodId());
         encoder.field("transactionType", draft.transactionType());
         encoder.field("narration", draft.narration());

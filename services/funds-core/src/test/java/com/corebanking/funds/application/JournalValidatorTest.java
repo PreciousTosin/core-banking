@@ -1,5 +1,6 @@
 package com.corebanking.funds.application;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -9,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
+import com.corebanking.funds.domain.ReversalRequest;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import java.time.Instant;
@@ -85,6 +87,54 @@ class JournalValidatorTest {
         var b = line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100_000);
 
         assertEquals(hasher.sha256(fixtureJournal(a, b)), hasher.sha256(fixtureJournal(b, a)));
+    }
+
+    @Test
+    void v004VerifierRetainsItsGoldenBytesAndDoesNotPinTheLaterChartField() {
+        JournalDraft original = fixtureJournal(
+            line(POSTING_A, ASSET_ACCOUNT, "NGN", 100_000),
+            line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100_000));
+        JournalDraft differentBackfilledChart = new JournalDraft(
+            original.journalId(), original.commandId(), original.correlationId(),
+            original.businessTransactionId(), original.legalEntityId(), original.bookId(),
+            uuid(700), original.periodId(), original.transactionType(), original.narration(),
+            original.bookingTime(), original.valueDate(), original.reversalOfJournalId(),
+            original.policyVersion(), original.postings());
+
+        assertEquals(
+            "d9aa3d75e98a6a1d9abbcc13bb8fe1ce4a9b5397c386c2c8fc41ce071c5857eb",
+            hasher.v004Sha256(original));
+        assertEquals(
+            hasher.v004Sha256(original),
+            hasher.v004Sha256(differentBackfilledChart));
+        assertNotEquals(
+            hasher.v2Sha256(original),
+            hasher.v2Sha256(differentBackfilledChart));
+    }
+
+    @Test
+    void v2JournalAndTypedCommandSchemesRetainTheirGoldenBytes() {
+        JournalDraft journal = fixtureJournal(
+            line(POSTING_A, ASSET_ACCOUNT, "NGN", 100_000,
+                Map.of("channel", "nip", "region", "ng")),
+            line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100_000,
+                Map.of("purpose", "deposit")));
+        var commandHasher = new CanonicalCommandHasher();
+        ReversalRequest reversal = new ReversalRequest(
+            COMMAND_ID, "0".repeat(64), JOURNAL_ID, CORRELATION_ID,
+            BUSINESS_TRANSACTION_ID, PERIOD_ID, BOOKING_TIME, VALUE_DATE,
+            "Golden exact reversal");
+
+        assertAll(
+            () -> assertEquals(
+                "9c2f5d6827c5458f77ee6e59576f82516ba5bed9c501a497a42b72f1d79d7ee8",
+                hasher.v2Sha256(journal)),
+            () -> assertEquals(
+                "44e0f75f6b9858ce0543cb2a3622be7a7c127530579f44abe8a1e59ddaf30ce5",
+                commandHasher.postingV2(journal)),
+            () -> assertEquals(
+                "90bef3026c6e558d130fc411e1cb6f5979e7183be3a2a66a01dd418770010816",
+                commandHasher.reversalV2(reversal)));
     }
 
     @Test

@@ -69,6 +69,7 @@ public class JdbcAccountingProofRepository {
                   ON mapping.account_id = posting.account_id
                  AND mapping.book_id = journal.book_id
                  AND mapping.chart_version_id = journal.chart_version_id
+                 AND mapping.account_currency = posting.currency
                 WHERE journal.book_id = ?
                   AND mapping.control_account_code = ?
                   AND posting.currency = ?

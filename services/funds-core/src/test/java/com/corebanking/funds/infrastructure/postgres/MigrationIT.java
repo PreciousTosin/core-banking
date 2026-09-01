@@ -143,6 +143,7 @@ class MigrationIT {
                           'enforce_posting_chart_mapping',
                           'enforce_posting_reference_consistency',
                           'reject_posting_to_completed_journal',
+                          'reject_ungoverned_active_chart_account_onboarding',
                           'enforce_journal_reversibility',
                           'lock_book_chart_for_posting',
                           'lock_period_for_posting',
@@ -220,7 +221,7 @@ class MigrationIT {
                 SELECT has_function_privilege(
                     'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')
                 """));
-            assertEquals(4, queryInt(connection, """
+            assertEquals(5, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_proc procedure
                 JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
@@ -228,7 +229,7 @@ class MigrationIT {
                   AND has_function_privilege('funds_app', procedure.oid, 'EXECUTE')
                 """));
             assertEquals(
-                "jsonb_object_size,lock_account_mapping_for_posting,lock_book_chart_for_posting,lock_period_for_posting",
+                "jsonb_object_size,jsonb_object_values_are_strings,lock_account_mapping_for_posting,lock_book_chart_for_posting,lock_period_for_posting",
                 queryString(connection, """
                     SELECT string_agg(procedure.proname, ',' ORDER BY procedure.proname)
                     FROM pg_proc procedure
@@ -392,6 +393,7 @@ class MigrationIT {
                           ON mapping.account_id = posting.account_id
                          AND mapping.book_id = journal.book_id
                          AND mapping.chart_version_id = journal.chart_version_id
+                         AND mapping.account_currency = posting.currency
                         WHERE journal.book_id = '00000000-0000-0000-0000-000000000001'
                           AND mapping.control_account_code = 'CUSTOMER-DEPOSITS'
                           AND posting.currency = 'NGN'
@@ -426,8 +428,8 @@ class MigrationIT {
     @Test
     void rejectsLedgerCurrencyLongerThanThreeCharacters() throws Exception {
         inTransaction(connection -> {
-            insertReferenceGraph(connection);
-            assertSqlRejected(connection, ledgerInsert(
+            insertDraftReferenceGraph(connection);
+            assertSqlStateRejected(connection, "22001", ledgerInsert(
                 uuid(100), BOOK_ID, CHART_VERSION_ID, "INVALID-CURRENCY", "CUSTOMER",
                 PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGNN"));
         });
@@ -436,8 +438,8 @@ class MigrationIT {
     @Test
     void rejectsUnknownLedgerNormalBalance() throws Exception {
         inTransaction(connection -> {
-            insertReferenceGraph(connection);
-            assertSqlRejected(connection, ledgerInsert(
+            insertDraftReferenceGraph(connection);
+            assertSqlStateRejected(connection, "23514", ledgerInsert(
                 uuid(101), BOOK_ID, CHART_VERSION_ID, "INVALID-NORMAL", "CUSTOMER",
                 PRODUCT_VERSION_ID, "LIABILITY", "SIDEWAYS", "NGN"));
         });
@@ -446,8 +448,8 @@ class MigrationIT {
     @Test
     void rejectsLedgerAccountWhoseBookDoesNotExist() throws Exception {
         inTransaction(connection -> {
-            insertReferenceGraph(connection);
-            assertSqlRejected(connection, ledgerInsert(
+            insertDraftReferenceGraph(connection);
+            assertSqlStateRejected(connection, "23503", ledgerInsert(
                 uuid(102), uuid(999), CHART_VERSION_ID, "MISSING-BOOK", "CUSTOMER",
                 PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN"));
         });
@@ -456,10 +458,10 @@ class MigrationIT {
     @Test
     void rejectsChartVersionFromAnotherBook() throws Exception {
         inTransaction(connection -> {
-            insertReferenceGraph(connection);
+            insertDraftReferenceGraph(connection);
             insertSecondBookAndChart(connection);
 
-            assertSqlRejected(connection, ledgerInsert(
+            assertSqlStateRejected(connection, "23503", ledgerInsert(
                 uuid(105), BOOK_ID, SECOND_CHART_VERSION_ID, "WRONG-CHART-BOOK", "CUSTOMER",
                 PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN"));
         });
@@ -483,8 +485,8 @@ class MigrationIT {
     @Test
     void rejectsCustomerAccountWithoutProductVersionBinding() throws Exception {
         inTransaction(connection -> {
-            insertReferenceGraph(connection);
-            assertSqlRejected(connection, ledgerInsert(
+            insertDraftReferenceGraph(connection);
+            assertSqlStateRejected(connection, "23514", ledgerInsert(
                 uuid(103), BOOK_ID, CHART_VERSION_ID, "NO-PRODUCT", "CUSTOMER",
                 null, "LIABILITY", "CREDIT", "NGN"));
         });
@@ -493,8 +495,8 @@ class MigrationIT {
     @Test
     void rejectsProductVersionBindingForNonCustomerAccount() throws Exception {
         inTransaction(connection -> {
-            insertReferenceGraph(connection);
-            assertSqlRejected(connection, ledgerInsert(
+            insertDraftReferenceGraph(connection);
+            assertSqlStateRejected(connection, "23514", ledgerInsert(
                 uuid(104), BOOK_ID, CHART_VERSION_ID, "CONTROL-WITH-PRODUCT", "CONTROL",
                 PRODUCT_VERSION_ID, "ASSET", "DEBIT", "NGN"));
         });
@@ -862,6 +864,15 @@ class MigrationIT {
     }
 
     private static void insertReferenceGraph(Connection connection) throws SQLException {
+        insertDraftReferenceGraph(connection);
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+            WHERE chart_version_id = '00000000-0000-0000-0000-000000000002'
+            """);
+    }
+
+    private static void insertDraftReferenceGraph(Connection connection) throws SQLException {
         execute(connection, """
             INSERT INTO funds.book
                 (book_id, legal_entity_id, functional_currency, timezone, calendar_code, accounting_policy_version)
@@ -871,10 +882,10 @@ class MigrationIT {
             """);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+                (chart_version_id, book_id, version, status, approval_reference)
             VALUES
                 ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001',
-                 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
+                 1, 'DRAFT', 'APP-CHART-001')
             """);
         execute(connection, """
             INSERT INTO funds.product_definition
@@ -924,10 +935,9 @@ class MigrationIT {
             """.formatted(SECOND_BOOK_ID));
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+                (chart_version_id, book_id, version, status, approval_reference)
             VALUES
-                ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00',
-                 'APP-SECOND-CHART')
+                ('%s', '%s', 1, 'DRAFT', 'APP-SECOND-CHART')
             """.formatted(SECOND_CHART_VERSION_ID, SECOND_BOOK_ID));
     }
 
@@ -959,12 +969,14 @@ class MigrationIT {
                     (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
                 VALUES ('%s', '%s', '%s', %s, '%s', 'OPEN',
                         TIMESTAMPTZ '2026-01-01 00:00:00+00')
-                RETURNING account_id, book_id
+                RETURNING account_id, book_id, currency
             )
             INSERT INTO funds.ledger_account_chart_mapping
-                (account_id, book_id, chart_version_id, account_code, account_class,
+                (account_id, book_id, chart_version_id, account_code, account_currency,
+                 account_class,
                  normal_balance, control_account_code, account_role)
-            SELECT account_id, book_id, '%s', '%s', '%s', '%s', 'CUSTOMER-DEPOSITS', '%s'
+            SELECT account_id, book_id, '%s', '%s', currency, '%s', '%s',
+                   'CUSTOMER-DEPOSITS', '%s'
             FROM inserted_account
             """.formatted(
                 accountId, bookId, accountScope, productValue, currency, chartVersionId,

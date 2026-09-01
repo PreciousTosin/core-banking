@@ -134,7 +134,7 @@ class PostingTimeoutIT {
                     NGN, 100, 0, Map.of()),
                 new PostingLine(TestPostingStack.uuid(2_005), TestPostingStack.CUSTOMER_LIABILITY,
                     NGN, -100, 0, Map.of())));
-        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV1(draft), draft);
+        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV2(draft), draft);
     }
 
     private static void lockAccount(Connection connection, UUID accountId) throws SQLException {

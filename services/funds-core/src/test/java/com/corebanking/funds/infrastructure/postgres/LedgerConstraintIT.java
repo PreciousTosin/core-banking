@@ -236,10 +236,15 @@ class LedgerConstraintIT {
                 execute(creator, """
                     UPDATE funds.idempotency_command
                     SET state = 'COMPLETED', journal_id = '%s',
-                        result_json = '{"journalId":"%s"}'::jsonb,
+                        result_json = jsonb_build_object(
+                            'journalId', '%s'::text,
+                            'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                                WHERE journal_id = '%s'),
+                            'canonicalHash', '%s'::text),
                         completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
                     WHERE command_id = '%s'
-                    """.formatted(JOURNAL_ID, JOURNAL_ID, COMMAND_ID));
+                    """.formatted(
+                        JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
 
                 var appenderBackendPid = new AtomicInteger();
                 append = executor.submit(() -> appendBalancedPostings(appenderBackendPid));
@@ -384,10 +389,15 @@ class LedgerConstraintIT {
                 execute(connection, """
                     UPDATE funds.idempotency_command
                     SET state = 'COMPLETED', journal_id = '%s',
-                        result_json = '{"status":"BOOKED"}'::jsonb,
+                        result_json = jsonb_build_object(
+                            'journalId', '%s'::text,
+                            'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                                WHERE journal_id = '%s'),
+                            'canonicalHash', '%s'::text),
                         completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
                     WHERE command_id = '%s'
-                    """.formatted(JOURNAL_ID, COMMAND_ID));
+                    """.formatted(
+                        JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
                 connection.commit();
             }
 
@@ -417,8 +427,9 @@ class LedgerConstraintIT {
                 assertEquals("COMPLETED", queryString(connection, """
                     SELECT state FROM funds.idempotency_command WHERE command_id = '%s'
                     """.formatted(COMMAND_ID)));
-                assertEquals("BOOKED", queryString(connection, """
-                    SELECT result_json ->> 'status' FROM funds.idempotency_command WHERE command_id = '%s'
+                assertEquals(REQUEST_HASH, queryString(connection, """
+                    SELECT result_json ->> 'canonicalHash'
+                    FROM funds.idempotency_command WHERE command_id = '%s'
                     """.formatted(COMMAND_ID)));
                 assertEquals(JOURNAL_ID.toString(), queryString(connection, """
                     SELECT journal_id::text FROM funds.idempotency_command WHERE command_id = '%s'
@@ -502,10 +513,16 @@ class LedgerConstraintIT {
                     """.formatted(EVENT_ID, JOURNAL_ID));
                 execute(connection, """
                     UPDATE funds.idempotency_command
-                    SET state = 'COMPLETED', journal_id = '%s', result_json = '{}'::jsonb,
+                    SET state = 'COMPLETED', journal_id = '%s',
+                        result_json = jsonb_build_object(
+                            'journalId', '%s'::text,
+                            'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                                WHERE journal_id = '%s'),
+                            'canonicalHash', '%s'::text),
                         completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
                     WHERE command_id = '%s' AND state = 'IN_PROGRESS'
-                    """.formatted(JOURNAL_ID, COMMAND_ID));
+                    """.formatted(
+                        JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
                 execute(connection, "SET CONSTRAINTS ALL IMMEDIATE");
 
                 long allocatedSequence = queryLong(connection,
@@ -605,6 +622,7 @@ class LedgerConstraintIT {
                       ON mapping.account_id = posting.account_id
                      AND mapping.book_id = journal.book_id
                      AND mapping.chart_version_id = journal.chart_version_id
+                     AND mapping.account_currency = posting.currency
                     """));
                 assertEquals(1, queryLong(connection, """
                     SELECT count(book_id) FROM funds.control_account_projection
@@ -678,10 +696,15 @@ class LedgerConstraintIT {
                 execute(connection, """
                     UPDATE funds.idempotency_command
                     SET state = 'COMPLETED', journal_id = '%s',
-                        result_json = '{"journalId":"%s"}'::jsonb,
+                        result_json = jsonb_build_object(
+                            'journalId', '%s'::text,
+                            'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                                WHERE journal_id = '%s'),
+                            'canonicalHash', '%s'::text),
                         completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
                     WHERE command_id = '%s'
-                    """.formatted(JOURNAL_ID, JOURNAL_ID, COMMAND_ID));
+                    """.formatted(
+                        JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
                 connection.commit();
             }
 
@@ -725,10 +748,15 @@ class LedgerConstraintIT {
                 execute(connection, """
                     UPDATE funds.idempotency_command
                     SET state = 'COMPLETED', journal_id = '%s',
-                        result_json = '{"journalId":"%s"}'::jsonb,
+                        result_json = jsonb_build_object(
+                            'journalId', '%s'::text,
+                            'journalSequence', (SELECT journal_sequence FROM funds.journal
+                                                WHERE journal_id = '%s'),
+                            'canonicalHash', '%s'::text),
                         completed_at = TIMESTAMPTZ '2026-01-15 10:00:01+00'
                     WHERE command_id = '%s'
-                    """.formatted(JOURNAL_ID, JOURNAL_ID, COMMAND_ID));
+                    """.formatted(
+                        JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
                 connection.commit();
                 return null;
             } catch (SQLException failure) {
@@ -795,11 +823,10 @@ class LedgerConstraintIT {
             """);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+                (chart_version_id, book_id, version, status, approval_reference)
             VALUES
                 ('00000000-0000-0000-0000-000000000002',
-                 '00000000-0000-0000-0000-000000000001', 1, 'ACTIVE',
-                 TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
+                 '00000000-0000-0000-0000-000000000001', 1, 'DRAFT', 'APP-CHART-001')
             """);
         execute(connection, """
             INSERT INTO funds.accounting_period
@@ -835,6 +862,11 @@ class LedgerConstraintIT {
         insertLedgerAccount(connection,
             USD_ACCOUNT, BOOK_ID, CHART_VERSION_ID, "USD-INTERNAL", "INTERNAL",
             null, "ASSET", "DEBIT", "USD", "FX-CONTROL");
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+            WHERE chart_version_id = '%s'
+            """.formatted(CHART_VERSION_ID));
     }
 
     private static void insertSecondBookAccount(Connection connection) throws SQLException {
@@ -847,13 +879,17 @@ class LedgerConstraintIT {
             """.formatted(SECOND_BOOK_ID));
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
-            VALUES ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00',
-                    'APP-SECOND-CHART')
+                (chart_version_id, book_id, version, status, approval_reference)
+            VALUES ('%s', '%s', 1, 'DRAFT', 'APP-SECOND-CHART')
             """.formatted(SECOND_CHART_VERSION_ID, SECOND_BOOK_ID));
         insertLedgerAccount(connection,
             SECOND_ACCOUNT_ID, SECOND_BOOK_ID, SECOND_CHART_VERSION_ID, "SECOND-BOOK", "INTERNAL",
             null, "ASSET", "DEBIT", "NGN", "SECOND-CONTROL");
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+            WHERE chart_version_id = '%s'
+            """.formatted(SECOND_CHART_VERSION_ID));
     }
 
     private static void insertAlternateChartForMainBook(Connection connection) throws SQLException {
@@ -975,10 +1011,11 @@ class LedgerConstraintIT {
                 accountId, bookId, accountScope, productValue, currency));
         execute(connection, """
             INSERT INTO funds.ledger_account_chart_mapping
-                (account_id, book_id, chart_version_id, account_code, account_class,
+                (account_id, book_id, chart_version_id, account_code, account_currency,
+                 account_class,
                  normal_balance, control_account_code, account_role)
-            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
-            """.formatted(accountId, bookId, chartVersionId, accountCode, accountClass,
+            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+            """.formatted(accountId, bookId, chartVersionId, accountCode, currency, accountClass,
                 normalBalance, controlAccountCode, accountScope));
     }
 

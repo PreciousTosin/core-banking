@@ -56,6 +56,16 @@ class AccountingProofServiceIT {
             seedAccount(connection, CUSTOMER_A, BOOK, CHART, "CUSTOMER-A", "NGN", "CUSTOMER-DEPOSITS");
             seedAccount(connection, CUSTOMER_B, BOOK, CHART, "CUSTOMER-B", "NGN", "CUSTOMER-DEPOSITS");
             seedAccount(connection, OTHER, BOOK, CHART, "OTHER", "NGN", "OTHER-CONTROL");
+            seedAccount(connection, uuid(206), BOOK, CHART, "USD-DEBIT", "USD", "USD-ASSET");
+            seedAccount(connection, uuid(207), BOOK, CHART,
+                "USD-CUSTOMER", "USD", "CUSTOMER-DEPOSITS");
+            seedAccount(connection, uuid(300), BOOK, CHART,
+                "MINIMUM", "NGN", "MINIMUM-CONTROL");
+            seedAccount(connection, uuid(301), BOOK, CHART,
+                "MAXIMUM", "NGN", "MAXIMUM-CONTROL");
+            seedAccount(connection, uuid(302), BOOK, CHART,
+                "UNIT", "NGN", "UNIT-CONTROL");
+            activateChart(connection, CHART);
         }
     }
 
@@ -223,6 +233,7 @@ class AccountingProofServiceIT {
             seedAccount(connection, debitTail, otherBook, otherChart, "USD-DEBIT-TAIL", "USD", "USD-DEBIT-B");
             seedAccount(connection, usdCredit, otherBook, otherChart, "USD-CREDIT", "USD", "USD-CREDIT-A");
             seedAccount(connection, creditTail, otherBook, otherChart, "USD-CREDIT-TAIL", "USD", "USD-CREDIT-B");
+            activateChart(connection, otherChart);
         }
         PostingResult ngn = post(80, "NGN", null,
             line(81, PROVIDER, NGN, 10), line(82, CUSTOMER_A, NGN, -10));
@@ -264,9 +275,7 @@ class AccountingProofServiceIT {
                 "OTHER-BOOK-DEBIT", "NGN", "ASSET-CONTROL");
             seedAccount(connection, otherCustomer, otherBook, otherChart,
                 "OTHER-BOOK-CUSTOMER", "NGN", "CUSTOMER-DEPOSITS");
-            seedAccount(connection, usdDebit, BOOK, CHART, "USD-DEBIT", "USD", "USD-ASSET");
-            seedAccount(connection, usdCustomer, BOOK, CHART,
-                "USD-CUSTOMER", "USD", "CUSTOMER-DEPOSITS");
+            activateChart(connection, otherChart);
         }
         post(210, "BASE-NGN", null,
             line(211, PROVIDER, NGN, 11), line(212, CUSTOMER_A, NGN, -11));
@@ -289,11 +298,6 @@ class AccountingProofServiceIT {
         UUID minimum = uuid(300);
         UUID maximum = uuid(301);
         UUID unit = uuid(302);
-        try (var connection = dataSource.getConnection()) {
-            seedAccount(connection, minimum, BOOK, CHART, "MINIMUM", "NGN", "MINIMUM-CONTROL");
-            seedAccount(connection, maximum, BOOK, CHART, "MAXIMUM", "NGN", "MAXIMUM-CONTROL");
-            seedAccount(connection, unit, BOOK, CHART, "UNIT", "NGN", "UNIT-CONTROL");
-        }
         PostingResult result = postFor(BOOK, CHART, PERIOD, LEGAL_ENTITY, 310, "EXTREME", null, List.of(
             line(311, minimum, NGN, Long.MIN_VALUE + 1),
             line(312, maximum, NGN, Long.MAX_VALUE)));
@@ -376,7 +380,7 @@ class AccountingProofServiceIT {
             chart, period,
             type, type, Instant.parse("2026-01-15T10:00:00Z"), LocalDate.of(2026, 1, 15), reversal, 1, lines);
         return postingService.post(new PostingCommand(
-            commandId, new CanonicalCommandHasher().postingV1(draft), draft));
+            commandId, new CanonicalCommandHasher().postingV2(draft), draft));
     }
 
     private static PostingLine line(long seed, UUID account, CurrencyCode currency, long amount) {
@@ -385,7 +389,7 @@ class AccountingProofServiceIT {
 
     private static ReversalRequest canonical(ReversalRequest request) {
         return new ReversalRequest(
-            request.commandId(), new CanonicalCommandHasher().reversalV1(request),
+            request.commandId(), new CanonicalCommandHasher().reversalV2(request),
             request.originalJournalId(), request.correlationId(), request.businessTransactionId(),
             request.currentPeriodId(), request.bookingTime(), request.valueDate(), request.reason());
     }
@@ -412,8 +416,8 @@ class AccountingProofServiceIT {
             """, book, entity, currency);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', ?)
+                (chart_version_id, book_id, version, status, approval_reference)
+            VALUES (?, ?, 1, 'DRAFT', ?)
             """, chart, book, "PROOF-CHART-" + chart);
         execute(connection, """
             INSERT INTO funds.accounting_period (period_id, book_id, business_date_from, business_date_to, status)
@@ -432,10 +436,19 @@ class AccountingProofServiceIT {
             """, account, book, currency);
         execute(connection, """
             INSERT INTO funds.ledger_account_chart_mapping
-                (account_id, book_id, chart_version_id, account_code, account_class,
+                (account_id, book_id, chart_version_id, account_code, account_currency,
+                 account_class,
                  normal_balance, control_account_code, account_role)
-            VALUES (?, ?, ?, ?, 'ASSET', 'DEBIT', ?, 'INTERNAL')
-            """, account, book, chart, code, control);
+            VALUES (?, ?, ?, ?, ?, 'ASSET', 'DEBIT', ?, 'INTERNAL')
+            """, account, book, chart, code, currency, control);
+    }
+
+    private static void activateChart(Connection connection, UUID chart) throws SQLException {
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+            WHERE chart_version_id = ?
+            """, chart);
     }
 
     private static void execute(Connection connection, String sql, Object... values) throws SQLException {

@@ -91,8 +91,8 @@ final class TestPostingStack {
             """, BOOK_ID, LEGAL_ENTITY_ID);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at, approval_reference)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
+                (chart_version_id, book_id, version, status, approval_reference)
+            VALUES (?, ?, 1, 'DRAFT', 'APP-CHART-001')
             """, CHART_VERSION_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.accounting_period
@@ -129,6 +129,11 @@ final class TestPostingStack {
             "LIABILITY",
             "CREDIT",
             CUSTOMER_CONTROL);
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+            WHERE chart_version_id = ?
+            """, CHART_VERSION_ID);
     }
 
     private static void insertAccount(
@@ -152,9 +157,9 @@ final class TestPostingStack {
             productVersionId);
         execute(connection, """
             INSERT INTO funds.ledger_account_chart_mapping
-                (account_id, book_id, chart_version_id, account_code, account_class,
+                (account_id, book_id, chart_version_id, account_code, account_currency, account_class,
                  normal_balance, control_account_code, account_role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'NGN', ?, ?, ?, ?)
             """,
             accountId,
             BOOK_ID,

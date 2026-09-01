@@ -829,7 +829,7 @@ class ReversalServiceIT {
     private static PostingCommand command(JournalDraft journal) {
         return new PostingCommand(
             journal.commandId(),
-            new CanonicalCommandHasher().postingV1(journal),
+            new CanonicalCommandHasher().postingV2(journal),
             journal);
     }
 
@@ -847,7 +847,7 @@ class ReversalServiceIT {
     }
 
     private static ReversalRequest canonical(ReversalRequest request) {
-        String requestHash = new CanonicalCommandHasher().reversalV1(request);
+        String requestHash = new CanonicalCommandHasher().reversalV2(request);
         return new ReversalRequest(
             request.commandId(), requestHash, request.originalJournalId(), request.correlationId(),
             request.businessTransactionId(), request.currentPeriodId(), request.bookingTime(),

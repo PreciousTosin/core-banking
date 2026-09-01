@@ -65,7 +65,7 @@ public final class CrashPostingWorker {
                     -POSTING_AMOUNT,
                     0,
                     Map.of("customer", "crash-recovery"))));
-        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV1(journal), journal);
+        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV2(journal), journal);
     }
 
     private static String requiredEnvironment(String name) {

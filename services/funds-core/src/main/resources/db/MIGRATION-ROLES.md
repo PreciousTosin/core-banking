@@ -23,8 +23,9 @@ service's default datasource role. The in-process posting and proof APIs use the
 `funds_app` datasource; an independently scheduled proof job receives its own
 deployment-managed login granted only `funds_proof_reader`. V005 grants that
 role only the journal sequence/book/chart columns, posting account/currency/
-amount columns, immutable chart-mapping control code, and control-projection
-columns needed by the proof queries. It cannot read account identifiers,
+amount columns, immutable chart-mapping account-currency/control-code columns,
+and control-projection columns needed by the proof queries. It cannot read
+account identifiers,
 product policy JSON, idempotency results, materialised balances, or outbox
 payloads. Control-account projection proof is deliberately current-cutoff-only;
 historical cutoffs remain supported by the immutable-posting trial-balance

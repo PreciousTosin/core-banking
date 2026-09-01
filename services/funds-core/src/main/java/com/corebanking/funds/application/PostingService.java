@@ -77,7 +77,7 @@ public class PostingService {
                 throw new InvalidJournalException("trusted reversal path requires linked REVERSAL journal");
             }
         } else {
-            if (!command.requestHash().equals(commandHasher.postingV1(command.journal()))) {
+            if (!command.requestHash().equals(commandHasher.postingV2(command.journal()))) {
                 throw new IdempotencyConflictException(command.commandId());
             }
             if (linkedReversal || "REVERSAL".equals(command.journal().transactionType())) {
@@ -93,8 +93,7 @@ public class PostingService {
                 PostingResult result;
                 try {
                     transactionTimeouts.apply(connection);
-                    var completed = repository.findCompleted(
-                        connection, command.commandId(), command.requestHash());
+                    var completed = repository.findCompleted(connection, command);
                     if (completed.isPresent()) {
                         connection.rollback();
                         return completed.orElseThrow();

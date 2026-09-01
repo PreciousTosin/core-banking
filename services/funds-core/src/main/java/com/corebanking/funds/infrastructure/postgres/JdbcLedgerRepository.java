@@ -1,6 +1,7 @@
 package com.corebanking.funds.infrastructure.postgres;
 
 import com.corebanking.funds.application.CanonicalJournalHasher;
+import com.corebanking.funds.application.CanonicalCommandHasher;
 import com.corebanking.funds.application.JournalValidator;
 import com.corebanking.funds.application.PostingCommand;
 import com.corebanking.funds.application.PostingDimensions;
@@ -38,6 +39,7 @@ import java.util.UUID;
 
 @ApplicationScoped
 public class JdbcLedgerRepository implements LedgerRepository {
+    private static final int LEGACY_QUERY_TIMEOUT_SECONDS = 5;
     private static final Comparator<UUID> CANONICAL_ACCOUNT_ORDER = Comparator.comparing(UUID::toString);
     private static final Comparator<ControlKey> CONTROL_ORDER = Comparator
         .comparing(ControlKey::controlAccountCode)
@@ -45,6 +47,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
 
     private final JournalValidator validator;
     private final CanonicalJournalHasher hasher;
+    private final CanonicalCommandHasher commandHasher;
     private final PostingTransactionObserver observer;
 
     public JdbcLedgerRepository() {
@@ -67,6 +70,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
     ) {
         this.validator = Objects.requireNonNull(validator, "validator");
         this.hasher = Objects.requireNonNull(hasher, "hasher");
+        this.commandHasher = new CanonicalCommandHasher();
         this.observer = Objects.requireNonNull(observer, "observer");
     }
 
@@ -77,7 +81,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
         try {
             insertIdempotencyCommand(connection, command);
             LockedCommand locked = lockIdempotencyCommand(connection, command.commandId());
-            if (!locked.requestHash().equals(command.requestHash())) {
+            if (!"TYPED_V2".equals(locked.requestHashScheme())
+                || !locked.requestHash().equals(command.requestHash())) {
                 throw new IdempotencyConflictException(command.commandId());
             }
             observer.afterIdempotencyAcquired(command.commandId());
@@ -94,7 +99,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
             observer.afterAccountLocks(command.commandId());
             JournalDraft assignedJournal = assignAccountSequences(command.journal(), accounts);
             validator.validate(assignedJournal);
-            String canonicalHash = hasher.sha256(assignedJournal);
+            String canonicalHash = hasher.v2Sha256(assignedJournal);
 
             long journalSequence = insertJournal(connection, assignedJournal, canonicalHash);
             insertPostings(connection, assignedJournal);
@@ -111,45 +116,273 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    private JournalDraft loadLegacyJournal(
+        Connection connection,
+        UUID commandId,
+        UUID journalId,
+        String canonicalHash
+    ) throws SQLException {
+        LegacyHeader header = loadLegacyHeader(connection, commandId, journalId);
+        Map<UUID, LegacyPostingBuilder> builders = loadLegacyPostingSummaries(
+            connection, journalId);
+        loadLegacyDimensions(connection, journalId, builders);
+        var postings = new ArrayList<PostingLine>(builders.size());
+        for (LegacyPostingBuilder builder : builders.values()) {
+            postings.add(builder.build());
+        }
+        var persisted = new JournalDraft(
+            header.journalId(),
+            header.commandId(),
+            header.correlationId(),
+            header.businessTransactionId(),
+            header.legalEntityId(),
+            header.bookId(),
+            header.chartVersionId(),
+            header.periodId(),
+            header.transactionType(),
+            header.narration(),
+            header.bookingTime(),
+            header.valueDate(),
+            header.reversalOfJournalId(),
+            header.policyVersion(),
+            postings);
+        validator.validate(persisted);
+        if (!canonicalHash.equals(hasher.v004Sha256(persisted))) {
+            throw new InvalidJournalException(
+                "migrated V004 journal hash does not match persisted facts: " + journalId);
+        }
+        return persisted;
+    }
+
+    private static LegacyHeader loadLegacyHeader(
+        Connection connection,
+        UUID commandId,
+        UUID journalId
+    ) throws SQLException {
+        try (var statement = connection.prepareStatement("""
+            SELECT journal_id, command_id, correlation_id, business_transaction_id,
+                   legal_entity_id, book_id, chart_version_id, period_id,
+                   transaction_type, narration, booking_time, value_date,
+                   reversal_of_journal_id, policy_version
+            FROM funds.journal
+            WHERE journal_id = ? AND command_id = ?
+            """)) {
+            statement.setQueryTimeout(LEGACY_QUERY_TIMEOUT_SECONDS);
+            statement.setObject(1, journalId);
+            statement.setObject(2, commandId);
+            try (var rows = statement.executeQuery()) {
+                if (!rows.next()) {
+                    throw new InvalidJournalException(
+                        "migrated completed command has no coherent journal: " + commandId);
+                }
+                return new LegacyHeader(
+                    rows.getObject("journal_id", UUID.class),
+                    rows.getObject("command_id", UUID.class),
+                    rows.getObject("correlation_id", UUID.class),
+                    rows.getObject("business_transaction_id", UUID.class),
+                    rows.getObject("legal_entity_id", UUID.class),
+                    rows.getObject("book_id", UUID.class),
+                    rows.getObject("chart_version_id", UUID.class),
+                    rows.getObject("period_id", UUID.class),
+                    rows.getString("transaction_type"),
+                    rows.getString("narration"),
+                    rows.getObject("booking_time", OffsetDateTime.class).toInstant(),
+                    rows.getObject("value_date", LocalDate.class),
+                    rows.getObject("reversal_of_journal_id", UUID.class),
+                    rows.getInt("policy_version"));
+            }
+        }
+    }
+
+    private static Map<UUID, LegacyPostingBuilder> loadLegacyPostingSummaries(
+        Connection connection,
+        UUID journalId
+    ) throws SQLException {
+        try (var statement = connection.prepareStatement("""
+            SELECT posting_id, account_id, currency, signed_minor_units,
+                   account_sequence, octet_length(dimensions::text) AS dimension_json_bytes
+            FROM funds.posting
+            WHERE journal_id = ?
+            ORDER BY posting_id
+            LIMIT ?
+            """)) {
+            statement.setQueryTimeout(LEGACY_QUERY_TIMEOUT_SECONDS);
+            statement.setObject(1, journalId);
+            statement.setInt(2, JournalValidator.MAX_POSTINGS_PER_JOURNAL + 1);
+            try (var rows = statement.executeQuery()) {
+                Map<UUID, LegacyPostingBuilder> builders = new LinkedHashMap<>();
+                while (rows.next()) {
+                    if (builders.size() == JournalValidator.MAX_POSTINGS_PER_JOURNAL) {
+                        throw new InvalidJournalException(
+                            "migrated journal exceeds POC posting limit");
+                    }
+                    if (rows.getInt("dimension_json_bytes")
+                        > JournalValidator.MAX_DIMENSION_JSON_BYTES) {
+                        throw new InvalidJournalException(
+                            "migrated journal dimension JSON exceeds POC byte limit");
+                    }
+                    UUID postingId = rows.getObject("posting_id", UUID.class);
+                    builders.put(postingId, new LegacyPostingBuilder(
+                        postingId,
+                        rows.getObject("account_id", UUID.class),
+                        CurrencyCode.of(rows.getString("currency")),
+                        rows.getLong("signed_minor_units"),
+                        rows.getLong("account_sequence"),
+                        new LinkedHashMap<>()));
+                }
+                if (builders.isEmpty()) {
+                    throw new InvalidJournalException(
+                        "migrated journal has no postings: " + journalId);
+                }
+                return builders;
+            }
+        }
+    }
+
+    private static void loadLegacyDimensions(
+        Connection connection,
+        UUID journalId,
+        Map<UUID, LegacyPostingBuilder> builders
+    ) throws SQLException {
+        int maximumRows = JournalValidator.MAX_POSTINGS_PER_JOURNAL
+            * JournalValidator.MAX_DIMENSIONS_PER_POSTING;
+        try (var statement = connection.prepareStatement("""
+            SELECT posting.posting_id, dimension.key, dimension.value
+            FROM funds.posting posting
+            CROSS JOIN LATERAL jsonb_each_text(posting.dimensions) dimension
+            WHERE posting.journal_id = ?
+            ORDER BY posting.posting_id, dimension.key
+            LIMIT ?
+            """)) {
+            statement.setQueryTimeout(LEGACY_QUERY_TIMEOUT_SECONDS);
+            statement.setObject(1, journalId);
+            statement.setInt(2, maximumRows + 1);
+            int rowsRead = 0;
+            try (var rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    if (rowsRead++ == maximumRows) {
+                        throw new InvalidJournalException(
+                            "migrated journal dimension rows exceed POC limit");
+                    }
+                    UUID postingId = rows.getObject("posting_id", UUID.class);
+                    LegacyPostingBuilder builder = builders.get(postingId);
+                    if (builder == null) {
+                        throw new InvalidJournalException(
+                            "migrated journal posting set is inconsistent: " + postingId);
+                    }
+                    if (builder.dimensions().size()
+                        == JournalValidator.MAX_DIMENSIONS_PER_POSTING) {
+                        throw new InvalidJournalException(
+                            "migrated posting exceeds POC dimension limit");
+                    }
+                    builder.dimensions().put(rows.getString("key"), rows.getString("value"));
+                }
+            }
+        }
+    }
+
     @Override
     public Optional<PostingResult> findCompleted(
         Connection connection,
-        UUID commandId,
-        String requestHash
+        PostingCommand command
     ) {
         Objects.requireNonNull(connection, "connection");
-        Objects.requireNonNull(commandId, "commandId");
-        Objects.requireNonNull(requestHash, "requestHash");
+        Objects.requireNonNull(command, "command");
+        UUID commandId = command.commandId();
         try (var statement = connection.prepareStatement("""
-            SELECT command.request_hash, command.state,
-                   journal.journal_id, journal.journal_sequence, journal.canonical_hash
+            SELECT command.request_hash, command.request_hash_scheme, command.state,
+                   command.journal_id AS command_journal_id,
+                   command.result_json ->> 'journalId' AS stored_journal_id,
+                   command.result_json ->> 'journalSequence' AS stored_journal_sequence,
+                   command.result_json ->> 'canonicalHash' AS stored_canonical_hash,
+                   journal.journal_id, journal.journal_sequence, journal.canonical_hash,
+                   journal.canonical_hash_scheme
             FROM funds.idempotency_command command
-            LEFT JOIN funds.journal journal ON journal.journal_id = command.journal_id
+            LEFT JOIN funds.journal journal
+              ON journal.journal_id = command.journal_id
+             AND journal.command_id = command.command_id
             WHERE command.command_id = ?
             """)) {
+            statement.setQueryTimeout(LEGACY_QUERY_TIMEOUT_SECONDS);
             statement.setObject(1, commandId);
             try (var rows = statement.executeQuery()) {
                 if (!rows.next()) {
                     return Optional.empty();
                 }
-                if (!requestHash.equals(rows.getString("request_hash"))) {
-                    throw new IdempotencyConflictException(commandId);
+                String commandScheme = rows.getString("request_hash_scheme");
+                boolean completed = "COMPLETED".equals(rows.getString("state"));
+                if ("TYPED_V2".equals(commandScheme)) {
+                    if (!command.requestHash().equals(rows.getString("request_hash"))) {
+                        throw new IdempotencyConflictException(commandId);
+                    }
+                    if (!completed) {
+                        return Optional.empty();
+                    }
+                } else if ("V004_OPAQUE".equals(commandScheme)) {
+                    if (!completed) {
+                        throw new IdempotencyConflictException(commandId);
+                    }
+                } else {
+                    throw new InvalidJournalException(
+                        "unsupported command hash scheme for command: " + commandId);
                 }
-                if (!"COMPLETED".equals(rows.getString("state"))) {
+                if (!completed) {
                     return Optional.empty();
                 }
-                UUID journalId = rows.getObject("journal_id", UUID.class);
-                if (journalId == null) {
-                    throw new InvalidJournalException(
-                        "completed command has no journal: " + commandId);
+                PostingResult result = coherentCompletedResult(rows, commandId);
+                if ("V004_OPAQUE".equals(commandScheme)) {
+                    if (!"V004_V1".equals(rows.getString("canonical_hash_scheme"))) {
+                        throw new InvalidJournalException(
+                            "migrated command does not reference a V004 journal: " + commandId);
+                    }
+                    JournalDraft persisted = loadLegacyJournal(
+                        connection, commandId, result.journalId(), result.canonicalHash());
+                    if (!command.requestHash().equals(commandHasher.postingV2(persisted))) {
+                        throw new IdempotencyConflictException(commandId);
+                    }
                 }
-                return Optional.of(new PostingResult(
-                    journalId,
-                    rows.getLong("journal_sequence"),
-                    rows.getString("canonical_hash")));
+                return Optional.of(result);
             }
         } catch (SQLException failure) {
             throw SqlState.persistenceFailure(failure);
+        }
+    }
+
+    private static PostingResult coherentCompletedResult(
+        java.sql.ResultSet rows,
+        UUID commandId
+    ) throws SQLException {
+        UUID commandJournalId = rows.getObject("command_journal_id", UUID.class);
+        UUID joinedJournalId = rows.getObject("journal_id", UUID.class);
+        UUID storedJournalId = parseUuid(rows.getString("stored_journal_id"));
+        long storedSequence = parseLong(rows.getString("stored_journal_sequence"));
+        String storedHash = rows.getString("stored_canonical_hash");
+        if (commandJournalId == null
+            || !commandJournalId.equals(joinedJournalId)
+            || !commandJournalId.equals(storedJournalId)
+            || storedSequence != rows.getLong("journal_sequence")
+            || storedHash == null
+            || !storedHash.equals(rows.getString("canonical_hash"))) {
+            throw new InvalidJournalException(
+                "completed command has inconsistent stored result: " + commandId);
+        }
+        return new PostingResult(storedJournalId, storedSequence, storedHash);
+    }
+
+    private static UUID parseUuid(String value) {
+        try {
+            return value == null ? null : UUID.fromString(value);
+        } catch (IllegalArgumentException malformed) {
+            throw new InvalidJournalException("completed command contains malformed journal ID");
+        }
+    }
+
+    private static long parseLong(String value) {
+        try {
+            return Long.parseLong(value);
+        } catch (RuntimeException malformed) {
+            throw new InvalidJournalException(
+                "completed command contains malformed journal sequence");
         }
     }
 
@@ -157,8 +390,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
         throws SQLException {
         try (var statement = connection.prepareStatement("""
             INSERT INTO funds.idempotency_command
-                (command_id, request_hash, state, created_at)
-            VALUES (?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)
+                (command_id, request_hash, request_hash_scheme, state, created_at)
+            VALUES (?, ?, 'TYPED_V2', 'IN_PROGRESS', CURRENT_TIMESTAMP)
             ON CONFLICT (command_id) DO NOTHING
             """)) {
             statement.setObject(1, command.commandId());
@@ -170,7 +403,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
     private static LockedCommand lockIdempotencyCommand(Connection connection, UUID commandId)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
-            SELECT request_hash, state
+            SELECT request_hash, request_hash_scheme, state
             FROM funds.idempotency_command
             WHERE command_id = ?
             FOR UPDATE
@@ -182,6 +415,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 }
                 return new LockedCommand(
                     rows.getString("request_hash"),
+                    rows.getString("request_hash_scheme"),
                     "COMPLETED".equals(rows.getString("state")));
             }
         }
@@ -447,8 +681,9 @@ public class JdbcLedgerRepository implements LedgerRepository {
             INSERT INTO funds.journal
                 (journal_id, command_id, correlation_id, business_transaction_id, legal_entity_id,
                  book_id, period_id, transaction_type, narration, booking_time, value_date,
-                 chart_version_id, reversal_of_journal_id, policy_version, canonical_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 chart_version_id, reversal_of_journal_id, policy_version, canonical_hash,
+                 canonical_hash_scheme)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'V2')
             RETURNING journal_sequence
             """)) {
             statement.setObject(1, journal.journalId());
@@ -723,7 +958,37 @@ public class JdbcLedgerRepository implements LedgerRepository {
         return json.append('"').toString();
     }
 
-    private record LockedCommand(String requestHash, boolean completed) {}
+    private record LockedCommand(String requestHash, String requestHashScheme, boolean completed) {}
+
+    private record LegacyHeader(
+        UUID journalId,
+        UUID commandId,
+        UUID correlationId,
+        UUID businessTransactionId,
+        UUID legalEntityId,
+        UUID bookId,
+        UUID chartVersionId,
+        UUID periodId,
+        String transactionType,
+        String narration,
+        Instant bookingTime,
+        LocalDate valueDate,
+        UUID reversalOfJournalId,
+        int policyVersion) {}
+
+    private record LegacyPostingBuilder(
+        UUID postingId,
+        UUID accountId,
+        CurrencyCode currency,
+        long signedMinorUnits,
+        long accountSequence,
+        Map<String, String> dimensions) {
+
+        private PostingLine build() {
+            return new PostingLine(
+                postingId, accountId, currency, signedMinorUnits, accountSequence, dimensions);
+        }
+    }
 
     private record AccountMetadata(String controlAccountCode, CurrencyCode currency) {}
 
