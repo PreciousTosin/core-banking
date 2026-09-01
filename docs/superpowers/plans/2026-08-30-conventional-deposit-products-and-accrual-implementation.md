@@ -1,5 +1,9 @@
 # Conventional Deposit Products and Accrual Implementation Plan
 
+**Proposal:** [Conventional deposit products and accrual](../../../architecture/proposals/README.md#conventional-deposit-products-and-accrual)
+
+**Related ADRs:** [ADR-0002](../../../architecture/adr/0002-centralize-financial-invariants-in-funds-core.md), [ADR-0003](../../../architecture/adr/0003-use-signed-integer-minor-units.md), [ADR-0004](../../../architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md), [ADR-0005](../../../architecture/adr/0005-use-immutable-journals-and-additive-corrections.md), and [ADR-0006](../../../architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans task-by-task. Keep checkbox state here.
 
 **Goal:** Implement versioned savings, current and fixed-deposit liabilities with exact, idempotent accrual, capitalisation, maturity, renewal and early-liquidation accounting.
@@ -52,6 +56,8 @@ test/acceptance/conventional_deposits.sh
 - [ ] Publish `DepositContractOpened` atomically without putting PII/account number in headers.
 - [ ] Commit: `feat(funds-core): open versioned deposit contracts`
 
+<a id="accrual-maturity-delivery-detail"></a>
+<!-- migration-source: 13.07.02 -->
 ### Task 3: Implement exact accrual calculation
 
 - [ ] Write unit/generated tests for daily eligible balance, tiers, minimum-balance rule, leap years and negative/zero balances. Use `BigInteger`/exact fraction as oracle.

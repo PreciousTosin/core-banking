@@ -1,0 +1,11 @@
+{
+  "name": "core-banking-architecture-tooling",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "11.16.0"
+  }
+}

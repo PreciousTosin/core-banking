@@ -1,0 +1,120 @@
+name: Architecture documentation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  architecture-docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
+      - if: github.event_name == 'pull_request'
+        run: python3 architecture/scripts/validate_architecture.py --root . --pr-event "$GITHUB_EVENT_PATH"
+      - run: python3 architecture/scripts/validate_architecture.py --root .
+      - run: python3 architecture/scripts/validate_architecture.py --root . --checks tooling
+      - run: architecture/scripts/render-diagrams.sh
+      - run: |
+          set -o pipefail
+          python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of "$(date -u +%F)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check changed-tree whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          [[ "$empty_tree" =~ $sha_pattern ]]
+          check_proposal_edge() {
+            local edge_base="$1"
+            local edge_head="$2"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$edge_base" --proposal-head-ref "$edge_head"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$edge_base" --proposal-edge-head-ref "$edge_head"
+          }
+          check_ranged_edges() {
+            local range_base="$1"
+            local range_head="$2"
+            local commit_and_parents child parent
+            local -a edge_parts
+            while read -r commit_and_parents; do
+              read -r -a edge_parts <<<"$commit_and_parents"
+              child="${edge_parts[0]}"
+              [[ "$child" =~ $sha_pattern ]]
+              git cat-file -e "$child^{commit}"
+              if [[ "${#edge_parts[@]}" -eq 1 ]]; then
+                git diff --check "$empty_tree" "$child"
+                check_proposal_edge "$child" "$child"
+                continue
+              fi
+              for parent in "${edge_parts[@]:1}"; do
+                [[ "$parent" =~ $sha_pattern ]]
+                git cat-file -e "$parent^{commit}"
+                git diff --check "$parent" "$child"
+                python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+                check_proposal_edge "$parent" "$child"
+              done
+            done < <(git rev-list --reverse --topo-order --parents "$range_base..$range_head")
+          }
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$(jq -r '.pull_request.base.sha // empty' "$GITHUB_EVENT_PATH")"
+            head_sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
+            [[ "$base_sha" =~ $sha_pattern ]]
+            [[ "$head_sha" =~ $sha_pattern ]]
+            git cat-file -e "$base_sha^{commit}"
+            git cat-file -e "$head_sha^{commit}"
+            merge_base="$(git merge-base "$base_sha" "$head_sha")"
+            [[ "$merge_base" =~ $sha_pattern ]]
+            git cat-file -e "$merge_base^{commit}"
+            git diff --check "$merge_base" "$head_sha"
+            check_ranged_edges "$merge_base" "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$merge_base" --proposal-head-ref "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$merge_base" --proposal-edge-head-ref "$head_sha"
+            exit 0
+          fi
+          [[ "$GITHUB_SHA" =~ $sha_pattern ]]
+          git cat-file -e "$GITHUB_SHA^{commit}"
+          before_sha="$(jq -r '.before // empty' "$GITHUB_EVENT_PATH")"
+          zero_sha=0000000000000000000000000000000000000000
+          if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"; then
+            git diff --check "$before_sha" "$GITHUB_SHA"
+            check_ranged_edges "$before_sha" "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$before_sha" --proposal-head-ref "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$before_sha" --proposal-edge-head-ref "$GITHUB_SHA"
+          else
+            git diff --check "$empty_tree" "$GITHUB_SHA"
+            while read -r commit_and_parents; do
+              read -r -a edge_parts <<<"$commit_and_parents"
+              child="${edge_parts[0]}"
+              [[ "$child" =~ $sha_pattern ]]
+              git cat-file -e "$child^{commit}"
+              if [[ "${#edge_parts[@]}" -eq 1 ]]; then
+                git diff --check "$empty_tree" "$child"
+                check_proposal_edge "$child" "$child"
+                continue
+              fi
+              for parent in "${edge_parts[@]:1}"; do
+                [[ "$parent" =~ $sha_pattern ]]
+                git cat-file -e "$parent^{commit}"
+                git diff --check "$parent" "$child"
+                python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+                check_proposal_edge "$parent" "$child"
+              done
+            done < <(git rev-list --reverse --topo-order --parents "$GITHUB_SHA")
+          fi

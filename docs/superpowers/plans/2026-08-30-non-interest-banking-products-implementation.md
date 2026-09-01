@@ -1,5 +1,9 @@
 # Non-Interest Banking Products Implementation Plan
 
+**Proposal:** [Non-interest banking products](../../../architecture/proposals/README.md#non-interest-banking-products)
+
+**Related ADRs:** [ADR-0002](../../../architecture/adr/0002-centralize-financial-invariants-in-funds-core.md), [ADR-0003](../../../architecture/adr/0003-use-signed-integer-minor-units.md), [ADR-0004](../../../architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md), [ADR-0005](../../../architecture/adr/0005-use-immutable-journals-and-additive-corrections.md), and [ADR-0006](../../../architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans task-by-task. Keep checkbox state here.
 
 **Goal:** Implement a structurally separate, governance-approved non-interest deposit/investment foundation and a Mudarabah-style investment-pool allocation proof without disguising conventional interest as “zero rate”.
@@ -58,6 +62,8 @@ test/acceptance/non_interest_products.sh
 - [ ] Page events/contracts by stable key; independently replay unit balances at any cutoff.
 - [ ] Commit: `feat(non-interest): track investment participation exactly`
 
+<a id="pool-distribution-delivery-detail"></a>
+<!-- migration-source: 13.07.03 -->
 ### Task 4: Approve and freeze a pool-close result
 
 - [ ] Write tests for incomplete source period, unbalanced pool books, unapproved adjustments, changed evidence hash, cross-pool account and concurrent close commands.
