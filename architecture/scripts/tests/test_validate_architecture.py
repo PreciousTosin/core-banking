@@ -770,6 +770,20 @@ class AdrValidatorTest(unittest.TestCase):
                 errors = validator.validate_adrs(self.root)
                 self.assertTrue(any("## Context must contain prose, a list item, or a link" in error for error in errors), errors)
 
+    def test_substantive_sections_reject_indented_code_only_content(self):
+        for name, body in (
+            (
+                "four-space-block-with-blank-continuation",
+                '    print("not prose")\n    account_id = 1\n\n    raise RuntimeError(account_id)',
+            ),
+            ("leading-tab-block", "\tSELECT account_id FROM accounts;"),
+        ):
+            with self.subTest(name=name):
+                text = self.replace_section(self.valid_adr(), "## Context", body)
+                self.write("architecture/adr/0009-test-decision.md", text)
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any("## Context must contain prose, a list item, or a link" in error for error in errors), errors)
+
     def test_substantive_sections_accept_prose_list_items_and_links(self):
         for name, body in (
             ("prose", "A prose statement."),

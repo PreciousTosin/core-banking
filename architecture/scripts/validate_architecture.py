@@ -848,7 +848,12 @@ def _section_bodies(text: str) -> dict[str, str]:
             if later_level <= level:
                 end = later_start
                 break
-        sections[heading] = "\n".join(line.rstrip() for line in lines[start + 1:end]).strip()
+        body_lines = [line.rstrip() for line in lines[start + 1:end]]
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        sections[heading] = "\n".join(body_lines)
     return sections
 
 def _parse_adr(path: str, raw: bytes) -> AdrRecord | None:
@@ -901,6 +906,8 @@ def _has_substantive_content(body: str) -> bool:
     lines = _mask("\n".join(unfenced_lines)).splitlines()
     syntax_only = set()
     for index, line in enumerate(lines):
+        if line.expandtabs(4).startswith("    "):
+            syntax_only.add(index)
         if re.match(r"^\s{0,3}#{1,6}(?:\s+|$)", line):
             syntax_only.add(index)
         if re.match(r"^\s{0,3}\[[^]]+\]:\s*(?:<[^>]+>|\S+)", line):
