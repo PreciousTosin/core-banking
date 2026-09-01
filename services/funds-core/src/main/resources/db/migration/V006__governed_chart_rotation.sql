@@ -218,7 +218,7 @@ $function$;
 -- Deliberately SECURITY INVOKER (the default): the caller must itself hold
 -- UPDATE on chart_version, which only the owner funds_migrator does. A definer
 -- routine would let one stray EXECUTE grant hand rotation to funds_app; the
--- REVOKE below removes even the possibility of that grant path.
+-- REVOKE below withdraws EXECUTE as well, so the runtime cannot even call it.
 CREATE FUNCTION funds.rotate_chart_version(
     p_book_id uuid,
     p_current_chart_version_id uuid,

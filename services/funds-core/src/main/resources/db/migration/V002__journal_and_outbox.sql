@@ -56,8 +56,8 @@ CREATE TABLE funds.posting (
 );
 
 -- Per-account running total, updated in the posting transaction under the
--- account lock. A projection, not a source of truth: proofs recompute from
--- posting and compare against it.
+-- account lock. A projection, not a source of truth: the proofs recompute from
+-- posting and never read it.
 CREATE TABLE funds.materialised_balance (
     account_id uuid PRIMARY KEY REFERENCES funds.ledger_account(account_id),
     signed_posting_total bigint NOT NULL DEFAULT 0,
@@ -78,8 +78,8 @@ CREATE TABLE funds.control_account_projection (
 );
 
 -- Transactional outbox: the event row commits with the journal or not at all.
--- Relay is outside this module; the unique key makes a re-emitted aggregate
--- version idempotent at insert.
+-- Relay is outside this module; the unique key rejects a second event for the
+-- same aggregate version and type.
 CREATE TABLE funds.outbox_event (
     event_id uuid PRIMARY KEY,
     aggregate_id uuid NOT NULL,
@@ -186,7 +186,6 @@ BEGIN
 END
 $function$;
 
--- Row-level, so a single mismatched line rejects the whole transaction.
 CREATE TRIGGER posting_reference_consistency
 BEFORE INSERT OR UPDATE ON funds.posting
 FOR EACH ROW

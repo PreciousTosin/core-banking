@@ -185,7 +185,7 @@ ALTER TABLE funds.chart_version
     );
 
 -- One ACTIVE chart per book. Rotation (V006) retires before it activates so
--- this is never violated mid-statement.
+-- this is never violated mid-rotation.
 CREATE UNIQUE INDEX one_active_chart_per_book_idx
     ON funds.chart_version (book_id)
     WHERE status = 'ACTIVE';
@@ -711,7 +711,7 @@ FOR EACH ROW
 EXECUTE FUNCTION funds.enforce_posting_chart_mapping();
 
 -- Helpers for the dimension CHECKs below; IMMUTABLE so they are legal in a
--- CHECK constraint and so the constraint validates existing rows on ADD.
+-- CHECK constraint.
 CREATE FUNCTION funds.jsonb_object_size(value jsonb)
 RETURNS integer
 LANGUAGE sql

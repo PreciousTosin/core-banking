@@ -9,8 +9,7 @@
 -- Guarded by MigrationIT.roleBootstrapIsFailClosedAndNeverAltersExistingClusterRoles,
 -- which reads this file as text: exactly three role-creation lines must exist,
 -- and the idempotent-create, role-alter, membership-catalogue and dynamic
--- revoke-from idioms are forbidden anywhere in the file. Keep comments free of
--- those phrases and never begin a comment line with a role-creation statement.
+-- revoke-from idioms are forbidden anywhere in the file, comments included.
 
 -- Fail closed: plain creation errors if any of the three roles already exists,
 -- so a pre-existing cluster role is never adopted or changed. NOINHERIT keeps a

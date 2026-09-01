@@ -37,7 +37,6 @@ BEGIN
 END
 $function$;
 
--- BEFORE INSERT: finality is decided before any other line guard runs.
 CREATE TRIGGER posting_requires_in_progress_command
 BEFORE INSERT ON funds.posting
 FOR EACH ROW

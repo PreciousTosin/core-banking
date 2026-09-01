@@ -44,8 +44,7 @@ AS $function$
 $function$;
 
 -- A book is one legal entity's accounting boundary (functional currency,
--- calendar, policy version). The composite unique key lets dependants pin book
--- and legal entity together.
+-- calendar, policy version).
 CREATE TABLE funds.book (
     book_id uuid PRIMARY KEY,
     legal_entity_id uuid NOT NULL,

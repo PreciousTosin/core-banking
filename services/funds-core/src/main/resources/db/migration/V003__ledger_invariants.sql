@@ -45,8 +45,8 @@ BEGIN
 END
 $function$;
 
--- Fired from the header as well as the lines, so a journal whose lines were
--- never written is still checked at commit.
+-- Fired from the header as well as the lines. An empty journal passes here (no
+-- currency group is unbalanced); V005's journal_reversibility_deferred rejects it.
 CREATE CONSTRAINT TRIGGER journal_balance_deferred
 AFTER INSERT OR UPDATE OR DELETE ON funds.journal
 DEFERRABLE INITIALLY DEFERRED
