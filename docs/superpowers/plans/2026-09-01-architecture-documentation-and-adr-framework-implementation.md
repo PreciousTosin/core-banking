@@ -27,8 +27,9 @@
 - Local work without a pull request uses a full Git commit hash as implementation evidence; branch names are not evidence.
 - Do not claim that infrastructure manifests are deployed or verified merely because their files exist.
 - Every task ends with its focused validation and a commit before the next task starts.
-- Before Task 1 changes any file, capture the immutable implementation baseline with `git rev-parse HEAD > /tmp/core-banking-architecture-base`; every cross-task whitespace review uses `$(cat /tmp/core-banking-architecture-base)..HEAD`, never `HEAD~N`.
+- Before Task 1 changes any file, create the durable local baseline ref `refs/codex/architecture-docs-framework-base`; fail rather than overwrite it if it already exists. Before every cross-task range review, resolve that ref to a 40-lowercase-hex commit, verify the commit exists, and use `<resolved-base>..HEAD`, never `HEAD~N`. Delete only this exact ref after Final Verification succeeds.
 - Markdown links resolve relative to the containing Markdown file after stripping query strings and fragments; the validator supports angle-bracket destinations and backslash-escaped spaces.
+- Link validation scans governed repository Markdown from the filesystem, including newly created and untracked task files, while pruning `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, every `node_modules/`, Maven/Gradle `target/` and `build/` output, and `architecture/diagrams/generated/`. Markdown fenced-code blocks and inline-code spans are examples, not link-bearing prose, and are excluded before destinations are parsed.
 
 ## File Structure
 
@@ -49,7 +50,7 @@
 
 ### Migration and historical preservation
 
-- Create `architecture/archive/comprehensive-design-migration-inventory.md`: granular rows for every material top-level section and subsection, with stable unique source keys, disposition, destination, evidence, coverage notes, and resolution while retaining full top-level coverage `1` through `27`.
+- Create `architecture/archive/comprehensive-design-migration-inventory.md`: granular rows for every material top-level section and subsection, with stable unique source keys, exact heading-relative material-block coverage, disposition, destination, evidence, rationale, and resolution while retaining full top-level coverage `1` through `27`.
 - Move `architecture/modern-core-banking-comprehensive-design-revised.md` to `architecture/archive/modern-core-banking-comprehensive-design-revised.md` only in the final archive-cutover task.
 
 ### Decisions and proposals
@@ -82,6 +83,7 @@
 **Interfaces:**
 - Consumes: repository root path and optional comma-separated check names.
 - Produces: generic front-matter, Markdown-link, CLI-dispatch, and deterministic-error primitives that later tasks extend with repository contracts.
+- Produces: `extract_markdown_destinations(text: str) -> list[str]`, which returns destinations from prose links only and ignores fenced and inline code examples.
 - Produces: `validate_repository(root: Path, checks: frozenset[str]) -> list[str]`, where an empty list means success and each non-empty string is one actionable validation error.
 - CLI: `python3 architecture/scripts/validate_architecture.py --root . --checks links`; omit `--checks` to run all checks registered at that point in the plan.
 
@@ -90,11 +92,21 @@
 Run before changing a file:
 
 ```bash
-git rev-parse HEAD > /tmp/core-banking-architecture-base
-test "$(tr -d '\n' < /tmp/core-banking-architecture-base | wc -c)" -eq 40
+base_ref=refs/codex/architecture-docs-framework-base
+if git show-ref --verify --quiet "$base_ref"; then
+  echo "$base_ref already exists; inspect and remove it deliberately before restarting" >&2
+  exit 1
+fi
+base_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+printf '%s' "$base_commit" | grep -Eq '^[0-9a-f]{40}$'
+git cat-file -e "$base_commit^{commit}"
+git update-ref "$base_ref" "$base_commit" ""
+recorded_base="$(git rev-parse --verify "$base_ref^{commit}")"
+printf '%s' "$recorded_base" | grep -Eq '^[0-9a-f]{40}$'
+git cat-file -e "$recorded_base^{commit}"
 ```
 
-Expected: the file contains exactly one full 40-hex commit hash. Keep it through Final Verification.
+Expected: the previously absent local ref resolves to the exact starting commit. Keep it through Final Verification; no task may overwrite or delete it.
 
 - [ ] **Step 2: Write failing validator unit tests**
 
@@ -114,6 +126,36 @@ def test_nested_links_resolve_from_containing_file(self):
 def test_escaped_space_link_resolves_from_containing_file(self):
     self.write("architecture/arc42/target file.md", "# Target\n")
     self.write("architecture/guides/nested.md", "[target](../arc42/target\\ file.md#section)\n")
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_broken_links_inside_fenced_and_inline_code_are_examples(self):
+    self.write(
+        "docs/examples.md",
+        "`[inline](missing-inline.md)`\n\n```markdown\n[fenced](missing-fenced.md)\n```\n",
+    )
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_destination_extraction_masks_code_but_keeps_prose_links(self):
+    text = "`[inline](missing-inline.md)`\n```md\n[fenced](missing-fenced.md)\n```\n[real](real.md)\n"
+    self.assertEqual(["real.md"], validator.extract_markdown_destinations(text))
+
+def test_link_scan_includes_new_untracked_markdown(self):
+    self.write("new-task-not-added-to-git.md", "[missing](governed-missing.md)\n")
+    errors = validator.validate_links(self.root)
+    self.assertTrue(any("governed-missing.md does not exist" in error for error in errors))
+
+def test_link_scan_prunes_non_governed_trees(self):
+    for path in (
+        ".git/objects/example.md",
+        ".worktrees/feature/example.md",
+        ".claude/worktrees/mirror/example.md",
+        "graft/cache/example.md",
+        "architecture/tooling/node_modules/pkg/example.md",
+        "services/funds-core/target/site/example.md",
+        "module/build/reports/example.md",
+        "architecture/diagrams/generated/example.md",
+    ):
+        self.write(path, "[ignored](missing.md)\n")
     self.assertEqual([], validator.validate_links(self.root))
 
 def test_front_matter_parses_supported_subset(self):
@@ -160,12 +202,13 @@ def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str
     return sorted(errors)
 ```
 
-Define `parse_front_matter(path: Path) -> dict[str, str | list[str]]`, `validate_links(root: Path) -> list[str]`, and `main(argv: Sequence[str] | None = None) -> int` with those exact names and types before constructing `VALIDATORS`.
+Define `parse_front_matter(path: Path) -> dict[str, str | list[str]]`, `extract_markdown_destinations(text: str) -> list[str]`, `validate_links(root: Path) -> list[str]`, and `main(argv: Sequence[str] | None = None) -> int` with those exact names and types before constructing `VALIDATORS`.
 
 Implement the bodies with these exact rules:
 
 - Parse only the repository's YAML subset: scalar `key: value`, `key: []`, and indented `- item` lists between the first two `---` lines.
-- `links` scans repository Markdown files, resolves each relative destination against the containing file's parent, removes query strings and fragments before checking the filesystem, unwraps destinations enclosed in angle brackets, converts Markdown backslash-escaped spaces to literal spaces, and skips `http`, `https`, `mailto`, and pure `#fragment` targets.
+- `links` walks Markdown files from the repository-root filesystem rather than `git ls-files`, so newly created and untracked task files are governed. Prune the exact repository-relative roots `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, and `architecture/diagrams/generated/`, plus any directory component named `node_modules`, `target`, or `build`; do not follow symlinked directories, which can be worktree or cache mirrors.
+- Before extracting Markdown links, mask CommonMark fenced code blocks opened by at least three backticks or tildes and inline code spans delimited by matching backtick runs. Preserve line breaks while masking so diagnostics retain correct locations. Resolve each remaining relative destination against the containing file's parent, remove query strings and fragments before checking the filesystem, unwrap destinations enclosed in angle brackets, convert Markdown backslash-escaped spaces to literal spaces, and skip `http`, `https`, `mailto`, and pure `#fragment` targets.
 - Sort errors by path and message so local and CI output is deterministic.
 - Print each error to stderr and return `1`; print `architecture validation passed` and return `0` when clean.
 
@@ -388,7 +431,8 @@ Add `migration` to the planned `CHECKS`/`VALIDATORS` contract, but write tests b
 - A complete fixture contains at least one unique source key rooted at each top-level integer `01` through `27`, includes multiple rows for mixed section `08`, and has exactly one `unresolved` row; assert one `unresolved migration row` error by presence, not total error cardinality.
 - Missing top-level root `17`, a duplicate full source key, a malformed source key, an unsupported disposition, and an unsupported resolution each produce focused errors.
 - A non-`historical-only` row whose destination does not exist fails; a `current` row whose evidence path does not exist fails.
-- A mixed-content heading represented by multiple rows fails if any row has empty coverage notes or if its source keys do not use distinct `::01`, `::02` segment suffixes.
+- Every row, including an unsplit one-row heading, fails when `Covered blocks` or `Rationale` is empty. A `historical-only` row fails unless its rationale explicitly explains why no maintained destination is appropriate.
+- For a heading with blocks `B01` and `B02`, a fixture missing `B02` fails with a coverage-gap diagnostic, and a fixture assigning `B01` to two rows fails with a coverage-overlap diagnostic. A mixed-content heading represented by multiple rows also fails if its source keys do not use contiguous distinct `::01`, `::02` segment suffixes.
 
 Build the valid fixture with all 27 roots, real temporary destination files, and real temporary evidence files; do not use a one-row fixture as a supposedly complete inventory.
 
@@ -399,24 +443,31 @@ self.write("architecture/README.md", "# Architecture\n")
 self.write("services/funds-core/README.md", "# Funds core\n")
 self.write(
     "architecture/modern-core-banking-comprehensive-design-revised.md",
-    "\n".join(f"## {section}. Section {section}" for section in range(1, 28)),
+    "\n\n".join(
+        (
+            f"## {section}. Section {section}\n\nCurrent paragraph.\n\nProposed paragraph."
+            if section == 8
+            else f"## {section}. Section {section}\n\nMaterial paragraph for section {section}."
+        )
+        for section in range(1, 28)
+    ),
 )
 rows = []
 for section in range(1, 28):
     if section == 8:
         rows.extend([
-            "| 08::01 | 8. Current segment | current | architecture/README.md | services/funds-core/README.md | Implemented paragraph | resolved |",
-            "| 08::02 | 8. Proposed segment | proposal | architecture/README.md | None | Unimplemented paragraph | resolved |",
+            "| 08::01 | 8. Section 8 | B01 | current | architecture/README.md | services/funds-core/README.md | B01 is verified current behavior. | resolved |",
+            "| 08::02 | 8. Section 8 | B02 | proposal | architecture/README.md | None | B02 is an unimplemented design. | resolved |",
         ])
         continue
     resolution = "unresolved" if section == 27 else "resolved"
     rows.append(
-        f"| {section:02d} | {section}. Section {section} | service-detail | architecture/README.md | None | Entire section | {resolution} |"
+        f"| {section:02d} | {section}. Section {section} | B01 | service-detail | architecture/README.md | None | B01 belongs in detailed service documentation. | {resolution} |"
     )
 self.write(
     "architecture/archive/comprehensive-design-migration-inventory.md",
-    "| Source key | Source heading | Disposition | Destination | Evidence | Coverage notes | Resolution |\n"
-    "|---|---|---|---|---|---|---|\n" + "\n".join(rows) + "\n",
+    "| Source key | Source heading | Covered blocks | Disposition | Destination | Evidence | Rationale | Resolution |\n"
+    "|---|---|---|---|---|---|---|---|\n" + "\n".join(rows) + "\n",
 )
 ```
 
@@ -435,19 +486,21 @@ Expected: fail because `validate_migration_inventory` and the `migration` regist
 Use this exact table schema:
 
 ```markdown
-| Source key | Source heading | Disposition | Destination | Evidence | Coverage notes | Resolution |
-|---|---|---|---|---|---|---|
+| Source key | Source heading | Covered blocks | Disposition | Destination | Evidence | Rationale | Resolution |
+|---|---|---|---|---|---|---|---|
 ```
 
-Inventory every material `##`, `###`, and `####` heading within numbered sections 1 through 27, not merely the 27 top-level headings. Derive a stable source key from the printed heading number: zero-pad each numeric component (`8.1.1` becomes `08.01.01`); named worked examples use a lowercase slug (`13.08.example-a`). If one heading mixes dispositions, split it into `08.01::01`, `08.01::02`, and later segment keys, with one row per content segment. Full source keys must be unique and top-level roots `01` through `27` must all be represented.
+Inventory every material `##`, `###`, and `####` heading within numbered sections 1 through 27, not merely the 27 top-level headings. Derive a stable source key from the printed heading number: zero-pad each numeric component (`8.1.1` becomes `08.01.01`); named worked examples use a lowercase slug (`13.08.example-a`). If one heading mixes dispositions, split it into `08.01::01`, `08.01::02`, and later contiguous segment keys, with one row per classified segment. Full source keys must be unique and top-level roots `01` through `27` must all be represented.
 
-Allowed `Disposition` values are exactly `current`, `proposal`, `decision`, `service-detail`, `plan-detail`, and `historical-only`. Allowed `Resolution` values are exactly `unresolved` and `resolved`. Semicolon-separated `Destination` entries are repository-relative paths; every listed destination must exist at validation time. Use `None` only for a `historical-only` destination. Semicolon-separated `Evidence` entries must exist for every `current` row and may be `None` for other dispositions. `Coverage notes` must name the paragraph range, table, example, or list covered and, for mixed content, explain why the segments have different dispositions. No row may resolve merely by pointing to the comprehensive source document.
+For machine-checkable material coverage, tokenize each heading's direct body, from the heading line to the next Markdown heading of any level, into ordered heading-relative blocks `B01`, `B02`, and later ordinals. A paragraph is one maximal run of non-blank prose lines; a list is one maximal contiguous list including indented continuations; a table is one maximal contiguous Markdown table; and a fenced block is one complete backtick- or tilde-fenced block. Blank lines separate blocks. The archive banner is outside every numbered heading body, so these ordinals survive both `git mv` and banner insertion. `Covered blocks` is a semicolon-separated list of exact ordinals. Across all rows for one heading, require every derived block ordinal exactly once: a gap, duplicate within one row, or overlap across rows is a blocking error. Require at least one covered block and a non-empty `Rationale` on every row, including unsplit headings. The rationale states why that material has the selected disposition; for `historical-only`, it must explicitly state why retention only in the archive is appropriate and why no maintained destination exists.
+
+Allowed `Disposition` values are exactly `current`, `proposal`, `decision`, `service-detail`, `plan-detail`, and `historical-only`. Allowed `Resolution` values are exactly `unresolved` and `resolved`. Semicolon-separated `Destination` entries are repository-relative paths; every listed destination must exist at validation time. Use `None` only for a `historical-only` destination. Semicolon-separated `Evidence` entries must exist for every `current` row and may be `None` for other dispositions. No row may resolve merely by pointing to the comprehensive source document.
 
 At initial inventory commit, use existing arc42, plan, service-document, source, test, and migration paths. Rows requiring not-yet-created ADRs or proposals remain `unresolved` and point to the already-existing `architecture/adr/README.md` or `architecture/proposals/README.md` governance destination until Tasks 5 and 7 replace that destination with the exact created artifact. This preserves path validity without falsely claiming extraction is complete.
 
 - [ ] **Step 4: Implement the migration contract**
 
-Add `migration` to `CHECKS` and `VALIDATORS` and implement `validate_migration_inventory(root: Path) -> list[str]` with the exact schema, source-key grammar, allowed values, top-level coverage, uniqueness, mixed-segment coverage-note, path-existence, current-evidence, and unresolved-row rules above. Parse numbered `##`/`###`/`####` headings from the comprehensive source, plus unnumbered `#### Example A` through `#### Example J` under section 13.8, and require each derived heading key to have either one exact inventory key or one or more segment keys with that key plus `::NN`; reject inventory keys that do not map back to a source heading. Table parsing must report malformed rows rather than silently skipping them.
+Add `migration` to `CHECKS` and `VALIDATORS` and implement `validate_migration_inventory(root: Path) -> list[str]` with the exact schema, source-key grammar, allowed values, top-level and subsection coverage, uniqueness, material-block tokenization and exact-once coverage, non-empty per-row rationale, historical-only rationale, contiguous mixed-segment suffix, path-existence, current-evidence, and unresolved-row rules above. Parse numbered `##`/`###`/`####` headings from the comprehensive source, plus unnumbered `#### Example A` through `#### Example J` under section 13.8, and require each derived material heading key to have either one exact inventory key or one or more segment keys with that key plus `::NN`; reject inventory keys that do not map back to a source heading. Table parsing must report malformed rows rather than silently skipping them.
 
 - [ ] **Step 5: Validate the inventory's deliberate interim state**
 
@@ -486,9 +539,11 @@ git commit -m "docs: inventory comprehensive architecture migration"
 - Consumes: approved ADR template and implementation evidence.
 - Produces: a contiguous decision history and stable IDs used by diagrams, proposals, and arc42 metadata.
 
-- [ ] **Step 1: Add failing ADR contract tests**
+- [ ] **Step 1: Add failing ADR contract and reciprocal-traceability tests**
 
-Write tests against a new `validate_adrs` behavior before implementing it. Test contiguous numbering, filename/title agreement, required headings, valid statuses, non-empty `None` relationship fields, retrospective marking, separation of decision from implementation status, evidence syntax, and substantive content. The substantive headings are exactly `## Context`, `## Decision drivers`, `## Considered options`, `## Decision`, `## Consequences`, `### Positive`, `### Negative`, `### Risks`, `## Compliance and verification`, and `## Implementation evidence`; each must contain non-whitespace prose, a list item, or a link before the next heading of the same or higher level. Add one negative test per empty substantive heading. Test that the body of `## Implementation evidence` may be exactly `None` only with `Not started` or `Not applicable`, while `Partial` and `Complete` require at least one existing repository path plus a full 40-lowercase-hex commit hash or stable `https://github.com/<owner>/<repo>/pull/<number>` URL in the evidence section or matching relationship fields.
+Write tests against a new `validate_adrs` behavior before implementing it. Test contiguous numbering, filename/title agreement, required headings, valid statuses, relationship fields containing either a non-empty value or the literal `None`, retrospective marking, separation of decision from implementation status, evidence syntax, and substantive content. The substantive headings are exactly `## Context`, `## Decision drivers`, `## Considered options`, `## Decision`, `## Consequences`, `### Positive`, `### Negative`, `### Risks`, `## Compliance and verification`, and `## Implementation evidence`; each must contain non-whitespace prose, a list item, or a link before the next heading of the same or higher level. Add one negative test per empty substantive heading. Test that the body of `## Implementation evidence` may be exactly `None` only with `Not started` or `Not applicable`, while `Partial` and `Complete` require at least one existing repository path plus a full 40-lowercase-hex commit hash or stable `https://github.com/<owner>/<repo>/pull/<number>` URL in the evidence section or matching relationship fields.
+
+Also add negative reciprocal fixtures proving all of these fail independently: a foundational ADR `0001` through `0008` with `Related architecture sections: None`; an ADR architecture-section link whose repository-relative path does not exist; an ADR linking an existing arc42 file whose `related_adrs` omits that ADR ID; an arc42 `related_adrs` ID with no matching ADR; and an arc42 ADR ID whose ADR does not link back to that exact section. Add a positive fixture with two ADR/arc42 pairs so the check cannot pass by comparing only aggregate sets.
 
 - [ ] **Step 2: Run ADR tests and verify failure**
 
@@ -500,13 +555,13 @@ python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 
 Expected: fail because `validate_adrs` and the `adrs` registry entry do not exist.
 
-- [ ] **Step 3: Implement the ADR contract**
+- [ ] **Step 3: Implement the ADR contract and reciprocal architecture links**
 
-Add `adrs` to `CHECKS` and `VALIDATORS`. Implement the exact numbering, filename/title, field, lifecycle-value, substantive-section, relationship-`None`, retrospective, implementation-evidence, 40-hex, stable-PR-URL, and evidence-path rules from Step 1. `Related pull requests`, `Related commits`, and `Implementation evidence` are append-only relationship/evidence areas; do not attempt to infer rationale immutability from a single checkout.
+Add `adrs` to `CHECKS` and `VALIDATORS`. Implement the exact numbering, filename/title, field, lifecycle-value, substantive-section, relationship-`None`, retrospective, implementation-evidence, 40-hex, stable-PR-URL, evidence-path, and reciprocal architecture-link rules from Step 1. Parse every Markdown destination in `Related architecture sections`, require it to resolve to an existing `architecture/arc42/*.md` file, and require that file's `related_adrs` metadata to contain the ADR's exact ID. Conversely, resolve every arc42 `related_adrs` ID to an ADR and require that ADR to link the exact arc42 path. For foundational ADRs `ADR-0001` through `ADR-0008`, reject `Related architecture sections: None`; `None` remains valid in the reusable template and in future non-foundational records when genuinely unaffected. `Related pull requests`, `Related commits`, and `Implementation evidence` are append-only relationship/evidence areas; do not attempt to infer rationale immutability from a single checkout.
 
 - [ ] **Step 4: Write ADR-0001 through ADR-0004**
 
-Use `Status: Accepted`. ADR-0001 is not retrospective and links the approved design plus its commit; implementation status is `Partial` until the framework is complete. ADR-0002 through ADR-0004 are retrospective with implementation status `Complete` and cite exact evidence:
+Use `Status: Accepted`. Every ADR links at least one exact affected arc42 file under `Related architecture sections`, and each linked arc42 file includes the reciprocal ADR ID in `related_adrs`. ADR-0001 is not retrospective and links the approved design plus its commit; implementation status is `Partial` until the framework is complete. ADR-0002 through ADR-0004 are retrospective with implementation status `Complete` and cite exact evidence:
 
 - ADR-0002: `PostingService`, `ReversalService`, proof services, and database privilege migrations.
 - ADR-0003: `Money`, `PostingLine`, `JournalValidator`, overflow tests, and the debit/credit example in the funds-core README.
@@ -568,7 +623,7 @@ git commit -m "docs: record foundational architecture decisions"
 
 - [ ] **Step 1: Add failing diagram metadata tests**
 
-Write tests against a new `validate_diagrams` behavior before implementing it. Test the seven required metadata comments, allowed state values, non-empty `abstraction`, non-empty `question`, existing arc42 path, existing ADR IDs, ISO date, matching state in the Mermaid title, and required five filenames. Include negative tests for missing abstraction, missing question, missing title state, and a `CURRENT` metadata/`PROPOSED` title mismatch.
+Write tests against a new `validate_diagrams` behavior before implementing it. Test the seven required metadata comments, allowed state values, non-empty `abstraction`, non-empty `question`, existing arc42 path, existing ADR IDs, ISO date, matching state in the Mermaid title, required five filenames, and executable mode on `architecture/scripts/render-diagrams.sh`. Include negative tests for missing abstraction, missing question, missing title state, a `CURRENT` metadata/`PROPOSED` title mismatch, a non-executable render script, and an arc42 section that does not contain a Markdown link back to the diagram source. Include a positive fixture in which each diagram's declared arc42 section links its exact `.mmd` path.
 
 - [ ] **Step 2: Run diagram tests and verify failure**
 
@@ -582,7 +637,7 @@ Expected: fail because `validate_diagrams` and the `diagrams` registry entry do 
 
 - [ ] **Step 3: Implement the diagram contract**
 
-Add `diagrams` to `CHECKS` and `VALIDATORS`. Implement the exact filename, first-ten-lines metadata/front-matter, state, abstraction, question, owner, arc42-path, ADR-ID, ISO-date, and title-state agreement rules from Step 1. The required comment keys are `state`, `abstraction`, `question`, `owner`, `arc42`, `adrs`, and `last_verified`; the Mermaid YAML front-matter title must include the same literal `CURRENT` or `PROPOSED` state.
+Add `diagrams` to `CHECKS` and `VALIDATORS`. Implement the exact filename, first-ten-lines metadata/front-matter, state, abstraction, question, owner, arc42-path, ADR-ID, ISO-date, title-state agreement, executable-render-script, and reciprocal arc42-link rules from Step 1. The required comment keys are `state`, `abstraction`, `question`, `owner`, `arc42`, `adrs`, and `last_verified`; the Mermaid YAML front-matter title must include the same literal `CURRENT` or `PROPOSED` state. For each diagram, resolve its declared arc42 path and require that Markdown file to contain a link whose resolved destination is the exact diagram source.
 
 - [ ] **Step 4: Add isolated Mermaid tooling**
 
@@ -629,12 +684,14 @@ Add these ignores:
 
 - [ ] **Step 7: Implement and run the render script**
 
-The script must use `set -euo pipefail`, resolve repository paths from its own location, require `architecture/tooling/node_modules/.bin/mmdc`, create a caller-provided directory or `mktemp -d`, render each source to SVG, and remove only its own temporary directory on exit.
+The script must begin with `#!/usr/bin/env bash`, use `set -euo pipefail`, resolve repository paths from its own location, require `architecture/tooling/node_modules/.bin/mmdc`, create a caller-provided directory or `mktemp -d`, render each source to SVG, and remove only its own temporary directory on exit. Establish and verify the executable contract before invoking it:
 
 Run:
 
 ```bash
 npm ci --prefix architecture/tooling
+chmod +x architecture/scripts/render-diagrams.sh
+test -x architecture/scripts/render-diagrams.sh
 architecture/scripts/render-diagrams.sh
 python3 architecture/scripts/validate_architecture.py --root . --checks diagrams,links
 ```
@@ -651,6 +708,7 @@ test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/dia
 
 ```bash
 git add .gitignore architecture/diagrams architecture/scripts/render-diagrams.sh architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py architecture/tooling architecture/arc42
+test "$(git ls-files -s architecture/scripts/render-diagrams.sh | awk '{print $1}')" = 100755
 git commit -m "docs: add architecture diagrams as code"
 ```
 
@@ -766,19 +824,28 @@ Write tests against a new `validate_archive_state` behavior before implementing 
 - invalid premature archive: unresolved rows with archive present;
 - invalid duplicate copy: old source and archive both present, regardless of resolution.
 
-The state check is separate from the inventory's unresolved-row diagnostic: unresolved/pre-cutover is a safe archive state even though the complete migration check still blocks cutover.
+Use the complete 27-root, subsection, and material-block fixture from Task 4 rather than a path-presence-only fixture. Assert that `validate_migration_inventory` selects the old source in both pre-cutover states and the archived source in the post-cutover state, then performs the same granular source-key and exact-once material-block coverage checks against the selected file. In the archived fixture, remove one source material block while leaving its inventory ordinal in place and assert a focused source/content coverage error. Neither source and both sources must each produce an error; the validator may never merge, prefer, or silently skip duplicate/missing sources.
 
-- [ ] **Step 2: Implement the archive state machine and verify the gate before moving**
+The state check is separate from the inventory's unresolved-row diagnostic: unresolved/pre-cutover is a safe archive state even though the complete migration check still blocks cutover. Run the new archive-state test before implementation:
 
-Implement `validate_archive_state(root: Path) -> list[str]`, add `archive` to `CHECKS` and `VALIDATORS`, and encode exactly the three valid and three invalid categories in Step 1. Do not infer cutover from Git history; use inventory resolution plus presence of the two exact paths.
+```bash
+python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_archive_state_selects_exactly_one_source_and_rechecks_full_inventory -v
+```
+
+Expected: fail because the Task 4 migration validator only knows the old source path and the new archive-state/source-selection behavior does not exist.
+
+- [ ] **Step 2: Implement the archive state machine and selected-source migration check**
+
+Implement `select_comprehensive_source(root: Path, all_rows_resolved: bool) -> tuple[Path | None, list[str]]` and use it from both `validate_migration_inventory` and `validate_archive_state`. It returns the old exact path when it alone exists in unresolved or resolved pre-cutover state, returns the archived exact path only when it alone exists and all rows are resolved, and returns deterministic errors plus `None` for neither, both, or an archived-only unresolved state. After selection, `validate_migration_inventory` must parse that selected file and rerun its full heading-key, top-level `01` through `27`, subsection, material-block tokenization, exact-once coverage, source-key back-reference, destination, evidence, rationale, and resolution contract; moving the source must not reduce validation to file presence. Add `archive` to `CHECKS` and `VALIDATORS`; do not infer cutover from Git history.
 
 Run:
 
 ```bash
+python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_archive_state_selects_exactly_one_source_and_rechecks_full_inventory -v
 python3 architecture/scripts/validate_architecture.py --root . --checks migration,archive,links
 ```
 
-Expected: pass with zero unresolved rows in the valid resolved pre-cutover state. Do not move the source document if granular coverage, destinations, evidence, links, or archive state fails.
+Expected: the focused archive-state/source-selection test passes, followed by repository validation with zero unresolved rows in the valid resolved pre-cutover state. Do not move the source document if granular coverage, destinations, evidence, links, or archive state fails.
 
 - [ ] **Step 3: Move the comprehensive design with Git**
 
@@ -900,8 +967,9 @@ Add tests before changing production code:
 
 - `validate_pr_body` rejects no selected box, both selected boxes, a missing required label, and `Architecture changed` when all four artifact fields are `None` or verification evidence is `None`/empty.
 - `validate_pr_body` accepts exactly one selection; for `Architecture changed`, all five labels have non-empty values, `None` is allowed only for an unaffected artifact field, at least one of ADR/arc42/proposal/diagram is not `None`, and verification evidence is not `None`.
-- `validate_workflow_contract` requires all `pull_request` events without a path filter, `push` to `master`, top-level `permissions: contents: read`, checkout `fetch-depth: 0`, the PR-body step guarded by `github.event_name == 'pull_request'`, unit tests, repository validation, npm install, diagram rendering, stale reporting with an explicit UTC date, and event-aware diff checking.
-- A workflow fixture with `pull_request.paths`, `contents: write`, missing PR-body checking, or bare `git diff --check` fails with a focused diagnostic.
+- `validate_workflow_contract` requires the explicit pull-request event set `types: [opened, synchronize, reopened, edited, ready_for_review]` with no path filter, `push` to `master`, top-level `permissions: contents: read`, checkout `fetch-depth: 0`, the PR-body step guarded by `github.event_name == 'pull_request'`, unit tests, repository validation, npm install, direct executable diagram rendering, stale reporting with an explicit UTC date, and event-aware diff checking.
+- A workflow fixture with a missing `edited` event, `pull_request.paths`, `contents: write`, missing PR-body checking, a non-executable render-script contract, bare `git diff --check`, or `git diff-tree --check --root "$GITHUB_SHA"` as the unavailable-push-base fallback fails with a focused diagnostic.
+- Add an integration-style unit fixture that initializes a temporary Git repository, commits a Markdown file containing trailing whitespace in the penultimate commit, and makes an unrelated clean tip commit. Assert the tip-only `git diff-tree --check "$tip"` output misses the earlier file, while `empty_tree=$(git hash-object -t tree /dev/null)` followed by `git diff --check "$empty_tree" "$tip"` reports it. This proves the fallback covers the complete current tree of a multi-commit replacement push rather than only the tip commit.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -923,7 +991,17 @@ Include the exact architecture block above, plus a warning that selecting `No ar
 
 - [ ] **Step 5: Create the GitHub Actions workflow**
 
-Configure all `pull_request` activity with no `paths` filter so architecture-impact declarations run for architecture-bearing source-code changes, and configure pushes to `master` with no path filter. Use `ubuntu-24.04`, `actions/checkout@v4` with `fetch-depth: 0`, `actions/setup-python@v5` with Python `3.12`, and `actions/setup-node@v4` with Node `22`. Grant only top-level `contents: read`; do not request pull-request write permission.
+Configure `pull_request: types: [opened, synchronize, reopened, edited, ready_for_review]` with no `paths` filter so initial submissions, commits, reopenings, body edits, and draft-to-ready transitions all retrigger architecture-impact declarations. Configure pushes to `master` with no path filter. Use `ubuntu-24.04`, `actions/checkout@v4` with `fetch-depth: 0`, `actions/setup-python@v5` with Python `3.12`, and `actions/setup-node@v4` with Node `22`. Grant only top-level `contents: read`; do not request pull-request write permission.
+
+Use this exact trigger contract:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [master]
+```
 
 Run these steps in order:
 
@@ -939,7 +1017,38 @@ Run these steps in order:
     python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of "$(date -u +%F)" | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
-The final workflow step must be an event-aware shell block. On pull requests, read `.pull_request.base.sha` and `.pull_request.head.sha` from `$GITHUB_EVENT_PATH` with `jq -r`, verify both commits exist, and run `git diff --check "$base_sha..$head_sha"`. On pushes, read `.before`; when it is a non-zero existing commit run `git diff --check "$before_sha..$GITHUB_SHA"`, otherwise run `git diff-tree --check --root "$GITHUB_SHA"`. This is why checkout uses `fetch-depth: 0`; a bare working-tree-only `git diff --check` is not the CI contract.
+The final workflow step must be an event-aware shell block. On pull requests, read `.pull_request.base.sha` and `.pull_request.head.sha` from `$GITHUB_EVENT_PATH` with `jq -r`, verify both are 40-lowercase-hex commits with `git cat-file -e "$sha^{commit}"`, and run `git diff --check "$base_sha..$head_sha"`. On pushes, read `.before`; when it is a non-zero 40-lowercase-hex existing commit, run `git diff --check "$before_sha..$GITHUB_SHA"`. When `.before` is missing, null, all zeroes, malformed, or names an unavailable commit, compute `empty_tree="$(git hash-object -t tree /dev/null)"`, verify it and `$GITHUB_SHA` are 40 lowercase hex, verify `$GITHUB_SHA` is an existing commit, and run `git diff --check "$empty_tree" "$GITHUB_SHA"`. This complete-current-tree fallback covers files introduced by any commit in a replacement push; a tip-only `git diff-tree --check --root "$GITHUB_SHA"` is forbidden. Checkout uses `fetch-depth: 0`, and a bare working-tree-only `git diff --check` is not the CI contract.
+
+Use this exact step:
+
+```yaml
+- name: Check changed-tree whitespace
+  shell: bash
+  run: |
+    set -euo pipefail
+    sha_pattern='^[0-9a-f]{40}$'
+    if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+      base_sha="$(jq -r '.pull_request.base.sha // empty' "$GITHUB_EVENT_PATH")"
+      head_sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
+      [[ "$base_sha" =~ $sha_pattern ]]
+      [[ "$head_sha" =~ $sha_pattern ]]
+      git cat-file -e "$base_sha^{commit}"
+      git cat-file -e "$head_sha^{commit}"
+      git diff --check "$base_sha..$head_sha"
+      exit 0
+    fi
+    [[ "$GITHUB_SHA" =~ $sha_pattern ]]
+    git cat-file -e "$GITHUB_SHA^{commit}"
+    before_sha="$(jq -r '.before // empty' "$GITHUB_EVENT_PATH")"
+    zero_sha=0000000000000000000000000000000000000000
+    if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null; then
+      git diff --check "$before_sha..$GITHUB_SHA"
+    else
+      empty_tree="$(git hash-object -t tree /dev/null)"
+      [[ "$empty_tree" =~ $sha_pattern ]]
+      git diff --check "$empty_tree" "$GITHUB_SHA"
+    fi
+```
 
 - [ ] **Step 6: Link governance to CI and run the local acceptance gate**
 
@@ -954,7 +1063,11 @@ npm ci --prefix architecture/tooling
 architecture/scripts/render-diagrams.sh
 python3 architecture/scripts/validate_architecture.py --root . --checks workflow
 git diff --check
-git diff --check "$(cat /tmp/core-banking-architecture-base)..HEAD"
+base_ref=refs/codex/architecture-docs-framework-base
+architecture_base="$(git rev-parse --verify "$base_ref^{commit}")"
+printf '%s' "$architecture_base" | grep -Eq '^[0-9a-f]{40}$'
+git cat-file -e "$architecture_base^{commit}"
+git diff --check "$architecture_base..HEAD"
 git status --short
 ```
 
@@ -1032,9 +1145,17 @@ python3 architecture/scripts/validate_architecture.py --root . --report-stale --
 npm ci --prefix architecture/tooling
 architecture/scripts/render-diagrams.sh
 node -e 'const l=require("./architecture/tooling/package-lock.json"); if(l.packages["node_modules/@mermaid-js/mermaid-cli"].version!=="11.16.0") process.exit(1)'
+test -x architecture/scripts/render-diagrams.sh
+test "$(git ls-files -s architecture/scripts/render-diagrams.sh | awk '{print $1}')" = 100755
 test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/diagrams/generated/**' '*.svg')"
-git diff --check "$(cat /tmp/core-banking-architecture-base)..HEAD"
+base_ref=refs/codex/architecture-docs-framework-base
+architecture_base="$(git rev-parse --verify "$base_ref^{commit}")"
+printf '%s' "$architecture_base" | grep -Eq '^[0-9a-f]{40}$'
+git cat-file -e "$architecture_base^{commit}"
+git diff --check "$architecture_base..HEAD"
 git status --short --branch
+git update-ref -d "$base_ref" "$architecture_base"
+test ! git show-ref --verify --quiet "$base_ref"
 ```
 
 Expected results:
@@ -1043,13 +1164,19 @@ Expected results:
 - Repository validation prints `architecture validation passed`.
 - Stale verification is reported at a 90-day threshold and warnings alone exit zero.
 - Exactly five Mermaid sources render successfully into a temporary directory.
+- The render script has executable mode `100755` and is directly invocable locally and in CI.
 - `package-lock.json` resolves `@mermaid-js/mermaid-cli` exactly to `11.16.0`; no `node_modules`, generated diagram output, or SVG is tracked.
 - The eleven implementation commits after the captured base contain no whitespace errors.
+- The durable baseline ref resolves to a verified commit before its final range check and is deleted only after all other verification succeeds.
 - The working tree is clean.
 - `ARCHITECTURE.md` is under 180 lines.
 - All twelve arc42 files are `current` or `deprecated`; none is `proposed`.
 - ADR identifiers are contiguous from `0001` through `0008`.
+- Every foundational ADR names existing affected arc42 paths, and ADR/arc42 references are reciprocal in both directions.
+- Every diagram's declared arc42 section contains a link back to that exact diagram source.
 - Every proposal has reciprocal ADR and plan links; the three unimplemented plans link their proposals, while the implemented accounting-kernel plan links current arc42 sections and retrospective ADRs without a proposal backlink.
 - The granular migration inventory covers every material heading under top-level sections `1` through `27`, has unique stable source keys, zero unresolved rows, and existing required destination/evidence paths.
+- Every inventory row has non-empty exact material-block coverage and disposition rationale; each heading-relative block is covered exactly once, including after archive cutover.
 - The old comprehensive-design path is absent and its archived copy is explicitly non-authoritative.
+- Pull-request `opened`, `synchronize`, `reopened`, `edited`, and `ready_for_review` events are all gated, and an unavailable push base falls back to an empty-tree-versus-current-tree whitespace check.
 - No generated SVG or `node_modules` content is tracked.
