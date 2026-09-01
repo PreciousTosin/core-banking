@@ -610,9 +610,11 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.render_tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
 
     def tearDown(self):
+        self.render_tmp.cleanup()
         self.tmp.cleanup()
 
     def write(self, rel, text):
@@ -621,7 +623,7 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
         path.write_text(text)
         return path
 
-    def write_diagram(self, name, *, state=None, abstraction=None, question="What does this show?", title_state=None, arc42=None, adrs=None):
+    def write_diagram(self, name, *, state=None, abstraction=None, question="What does this show?", owner="architecture", title_state=None, arc42=None, adrs=None, last_verified="2026-09-01"):
         expected_state, expected_abstraction, expected_arc42, expected_adrs = self.DIAGRAMS[name]
         state = expected_state if state is None else state
         abstraction = expected_abstraction if abstraction is None else abstraction
@@ -632,7 +634,7 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
             f"architecture/diagrams/{name}",
             f"---\ntitle: {title_state} — {name}\n---\n"
             f"%% state: {state}\n%% abstraction: {abstraction}\n%% question: {question}\n"
-            f"%% owner: architecture\n%% arc42: {arc42}\n%% adrs: {adrs}\n%% last_verified: 2026-09-01\n"
+            f"%% owner: {owner}\n%% arc42: {arc42}\n%% adrs: {adrs}\n%% last_verified: {last_verified}\n"
             "flowchart LR\n  A --> B\n",
         )
 
@@ -677,8 +679,13 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
 
     def test_diagrams_reject_required_metadata_and_title_state_failures(self):
         cases = {
+            "missing-state": {"state": ""},
             "missing-abstraction": {"abstraction": ""},
             "missing-question": {"question": ""},
+            "missing-owner": {"owner": ""},
+            "missing-arc42": {"arc42": ""},
+            "missing-adrs": {"adrs": ""},
+            "missing-last-verified": {"last_verified": ""},
             "missing-title-state": {"title_state": ""},
             "mismatched-title-state": {"state": "CURRENT", "title_state": "PROPOSED"},
         }
@@ -689,6 +696,28 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
                 self.write_diagram("context.mmd", **kwargs)
                 errors = validator.validate_diagrams(self.root)
                 self.assertTrue(errors, errors)
+
+    def test_diagrams_reject_invalid_state_arc42_target_adr_date_and_missing_source(self):
+        cases = {
+            "invalid-state": {"state": "FUTURE"},
+            "missing-arc42-target": {"arc42": "architecture/arc42/missing.md"},
+            "non-arc42-target": {"arc42": "architecture/not-arc42.md"},
+            "missing-adr": {"adrs": "ADR-9999"},
+            "invalid-date": {"last_verified": "2026-13-01"},
+        }
+        for case, kwargs in cases.items():
+            with self.subTest(case=case):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.write_complete_diagram_fixture()
+                if case == "non-arc42-target":
+                    self.write("architecture/not-arc42.md", "[Diagram](diagrams/context.mmd)\n")
+                self.write_diagram("context.mmd", **kwargs)
+                self.assertTrue(validator.validate_diagrams(self.root))
+        self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+        self.write_complete_diagram_fixture()
+        (self.root / "architecture/diagrams/context.mmd").unlink()
+        errors = validator.validate_diagrams(self.root)
+        self.assertTrue(any("context.mmd is required" in error for error in errors), errors)
 
     def test_diagrams_reject_non_executable_render_script_and_missing_reciprocal_link(self):
         script = self.write_complete_diagram_fixture()
@@ -732,8 +761,10 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
         )
         npm.chmod(0o755)
         caller_output = self.root / "caller-output"
-        environment = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}", "TOOL_LOG": str(log), "TMPDIR": str(self.root / "tmp"), "HOME": str(self.root / "home")}
-        (self.root / "tmp").mkdir(); (self.root / "home").mkdir()
+        test_home = self.root / "home"
+        test_home.mkdir()
+        temp_parent = Path(self.render_tmp.name)
+        environment = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}", "TOOL_LOG": str(log), "TMPDIR": str(temp_parent), "HOME": str(test_home)}
         for failure in (False, True):
             with self.subTest(failure=failure):
                 log.unlink(missing_ok=True)
@@ -744,8 +775,9 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
                 for record in records:
                     for key in ("cache", "puppeteer", "xdg_cache", "xdg_config", "xdg_data"):
                         value = Path(record[key])
-                        self.assertTrue(value.is_relative_to(self.root / "tmp"), (key, value))
-                        self.assertFalse(value.is_relative_to(self.root)) if not value.is_relative_to(self.root / "tmp") else None
+                        self.assertTrue(value.is_relative_to(temp_parent), (key, value))
+                        self.assertFalse(value.is_relative_to(self.root), (key, value, self.root))
+                        self.assertFalse(value.is_relative_to(test_home), (key, value, test_home))
                     self.assertFalse(Path(record["cache"]).parent.exists())
                 self.assertTrue(caller_output.is_dir())
 

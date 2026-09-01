@@ -424,8 +424,21 @@ def validate_diagrams(root: Path) -> list[str]:
         if state and state not in metadata.get("title", ""):
             errors.append(_diagram_error(path, root, "front matter title must contain the metadata state"))
         arc42_name = metadata.get("arc42", "")
-        arc42_path = root / arc42_name
-        if not arc42_name or not arc42_path.is_file():
+        arc42_rel = Path(arc42_name)
+        arc42_directory = (root / "architecture/arc42").resolve()
+        valid_arc42_path = (
+            bool(arc42_name)
+            and arc42_name == arc42_rel.as_posix()
+            and not arc42_rel.is_absolute()
+            and arc42_rel.suffix == ".md"
+            and len(arc42_rel.parts) >= 3
+            and arc42_rel.parts[:2] == ("architecture", "arc42")
+            and ".." not in arc42_rel.parts
+        )
+        arc42_path = (root / arc42_rel).resolve() if valid_arc42_path else root / "architecture/arc42/__invalid__"
+        if not valid_arc42_path:
+            errors.append(_diagram_error(path, root, "arc42 must be an exact repository-relative Markdown path under architecture/arc42/"))
+        elif not arc42_path.is_relative_to(arc42_directory) or not arc42_path.is_file():
             errors.append(_diagram_error(path, root, f"arc42 path does not exist: {arc42_name or 'missing'}"))
         else:
             destinations = extract_markdown_destinations(arc42_path.read_text())
