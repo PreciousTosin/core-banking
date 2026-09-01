@@ -5,6 +5,8 @@ SET ROLE funds_migrator;
 
 -- Product definitions are stable commercial families. Classification belongs
 -- to the immutable terms version to which a customer account is bound.
+DROP TRIGGER product_version_immutable ON funds.product_version;
+
 ALTER TABLE funds.product_version
     ADD COLUMN product_kind text,
     ADD COLUMN finance_principle text;
@@ -38,6 +40,11 @@ BEGIN
               CONSTRAINT = 'product_version_immutable';
 END
 $function$;
+
+CREATE TRIGGER product_version_immutable
+BEFORE UPDATE OR DELETE ON funds.product_version
+FOR EACH ROW
+EXECUTE FUNCTION funds.reject_product_version_mutation();
 
 CREATE FUNCTION funds.reject_product_definition_identity_mutation()
 RETURNS trigger
@@ -200,6 +207,7 @@ ALTER TABLE funds.ledger_account
     DROP COLUMN control_account_code;
 
 -- Every journal pins the one governed chart used to resolve all of its lines.
+DROP TRIGGER journal_immutable ON funds.journal;
 ALTER TABLE funds.journal ADD COLUMN chart_version_id uuid;
 
 DO $backfill_journal_chart$
@@ -231,6 +239,10 @@ BEGIN
 END
 $backfill_journal_chart$;
 
+-- The backfill schedules V003's deferred journal-balance trigger. Drain it
+-- while the row shape is still the V004 shape before the following ALTER.
+SET CONSTRAINTS ALL IMMEDIATE;
+
 ALTER TABLE funds.journal
     ALTER COLUMN chart_version_id SET NOT NULL,
     ADD CONSTRAINT journal_chart_book_fk
@@ -241,6 +253,11 @@ ALTER TABLE funds.journal
         OR (reversal_of_journal_id IS NOT NULL AND transaction_type = 'REVERSAL'
             AND reversal_of_journal_id <> journal_id)
     );
+
+CREATE TRIGGER journal_immutable
+BEFORE UPDATE OR DELETE ON funds.journal
+FOR EACH ROW
+EXECUTE FUNCTION funds.reject_ledger_mutation();
 
 DROP INDEX funds.one_reversal_per_original_idx;
 CREATE UNIQUE INDEX one_reversal_per_original_idx
