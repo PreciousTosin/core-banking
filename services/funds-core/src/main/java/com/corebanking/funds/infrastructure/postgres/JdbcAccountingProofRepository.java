@@ -13,6 +13,24 @@ import java.util.Objects;
 import java.util.UUID;
 import javax.sql.DataSource;
 
+/**
+ * Independent accounting proofs (ACC-19). Both proofs are computed from the immutable posting
+ * and journal rows, never from materialised_balance, so they can detect a corrupted or stale
+ * projection instead of agreeing with it; the control proof reads control_account_projection
+ * only to compare it against that source. Sums are taken in numeric and read back with
+ * toBigIntegerExact, so a total beyond bigint range is proven exactly rather than overflowed.
+ * Each proof is a single statement, so it observes one snapshot without an explicit
+ * transaction.
+ *
+ * <p>The columns touched here are exactly the ones V005 grants funds_proof_reader for the
+ * external proof job: journal(journal_id, journal_sequence, book_id, chart_version_id),
+ * posting(journal_id, account_id, currency, signed_minor_units),
+ * ledger_account_chart_mapping(account_id, book_id, chart_version_id, account_currency,
+ * control_account_code) and control_account_projection(book_id, control_account_code,
+ * currency, signed_posting_total, latest_journal_sequence). Referencing any other column
+ * would break that role (MigrationIT proves the session). In-process the repository runs
+ * through the funds_app datasource; funds_proof_reader is never an in-process login.
+ */
 @ApplicationScoped
 public class JdbcAccountingProofRepository {
     private static final int QUERY_TIMEOUT_SECONDS = 5;
@@ -24,6 +42,11 @@ public class JdbcAccountingProofRepository {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
     }
 
+    /**
+     * Debits (positive units) and credits (negated negative units) over every posting of the
+     * book and currency up to the journal-sequence cutoff; balanced means the two sums are equal.
+     * The sign split is the storage convention (README "Reading the accounting model").
+     */
     public TrialBalanceProof trialBalance(UUID bookId, CurrencyCode currency, long cutoff) {
         String sql = """
             SELECT
@@ -54,6 +77,15 @@ public class JdbcAccountingProofRepository {
         }
     }
 
+    /**
+     * Compares the independently summed source (postings resolved to the control code through
+     * each journal's own pinned chart mapping) with control_account_projection. The projection
+     * only ever holds the current total, so the proof is defined at the current cutoff: mapped
+     * activity after the cutoff is rejected instead of being compared against a total that
+     * already includes it, and the projection's latest_journal_sequence must equal the newest
+     * mapped source sequence. A missing projection is acceptable only when there is no mapped
+     * source at all.
+     */
     public ControlAccountProof controlAccount(
         UUID bookId,
         String controlCode,
@@ -136,6 +168,10 @@ public class JdbcAccountingProofRepository {
         }
     }
 
+    /**
+     * Each proof is one aggregate row; the row caps and query timeout keep a proof bounded on the
+     * shared funds_app pool.
+     */
     private static void bound(java.sql.PreparedStatement statement) throws SQLException {
         statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
         statement.setFetchSize(1);
@@ -148,6 +184,7 @@ public class JdbcAccountingProofRepository {
         }
     }
 
+    /** numeric sums of bigint columns must be integral; anything else is a query defect. */
     private static BigInteger exactInteger(ResultSet rows, String column) throws SQLException {
         BigDecimal value = rows.getBigDecimal(column);
         if (value == null) {

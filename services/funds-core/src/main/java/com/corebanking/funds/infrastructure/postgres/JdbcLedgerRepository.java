@@ -37,10 +37,38 @@ import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
 
+/**
+ * SQL of one posting transaction; PostingService owns the connection, isolation, deadlines and
+ * commit. {@link #post} runs, in order: insertIdempotencyCommand (claim the command row) ->
+ * lockIdempotencyCommand (scheme and request-hash check under FOR UPDATE) -> completed replay
+ * -> validateBookAndPeriod (chart row, then book row, then period, all FOR SHARE, through
+ * funds.lock_book_chart_for_posting and funds.lock_period_for_posting) ->
+ * lockAccountsAndBalances (accounts FOR UPDATE with their mappings FOR SHARE, then materialised
+ * balances FOR UPDATE, each pass in canonical UUID-string order) -> assignAccountSequences ->
+ * validate and hash (canonical scheme V2) -> insertJournal -> insertPostings ->
+ * updateMaterialisedBalances -> updateControlProjection (control keys in code-then-currency
+ * order) -> insertOutbox -> completeIdempotencyCommand.
+ *
+ * <p>One global lock order, shared with chart governance (chart before book, V006) and with
+ * every concurrent journal (UUID-string account order), is what keeps postings from
+ * deadlocking each other or rotate_chart_version; PostgresRetryPolicy still retries 40P01 as a
+ * backstop. All money and coordinate arithmetic is checked: addMoneyExact raises
+ * MonetaryOverflowException and addCapacityExact raises LedgerCapacityException naming the
+ * exhausted coordinate. PostgreSQL re-checks the same governance in its own triggers (V005
+ * journal_governance, posting_chart_mapping), so the Java checks exist to fail early with a
+ * domain exception, not as the only guard.
+ */
 @ApplicationScoped
 public class JdbcLedgerRepository implements LedgerRepository {
+    // Driver-side cancel for the replay reads (findCompleted and the V004 loaders), which run
+    // before any row lock is taken. Independent of the transaction-local statement_timeout that
+    // PostingService applies, so a caller using the repository directly is still bounded.
     private static final int LEGACY_QUERY_TIMEOUT_SECONDS = 5;
+    // The same total order CanonicalJournalHasher sorts postings by. Every journal locks its
+    // accounts in this order, so overlapping account sets can never be taken in opposite
+    // directions by two transactions.
     private static final Comparator<UUID> CANONICAL_ACCOUNT_ORDER = Comparator.comparing(UUID::toString);
+    // Control projections are locked in this order for the same reason (updateControlProjection).
     private static final Comparator<ControlKey> CONTROL_ORDER = Comparator
         .comparing(ControlKey::controlAccountCode)
         .thenComparing(key -> key.currency().value());
@@ -74,6 +102,11 @@ public class JdbcLedgerRepository implements LedgerRepository {
         this.observer = Objects.requireNonNull(observer, "observer");
     }
 
+    /**
+     * Executes the posting sequence described on the class. A command found COMPLETED under the
+     * row lock is replayed here as well, so the method stays correct without the findCompleted
+     * pre-flight. SQL failures are classified by SqlState; the caller rolls back on any throw.
+     */
     @Override
     public PostingResult post(Connection connection, PostingCommand command) {
         Objects.requireNonNull(connection, "connection");
@@ -81,6 +114,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
         try {
             insertIdempotencyCommand(connection, command);
             LockedCommand locked = lockIdempotencyCommand(connection, command.commandId());
+            // A non-TYPED_V2 row can never be claimed by this path: a V004_OPAQUE hash is not
+            // comparable with a typed hash, and V005 forbids creating new legacy rows.
             if (!"TYPED_V2".equals(locked.requestHashScheme())
                 || !locked.requestHash().equals(command.requestHash())) {
                 throw new IdempotencyConflictException(command.commandId());
@@ -99,6 +134,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
             observer.afterAccountLocks(command.commandId());
             JournalDraft assignedJournal = assignAccountSequences(command.journal(), accounts);
             validator.validate(assignedJournal);
+            // Scheme V2 pins chartVersionId; V004_V1 did not (see loadLegacyJournal).
             String canonicalHash = hasher.v2Sha256(assignedJournal);
 
             long journalSequence = insertJournal(connection, assignedJournal, canonicalHash);
@@ -116,6 +152,14 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Rebuilds a pre-V005 journal from its stored rows and proves it against its own V004_V1
+     * canonical hash before anything is derived from it. The stored fact is re-hashed rather than
+     * trusted because the V004 command hash is opaque: the only way to decide whether a replay
+     * carries the same content is to recompute the typed V2 command hash from facts that have
+     * themselves been authenticated. Row reads are capped at the POC limits plus one so an
+     * oversized or inconsistent legacy journal fails fast instead of being read without bound.
+     */
     private JournalDraft loadLegacyJournal(
         Connection connection,
         UUID commandId,
@@ -154,6 +198,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
         return persisted;
     }
 
+    /** Matches journal_id and command_id together (the V005 composite link), not either alone. */
     private static LegacyHeader loadLegacyHeader(
         Connection connection,
         UUID commandId,
@@ -239,6 +284,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Flattens every dimension so the per-posting count limit is checked row by row. The hasher
+     * re-sorts postings and keys, so the ORDER BY only makes the LIMIT deterministic.
+     */
     private static void loadLegacyDimensions(
         Connection connection,
         UUID journalId,
@@ -281,6 +330,15 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Pre-flight replay check, run by PostingService before validation and before any lock. The
+     * result_json cache is never returned on its own: coherentCompletedResult requires the
+     * command's journal_id, the joined journal row and the cached fields to agree, mirroring the
+     * identity V005 enforces at write time. TYPED_V2 rows compare request hashes directly, and an
+     * IN_PROGRESS one yields empty, leaving the decision to post() and its row lock. V004_OPAQUE
+     * rows cannot be compared by hash, so a completed one is re-verified from stored facts
+     * (loadLegacyJournal) and an incomplete one is a conflict outright.
+     */
     @Override
     public Optional<PostingResult> findCompleted(
         Connection connection,
@@ -348,6 +406,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /** Disagreement between pointer, journal row and cached result is corruption, not a replay. */
     private static PostingResult coherentCompletedResult(
         java.sql.ResultSet rows,
         UUID commandId
@@ -386,6 +445,11 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Claims the command row before any financial work. ON CONFLICT DO NOTHING plus the FOR
+     * UPDATE that follows turn the row into the per-command mutex, and V003.2 refuses postings
+     * whose command row is missing or already COMPLETED.
+     */
     private static void insertIdempotencyCommand(Connection connection, PostingCommand command)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
@@ -400,6 +464,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * A row lock, not just a read: concurrent same-key requests queue here and the loser observes
+     * the winner's final state.
+     */
     private static LockedCommand lockIdempotencyCommand(Connection connection, UUID commandId)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
@@ -421,6 +489,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Replay from inside post(), after the row lock. The full coherence checks live in
+     * findCompleted, which is the normal replay path.
+     */
     private static PostingResult loadCompletedResult(Connection connection, UUID commandId)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
@@ -441,6 +513,13 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Locks chart then book (FOR SHARE) through funds.lock_book_chart_for_posting, the order
+     * rotate_chart_version and the mapping triggers use (V006), then the period. Share locks let
+     * concurrent postings proceed while stopping a rotation or period close from slipping in
+     * between validation and commit. The booking date is derived in the book's timezone because
+     * periods are book-local calendar ranges.
+     */
     private static void validateBookAndPeriod(Connection connection, JournalDraft journal)
         throws SQLException {
         LocalDate localBookingDate;
@@ -518,6 +597,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Distinct accounts in the canonical lock order. The null check lives here because locking
+     * precedes JournalValidator in post().
+     */
     private static List<UUID> canonicalAccountIds(JournalDraft journal) {
         var ids = new ArrayList<UUID>();
         for (var posting : journal.postings()) {
@@ -532,6 +615,12 @@ public class JdbcLedgerRepository implements LedgerRepository {
         return List.copyOf(ids);
     }
 
+    /**
+     * Two passes in the same canonical order: first every ledger_account row (FOR UPDATE) with its
+     * chart mapping (FOR SHARE), then every materialised_balance row (FOR UPDATE), created on
+     * first use. Reading the balance under its own lock is what makes the later UPDATE an exact
+     * read-modify-write rather than a lost update.
+     */
     private static Map<UUID, AccountState> lockAccountsAndBalances(
         Connection connection,
         JournalDraft journal,
@@ -558,6 +647,11 @@ public class JdbcLedgerRepository implements LedgerRepository {
         return Map.copyOf(states);
     }
 
+    /**
+     * Resolves the account through the journal's pinned chart version, so a mapping that exists
+     * only on another chart reads as "does not exist". Currency and permitted direction are
+     * checked per line against the locked mapping; V005 posting_chart_mapping repeats both.
+     */
     private static AccountMetadata lockAccount(
         Connection connection,
         JournalDraft journal,
@@ -600,6 +694,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Lazy creation keeps account onboarding free of balance rows; DO NOTHING is safe because the
+     * row is locked and re-read immediately afterwards.
+     */
     private static void ensureMaterialisedBalance(Connection connection, UUID accountId)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
@@ -634,6 +732,12 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Continues each account's monotonic sequence from the locked latest_account_sequence, in
+     * journal line order. Exhaustion is a LedgerCapacityException for the "account sequence"
+     * coordinate, never a wrap. The sequence is a storage coordinate and is not part of the
+     * canonical hash.
+     */
     private static JournalDraft assignAccountSequences(
         JournalDraft journal,
         Map<UUID, AccountState> accounts
@@ -675,6 +779,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
             postings);
     }
 
+    /**
+     * journal_sequence comes from the bigserial and is the global ordering the proofs' cutoff and
+     * the outbox aggregate_version use. New rows are always scheme V2; V005 rejects anything else.
+     */
     private static long insertJournal(Connection connection, JournalDraft journal, String canonicalHash)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
@@ -712,6 +820,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Dimensions are persisted as compact JSON (PostingDimensions); the V005 CHECK bounds the
+     * stored text at 8192 bytes and 32 keys, mirroring JournalValidator's limits.
+     */
     private static void insertPostings(Connection connection, JournalDraft journal) throws SQLException {
         try (var statement = connection.prepareStatement("""
             INSERT INTO funds.posting
@@ -733,6 +845,12 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Read-modify-write against the totals read under lock in lockAccountsAndBalances. The delta,
+     * the new total and the version (advanced by the account's posting count) are computed with
+     * exact arithmetic in Java; a bigint overflow reported by PostgreSQL (22003) maps to the same
+     * MonetaryOverflowException so both layers fail identically.
+     */
     private static void updateMaterialisedBalances(
         Connection connection,
         JournalDraft journal,
@@ -774,6 +892,12 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Book-level control totals per (control code, currency), locked in CONTROL_ORDER so concurrent
+     * journals in one book take these rows in one direction. latest_journal_sequence records this
+     * journal's sequence, which the control-account proof compares against the newest mapped
+     * source sequence at its cutoff.
+     */
     private static void updateControlProjection(
         Connection connection,
         JournalDraft journal,
@@ -863,6 +987,12 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Transactional outbox row in the same commit as the journal. The event ID is a name-based
+     * UUID of the journal ID and aggregate_version is the journal sequence, so both the primary
+     * key and the (aggregate, version, type) unique constraint refuse a second event for one
+     * journal. The payload is the same triple the completed command stores.
+     */
     private static void insertOutbox(
         Connection connection,
         UUID journalId,
@@ -887,6 +1017,11 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /**
+     * Final step. The state predicate turns a double completion into a failed update rather than
+     * a silent overwrite, V004 makes the completed row immutable, and V005 checks result_json
+     * against the journal it points at before the row is accepted.
+     */
     private static void completeIdempotencyCommand(
         Connection connection,
         UUID commandId,
@@ -910,6 +1045,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    // Both helpers wrap Math.addExact, but an overflowing amount and an exhausted coordinate are
+    // distinct failures with distinct exceptions (README "Reading the accounting model").
     private static long addMoneyExact(long left, long right) {
         try {
             return Math.addExact(left, right);
@@ -932,6 +1069,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         return new MonetaryOverflowException(overflow);
     }
 
+    /**
+     * RFC 8259 string escaping so the hand-built payloads stay valid for the ::jsonb cast without
+     * a JSON library. The values are UUIDs and hex digests, so this is a guard, not a serializer.
+     */
     private static String jsonString(String value) {
         var json = new StringBuilder(value.length() + 2).append('"');
         for (int index = 0; index < value.length(); index++) {
@@ -958,8 +1099,10 @@ public class JdbcLedgerRepository implements LedgerRepository {
         return json.append('"').toString();
     }
 
+    /** Idempotency row as read under FOR UPDATE. */
     private record LockedCommand(String requestHash, String requestHashScheme, boolean completed) {}
 
+    /** funds.journal columns needed to rebuild a V004 journal for re-hashing. */
     private record LegacyHeader(
         UUID journalId,
         UUID commandId,
@@ -976,6 +1119,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
         UUID reversalOfJournalId,
         int policyVersion) {}
 
+    /** Accumulator for a legacy posting: facts from one query, dimensions attached by a second. */
     private record LegacyPostingBuilder(
         UUID postingId,
         UUID accountId,
@@ -990,14 +1134,17 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
+    /** Chart-mapping facts read together with the account lock. */
     private record AccountMetadata(String controlAccountCode, CurrencyCode currency) {}
 
+    /** materialised_balance row as read under FOR UPDATE. */
     private record MaterialisedBalance(
         long signedPostingTotal,
         long latestAccountSequence,
         long version
     ) {}
 
+    /** Account metadata plus its locked balance, the basis of every later read-modify-write. */
     private record AccountState(
         UUID accountId,
         String controlAccountCode,
@@ -1007,5 +1154,6 @@ public class JdbcLedgerRepository implements LedgerRepository {
         long version
     ) {}
 
+    /** Identity of a control_account_projection row within one book. */
     private record ControlKey(String controlAccountCode, CurrencyCode currency) {}
 }

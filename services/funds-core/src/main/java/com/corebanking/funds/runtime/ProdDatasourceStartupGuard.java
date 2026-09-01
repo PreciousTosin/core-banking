@@ -6,6 +6,13 @@ import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.eclipse.microprofile.config.ConfigProvider;
 
+/**
+ * Fail-closed datasource check for the packaged (prod) profile. The datasource must be
+ * explicitly active and its URL, username and password non-blank, otherwise startup aborts
+ * before readiness can be UP. The diagnostic names only the offending Quarkus property, never
+ * its value, so a missing or malformed secret cannot leak through logs (README "Database
+ * roles and startup"). Startup plus PostConstruct make the check eager rather than lazy.
+ */
 @Startup
 @ApplicationScoped
 @IfBuildProfile("prod")
@@ -25,7 +32,10 @@ public class ProdDatasourceStartupGuard {
             config.getOptionalValue(PASSWORD, String.class).orElse(null));
     }
 
+    /** Package-private and static so the rule is unit-tested without booting Quarkus. */
     static void validate(String active, String jdbcUrl, String username, String password) {
+        // The literal value is required: an inherited or defaulted "inactive" datasource must
+        // fail here, which scripts/prod-runtime-smoke.sh probes explicitly.
         if (!"true".equalsIgnoreCase(active)) {
             throw missingOrBlank(ACTIVE);
         }
