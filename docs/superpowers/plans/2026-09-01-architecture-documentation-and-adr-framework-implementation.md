@@ -24,13 +24,13 @@
 - Documentation/diagram tooling is development-only and adds no Java or Go runtime dependency.
 - Python validation uses the standard library only; do not add PyYAML or another runtime parser.
 - Pin `@mermaid-js/mermaid-cli` exactly to `11.16.0` and commit the npm lockfile.
-- Local work without a pull request uses a full Git commit hash as implementation evidence; branch names are not evidence.
+- Local work without a pull request uses a path-bound full Git commit hash as implementation evidence; branch names are not evidence. Every local evidence list item has exactly one of these forms: `- HASH changed: repository/path; repository/path` or `- HASH snapshot: repository/path; repository/path`, where `HASH` is 40 lowercase hexadecimal characters and every path is repository-relative. `changed` means each named path exists in that commit and occurs in that commit's changed-path set; for a root commit that set is the diff against the empty tree, and for a merge commit it is the union of the diffs against every parent. `snapshot` means each named path exists in that commit and records observed state only, not that the commit introduced or changed it. Stable pull-request evidence uses `- https://github.com/OWNER/REPOSITORY/pull/NUMBER` and must match the normalized owner/repository from the current repository's `remote.origin.url` (accepting SSH or HTTPS origin syntax).
 - Do not claim that infrastructure manifests are deployed or verified merely because their files exist.
 - Every task ends with its focused validation and a commit before the next task starts.
 - Before Task 1 changes any file, create the durable local baseline ref `refs/codex/architecture-docs-framework-base`; fail rather than overwrite it if it already exists. Before every cross-task range review, resolve that ref to a 40-lowercase-hex commit, verify the commit exists, and use `<resolved-base>..HEAD`, never `HEAD~N`. Delete only this exact ref after Final Verification succeeds.
 - Markdown links resolve relative to the containing Markdown file after stripping query strings while preserving and validating fragments; the validator supports inline and CommonMark reference-style links, angle-bracket destinations, and backslash-escaped spaces.
 - Link validation scans only these governed Markdown paths from the repository-root filesystem: `ARCHITECTURE.md`; `architecture/**/*.md`; `docs/superpowers/plans/*.md`; `docs/superpowers/specs/*.md`; `services/*/README.md`; `services/*/docs/**/*.md`; and `.github/pull_request_template.md` when present. It includes newly created and untracked files in those paths while pruning `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, every `node_modules/`, Maven/Gradle `target/` and `build/` output, and `architecture/diagrams/generated/`. Unrelated root-level, user, cache, and `.claude/` Markdown is outside the gate and may be reported informationally. Markdown fenced-code blocks and inline-code spans are examples, not link-bearing prose, and are excluded before destinations are parsed.
-- Unrelated untracked or modified user state, including `.claude/worktrees/`, is reported for awareness but never modified, staged, deleted, ignored, or treated as a framework failure. Task cleanliness assertions use `git diff --quiet`, `git diff --cached --quiet`, and `git status --short --` followed by the explicit paths owned by the current task.
+- Unrelated untracked, modified, or staged user state, including `.claude/worktrees/`, is reported for awareness but never modified, staged, deleted, ignored, stashed, committed, or treated as a framework failure. Every task declares an exact task-specific path array, such as `task1_paths`, containing each file in that task's `Files` section; stages only that array with `git add --`; compares the sorted task-owned staged names with the sorted array using `git diff --cached --name-only --no-renames`; and commits only that array with Git's `--only` path mode. Disabling rename display makes the comparison account for both sides of a move. A move task lists both the old and new paths so the deletion and addition are committed. The scoped comparison ignores unrelated pre-existing staged paths, which remain untouched and excluded from every task commit.
 
 ## File Structure
 
@@ -289,8 +289,18 @@ Expected: all generic primitive tests pass without third-party packages. No arc4
 - [ ] **Step 6: Commit the validator**
 
 ```bash
-git add architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "test: add architecture documentation validator"
+task1_paths=(
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task1_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task1_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task1_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "test: add architecture documentation validator" -- "${task1_paths[@]}"
 ```
 
 ### Task 2: Establish navigation and documentation governance
@@ -314,15 +324,18 @@ git commit -m "test: add architecture documentation validator"
 
 Add `test_required_governance_files` to the validator tests. It creates a temporary empty root, calls the new `validate_structure`, and asserts the error list names all seven files above. Add `test_root_architecture_must_be_fewer_than_180_lines`, with a valid 179-line fixture and an invalid 180-line fixture, and assert the latter reports `ARCHITECTURE.md must contain fewer than 180 lines`.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [ ] **Step 2: Run both new tests and verify failure**
 
 Run:
 
 ```bash
-python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_required_governance_files -v
+python3 -m unittest \
+  architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_required_governance_files \
+  architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_root_architecture_must_be_fewer_than_180_lines \
+  -v
 ```
 
-Expected: fail with `AttributeError: module 'validate_architecture' has no attribute 'validate_structure'` before production code changes.
+Expected: both tests run and fail before production code changes because `validate_structure` and its root-size behavior do not exist.
 
 - [ ] **Step 3: Implement the governance-structure rule**
 
@@ -350,8 +363,8 @@ State explicitly that the only implemented application slice is the Java 25/Quar
 Copy the approved rules into focused documents:
 
 - `architecture/README.md`: authority order, ownership, update triggers, pull-request traceability, review cadence, and archive rule.
-- `architecture/adr/README.md`: statuses, implementation statuses, ADR threshold, immutable accepted rationale, supersession, full-hash evidence, and retrospective ADR label.
-- `architecture/adr/template.md`: include `Retrospective: No` and `Related proposals: None` in addition to every field and heading specified by the design.
+- `architecture/adr/README.md`: statuses, implementation statuses, ADR threshold, immutable accepted rationale, supersession, retrospective ADR label, and the exact path-bound evidence forms `- HASH changed: repository/path; repository/path` and `- HASH snapshot: repository/path; repository/path`. Explain that `snapshot` proves observed tree state rather than introduction, and that stable GitHub pull-request URLs must match the normalized current `origin` owner/repository.
+- `architecture/adr/template.md`: include `Retrospective: No` and `Related proposals: None` in addition to every field and heading specified by the design. Its implementation-evidence instructions use only the exact local `changed`/`snapshot` forms or a stable same-repository GitHub pull-request URL.
 - `architecture/proposals/README.md`: statuses and the rule that `approved` does not mean `current`.
 - `architecture/archive/proposals/README.md`: only completed proposals move here, `status: implemented` is required for an implemented proposal, and the archived proposal retains links to its current arc42 replacement, implementation evidence, ADRs, and plan history.
 - `architecture/diagrams/README.md`: exact seven-line metadata contract, title/state rule, abstraction-level guidance, intended-question guidance, and render command.
@@ -387,8 +400,25 @@ Expected: unit tests pass; link validation passes because not-yet-created arc42 
 - [ ] **Step 7: Commit governance**
 
 ```bash
-git add ARCHITECTURE.md architecture/README.md architecture/adr/README.md architecture/adr/template.md architecture/proposals/README.md architecture/archive/proposals/README.md architecture/diagrams/README.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "docs: establish architecture governance"
+task2_paths=(
+  ARCHITECTURE.md
+  architecture/README.md
+  architecture/adr/README.md
+  architecture/adr/template.md
+  architecture/archive/proposals/README.md
+  architecture/diagrams/README.md
+  architecture/proposals/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task2_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task2_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task2_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: establish architecture governance" -- "${task2_paths[@]}"
 ```
 
 ### Task 3: Create the verified current-state arc42 baseline
@@ -475,8 +505,31 @@ Expected: metadata, links, and unit tests pass. Full structure validation begins
 - [ ] **Step 8: Commit current-state baseline**
 
 ```bash
-git add ARCHITECTURE.md architecture/arc42 architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "docs: add current-state arc42 baseline"
+task3_paths=(
+  ARCHITECTURE.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task3_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task3_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task3_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: add current-state arc42 baseline" -- "${task3_paths[@]}"
 ```
 
 ### Task 4: Classify every section of the comprehensive design
@@ -507,6 +560,7 @@ Add `migration` to the planned `CHECKS`/`VALIDATORS` contract, but write tests b
 - Missing top-level root `17`, a duplicate full source key, a malformed source key, an unsupported disposition, and an unsupported resolution each produce focused errors.
 - A non-`historical-only` row whose destination does not exist fails; a `current` row whose evidence path does not exist fails.
 - Every non-`historical-only` covered block must map exactly once to a stable `repository/path.md#explicit-anchor` destination. An empty destination, missing anchor, duplicate or omitted block mapping, destination mapped from the wrong source key, or destination section lacking the exact `<!-- migration-source: <source-key> -->` marker fails. A fixture with two destinations proves each block maps to its exact destination rather than merely proving both files exist.
+- Globally inventory every active full-line `<!-- migration-source: SOURCE_KEY -->` occurrence in all Markdown returned by `iter_governed_markdown`, after masking fenced and inline code with the same line-preserving Markdown code masker used by link validation. Code examples of marker syntax are not active markers. Require the occurrence multiset, represented as exact `(repository/path.md, explicit-anchor, SOURCE_KEY)` triples, to equal the deduplicated active non-historical `Destination map` triples exactly. Add independent negative fixtures for an orphan/extra marker, a duplicate marker at the correct anchor, a marker under the wrong anchor in the correct file, and a provisional governance marker left behind after its inventory row is remapped to a final destination. No governed migration marker may exist without one active destination tuple, and no active tuple may lack its one marker occurrence.
 - Every row, including an unsplit one-row heading, fails when `Covered blocks` or `Rationale` is empty. A `historical-only` row fails unless its rationale explicitly explains why no maintained destination is appropriate.
 - For a heading with blocks `B01` and `B02`, a fixture missing `B02` fails with a coverage-gap diagnostic, and a fixture assigning `B01` to two rows fails with a coverage-overlap diagnostic. A mixed-content heading represented by multiple rows also fails if its source keys do not use contiguous distinct `::01`, `::02` segment suffixes.
 
@@ -573,7 +627,9 @@ Inventory every material `##`, `###`, and `####` heading within numbered section
 
 For machine-checkable material coverage, tokenize each heading's direct body, from the heading line to the next Markdown heading of any level, into ordered heading-relative blocks `B01`, `B02`, and later ordinals. A paragraph is one maximal run of non-blank prose lines; a list is one maximal contiguous list including indented continuations; a table is one maximal contiguous Markdown table; and a fenced block is one complete backtick- or tilde-fenced block. Blank lines separate blocks. The archive banner is outside every numbered heading body, so these ordinals survive both `git mv` and banner insertion. `Covered blocks` is a semicolon-separated list of exact ordinals. Across all rows for one heading, require every derived block ordinal exactly once: a gap, duplicate within one row, or overlap across rows is a blocking error. Require at least one covered block and a non-empty `Rationale` on every row, including unsplit headings. The rationale states why that material has the selected disposition; for `historical-only`, it must explicitly state why retention only in the archive is appropriate and why no maintained destination exists.
 
-Allowed `Disposition` values are exactly `current`, `proposal`, `decision`, `service-detail`, `plan-detail`, and `historical-only`. Allowed `Resolution` values are exactly `unresolved` and `resolved`. `Destination map` contains semicolon-separated `BLOCK=repository/path.md#explicit-anchor` entries and maps every `Covered blocks` ordinal exactly once; this exact block mapping removes ambiguity when a row has multiple destinations. Every non-historical destination file and fragment must exist, and the destination section selected by that fragment must contain the exact explicit backlink `<!-- migration-source: SOURCE_KEY -->`. A marker for a different key is an error. Use `None` only for a `historical-only` destination. Semicolon-separated `Evidence` entries must exist for every `current` row and may be `None` for other dispositions. No row may resolve merely by pointing to the comprehensive source document.
+Allowed `Disposition` values are exactly `current`, `proposal`, `decision`, `service-detail`, `plan-detail`, and `historical-only`. Allowed `Resolution` values are exactly `unresolved` and `resolved`. `Destination map` contains semicolon-separated `BLOCK=repository/path.md#explicit-anchor` entries and maps every `Covered blocks` ordinal exactly once; this exact block mapping removes ambiguity when a row has multiple destinations. Every non-historical destination file and fragment must exist, and the destination section selected by that fragment must contain the exact explicit backlink `<!-- migration-source: SOURCE_KEY -->`. Use `None` only for a `historical-only` destination. Semicolon-separated `Evidence` entries must exist for every `current` row and may be `None` for other dispositions. No row may resolve merely by pointing to the comprehensive source document.
+
+Treat the inventory as the sole source of truth for migration markers. Deduplicate its non-historical block mappings into expected `(path, anchor, source-key)` triples. After masking fenced and inline code, globally scan every governed Markdown file for active full-line marker comments, associate each marker with the explicit HTML anchor whose contiguous marker block immediately follows it, and require multiset equality with the expected triples. Therefore a missing, orphan, extra, duplicate, wrong-file, wrong-anchor, wrong-key, or superseded provisional marker is blocking even when all active destinations themselves validate.
 
 At initial inventory commit, use existing arc42, plan, service-document, source, test, and migration paths. Rows requiring not-yet-created ADRs or proposals remain `unresolved` and point to the already-existing `architecture/adr/README.md` or `architecture/proposals/README.md` governance destination until Tasks 5 and 7 replace that destination with the exact created artifact. This preserves path validity without falsely claiming extraction is complete.
 
@@ -596,8 +652,39 @@ Expected: fail only with one or more `unresolved migration row` diagnostics for 
 - [ ] **Step 6: Commit the classification inventory**
 
 ```bash
-git add architecture/archive/comprehensive-design-migration-inventory.md architecture/README.md architecture/arc42 architecture/adr/README.md architecture/proposals/README.md services/funds-core/README.md docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "docs: inventory comprehensive architecture migration"
+task4_paths=(
+  architecture/README.md
+  architecture/adr/README.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/proposals/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md
+  docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md
+  services/funds-core/README.md
+)
+git add -- "${task4_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task4_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task4_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: inventory comprehensive architecture migration" -- "${task4_paths[@]}"
 ```
 
 ### Task 5: Record foundational architecture decisions
@@ -611,6 +698,7 @@ git commit -m "docs: inventory comprehensive architecture migration"
 - Create: `architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md`
 - Create: `architecture/adr/0007-separate-ledger-identity-from-account-addresses.md`
 - Create: `architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md`
+- Modify: `architecture/adr/README.md`
 - Modify: all twelve files under `architecture/arc42/` (ADR index and `related_adrs` metadata)
 - Modify: `architecture/archive/comprehensive-design-migration-inventory.md`
 - Modify: `architecture/scripts/validate_architecture.py`
@@ -625,13 +713,14 @@ git commit -m "docs: inventory comprehensive architecture migration"
 
 - [ ] **Step 1: Add failing ADR contract and reciprocal-traceability tests**
 
-Write tests against a new `validate_adrs` behavior before implementing it. Test contiguous numbering, filename/title agreement, required headings, valid statuses, relationship fields containing either a non-empty value or the literal `None`, retrospective marking, separation of decision from implementation status, evidence syntax, and substantive content. The substantive headings are exactly `## Context`, `## Decision drivers`, `## Considered options`, `## Decision`, `## Consequences`, `### Positive`, `### Negative`, `### Risks`, `## Compliance and verification`, and `## Implementation evidence`; each must contain non-whitespace prose, a list item, or a link before the next heading of the same or higher level. Add one negative test per empty substantive heading. Test that the body of `## Implementation evidence` may be exactly `None` only with `Not started` or `Not applicable`, while `Partial` and `Complete` require at least one existing repository path plus a full 40-lowercase-hex commit hash or stable `https://github.com/<owner>/<repo>/pull/<number>` URL in the evidence section or matching relationship fields.
+Write tests against a new `validate_adrs` behavior before implementing it. Test contiguous numbering, filename/title agreement, required headings, valid statuses, relationship fields containing either a non-empty value or the literal `None`, retrospective marking, separation of decision from implementation status, evidence syntax, and substantive content. The substantive headings are exactly `## Context`, `## Decision drivers`, `## Considered options`, `## Decision`, `## Consequences`, `### Positive`, `### Negative`, `### Risks`, `## Compliance and verification`, and `## Implementation evidence`; each must contain non-whitespace prose, a list item, or a link before the next heading of the same or higher level. Add one negative test per empty substantive heading. Test that the body of `## Implementation evidence` may be exactly `None` only with `Not started` or `Not applicable`. `Partial` and `Complete` require at least one exact list entry in one of these forms: `- HASH changed: repository/path; repository/path`, `- HASH snapshot: repository/path; repository/path`, or `- https://github.com/OWNER/REPOSITORY/pull/NUMBER`. Require at least one path-bound local entry when local hashes are used; a bare hash and an independently listed path never satisfy the contract.
 
 Also add negative reciprocal fixtures proving all of these fail independently: a foundational ADR `0001` through `0008` with `Related architecture sections: None`; an ADR architecture-section link whose repository-relative path does not exist; an ADR linking an existing arc42 file whose `related_adrs` omits that ADR ID; an arc42 `related_adrs` ID with no matching ADR; and an arc42 ADR ID whose ADR does not link back to that exact section. Add a positive fixture with two ADR/arc42 pairs so the check cannot pass by comparing only aggregate sets.
 
 Add repository-backed lifecycle/evidence fixtures in temporary Git repositories:
 
-- a local 40-lowercase-hex evidence hash resolves with the equivalent of `git cat-file -e "$hash^{commit}"`; a syntactically valid nonexistent hash fails, while a stable GitHub pull-request URL remains valid evidence;
+- a local 40-lowercase-hex evidence hash resolves with the equivalent of `git cat-file -e "$hash^{commit}"`; every paired path passes `git cat-file -e "$hash:$path"`; `changed` requires every paired path in the union of the commit's per-parent changed-path sets, using the empty tree for a root commit; `snapshot` requires tree existence but does not claim introduction. Add independent negative fixtures for a syntactically valid nonexistent hash, a path missing from the commit tree, and an unrelated hash/path pair where the path exists in the tree but is absent from that commit's changed-path set. Add a positive snapshot fixture for an unchanged path.
+- stable GitHub pull-request evidence is valid only when its owner/repository equals the normalized current repository `remote.origin.url`; cover SSH and HTTPS origin normalization, reject a syntactically valid URL for a different repository, and reject PR evidence when origin cannot be normalized.
 - `Supersedes` and `Superseded by` reject a missing ADR target, self-reference, non-reciprocal edge, incompatible statuses, and a cycle; accept a reciprocal `Accepted` successor that supersedes a `Superseded` predecessor;
 - an ADR Accepted at the base rejects mutations to `Context`, `Decision drivers`, `Considered options`, `Decision`, or the complete `Consequences` subtree including `Positive`, `Negative`, and `Risks`;
 - an Accepted-at-base ADR accepts only `Accepted -> Superseded` or `Accepted -> Deprecated`, rejects every reverse or lateral decision-status change, and enforces implementation status monotonically as `Not started -> Partial -> Complete`; `Not applicable` may remain unchanged but cannot transition to or from another implementation status;
@@ -668,7 +757,7 @@ Expected: fail because `validate_adrs` and the `adrs` registry entry do not exis
 
 - [ ] **Step 3: Implement the ADR contract, lifecycle graph, evidence existence, and accepted-record immutability**
 
-Add `adrs` to `CHECKS` and `VALIDATORS`. Implement the exact numbering, filename/title, field, lifecycle-value, substantive-section, relationship-`None`, retrospective, implementation-evidence, 40-hex, stable-PR-URL, evidence-path, and reciprocal architecture-link rules from Step 1. For each local full hash used as evidence, run Git through `subprocess` with argument vectors and require repository-aware commit existence equivalent to `git -C <root> cat-file -e <hash>^{commit}`; syntax alone is insufficient. Parse every Markdown destination in `Related architecture sections`, require it to resolve to an existing `architecture/arc42/*.md` file, and require that file's `related_adrs` metadata to contain the ADR's exact ID. Conversely, resolve every arc42 `related_adrs` ID to an ADR and require that ADR to link the exact arc42 path. For foundational ADRs `ADR-0001` through `ADR-0008`, reject `Related architecture sections: None`; `None` remains valid in the reusable template and in future non-foundational records when genuinely unaffected.
+Add `adrs` to `CHECKS` and `VALIDATORS`. Implement the exact numbering, filename/title, field, lifecycle-value, substantive-section, relationship-`None`, retrospective, implementation-evidence, reciprocal architecture-link, and evidence-binding rules from Step 1. Parse only the three exact evidence list-item forms. For every local entry, run Git through `subprocess` argument vectors, verify the commit with `git -C <root> cat-file -e <hash>^{commit}`, and verify every paired path with `git -C <root> cat-file -e <hash>:<path>`. For `changed`, derive the commit's changed-path set by diffing a root commit against Git's empty tree or diffing a non-root commit separately against every parent and taking the union; require every named path in that set. For `snapshot`, require only commit/tree existence and report it as observed-state evidence, never introduction evidence. Normalize `remote.origin.url` from either `git@github.com:OWNER/REPOSITORY.git` or `https://github.com/OWNER/REPOSITORY.git`, strip the optional `.git`, compare owner/repository case-insensitively, and reject a stable PR URL when origin is absent, non-GitHub, or names a different repository. Parse every Markdown destination in `Related architecture sections`, require it to resolve to an existing `architecture/arc42/*.md` file, and require that file's `related_adrs` metadata to contain the ADR's exact ID. Conversely, resolve every arc42 `related_adrs` ID to an ADR and require that ADR to link the exact arc42 path. For foundational ADRs `ADR-0001` through `ADR-0008`, reject `Related architecture sections: None`; `None` remains valid in the reusable template and in future non-foundational records when genuinely unaffected.
 
 Resolve every `Supersedes` and `Superseded by` ADR ID. Reject missing targets, self-reference, non-reciprocal declarations, and cycles in the directed predecessor-to-successor graph. Every predecessor with `Superseded by: ADR-NNNN` must be `Superseded`, every named successor must be `Accepted`, and the successor's `Supersedes` field must name the predecessor; `Deprecated` records do not claim a superseding ADR. Reject multiple successors for one predecessor.
 
@@ -684,7 +773,7 @@ Use `Status: Accepted`. Every ADR links at least one exact affected arc42 file u
 - ADR-0003: `Money`, `PostingLine`, `JournalValidator`, overflow tests, and the debit/credit example in the funds-core README.
 - ADR-0004: JDBC repositories, serializable transaction setup, Flyway migrations, PostgreSQL integration tests, and the separate proof-reader role.
 
-Each ADR must explain at least two rejected alternatives and negative consequences. For retrospective Complete ADRs, identify immutable evidence at execution time with `git log --format='%H %s' -- <evidence-paths>` and verify each selected value using `printf '%s' "$hash" | grep -Eq '^[0-9a-f]{40}$'` plus `git cat-file -e "$hash^{commit}"`. Verify these current-history candidates: `58fde48ba5ef053304b85ffe31cb17c1de021c5e` and `a8d7653f4296d13baa4e2fe56d7abae46161ff32` for ADR-0002, `38f822136da516ebf343c82c469a6cbccf148413` and `17a8a1d3d33b5d607b76bfa99d0a3c90f47c872c` for ADR-0003, and `c309afc5afcd0854d4ec690e80dcb9ba9ff28186` plus `58fde48ba5ef053304b85ffe31cb17c1de021c5e` for ADR-0004. Cite at least one verified full hash and one existing code/test/migration path in every Complete record.
+Each ADR must explain at least two rejected alternatives and negative consequences. For retrospective Complete ADRs, identify immutable evidence at execution time with `git log --format='%H %s' -- <evidence-paths>`, then verify each selected hash, each `HASH:PATH` tree entry, and each `changed` claim with the validator before recording it. Verify these current-history candidates: `58fde48ba5ef053304b85ffe31cb17c1de021c5e` and `a8d7653f4296d13baa4e2fe56d7abae46161ff32` for ADR-0002, `38f822136da516ebf343c82c469a6cbccf148413` and `17a8a1d3d33b5d607b76bfa99d0a3c90f47c872c` for ADR-0003, and `c309afc5afcd0854d4ec690e80dcb9ba9ff28186` plus `58fde48ba5ef053304b85ffe31cb17c1de021c5e` for ADR-0004. Record each candidate only as `changed` for paths it actually changes; use `snapshot` for paths that exist at the selected commit but were not changed there. Every Complete record contains at least one verified path-bound local evidence entry.
 
 - [ ] **Step 5: Write ADR-0005 through ADR-0008**
 
@@ -693,11 +782,11 @@ Each ADR must explain at least two rejected alternatives and negative consequenc
 - ADR-0007 is retrospective/partial: identifier foundations exist, but issuance/resolution/NIP APIs do not.
 - ADR-0008 is retrospective/partial: the 8 GiB target and resource envelopes are documented and some manifests exist, but the complete profile-based evidence suite is not deployed or measured.
 
-For ADR-0005 verify and cite `feb5bbd951c5061ef05050c35604aa863cbdea02`; for ADR-0006 verify and cite both `df6b2fb6a67f1406ccf2e8b0fa813626900c7d25` and `227bd288b593015f9009b0c408b1daf29855e997`. These hashes are immutable evidence, not replacements for the exact repository evidence paths. ADR-0007 and ADR-0008 are `Partial`, so each must also contain at least one verified full hash or stable PR URL and an existing evidence path; neither may use `None` for implementation evidence.
+For ADR-0005 verify and cite `feb5bbd951c5061ef05050c35604aa863cbdea02`; for ADR-0006 verify and cite both `df6b2fb6a67f1406ccf2e8b0fa813626900c7d25` and `227bd288b593015f9009b0c408b1daf29855e997`. These hashes are immutable evidence only when paired with exact paths and the verified `changed` or `snapshot` mode. For ADR-0007, inspect the identifier-foundation paths at candidate commits and record a verified `changed` entry for paths actually changed there plus `snapshot` entries for any other cited foundation paths. For ADR-0008, do the same for the 8 GiB constraint, resource-envelope, Dockerfile, smoke-script, and manifest paths; manifests observed in a `snapshot` entry remain design/state evidence and do not become deployment evidence. Both Partial ADRs require at least one verified path-bound local entry and may not use `None`.
 
 - [ ] **Step 6: Update decision indexes and classification**
 
-Link each ADR from `09-decisions.md`; update `related_adrs` in every arc42 file to the exact IDs that govern its documented claims, using `[]` when none governs the section; and replace each decision inventory row's temporary governance destination with an exact explicit anchor in the created ADR before marking that row `resolved`. Put the exact `<!-- migration-source: SOURCE_KEY -->` marker in the selected ADR section.
+Link each ADR from `09-decisions.md`; update `related_adrs` in every arc42 file to the exact IDs that govern its documented claims, using `[]` when none governs the section; and replace each decision inventory row's temporary governance destination with an exact explicit anchor in the created ADR before marking that row `resolved`. Put the exact `<!-- migration-source: SOURCE_KEY -->` marker in the selected ADR section and remove that row's superseded provisional marker from `architecture/adr/README.md`. After remapping, the global marker multiset must equal only the active inventory destination triples.
 
 - [ ] **Step 7: Validate and commit decisions**
 
@@ -728,8 +817,40 @@ diff -u "$expected_report" "$migration_report"
 Expected: ADR, metadata, link, and unit-test checks pass. The expected diagnostic set is frozen from the committed Task 4 inventory before Task 5 edits; the migration command fails only for those exact proposal-disposition rows still marked `unresolved` for Task 7. `diff` is silent, proving there are no new proposal rows and no schema, material-block coverage, destination, evidence, or source-marker diagnostics.
 
 ```bash
-git add architecture/adr architecture/arc42 architecture/archive/comprehensive-design-migration-inventory.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "docs: record foundational architecture decisions"
+task5_paths=(
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+  architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
+  architecture/adr/0003-use-signed-integer-minor-units.md
+  architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md
+  architecture/adr/0005-use-immutable-journals-and-additive-corrections.md
+  architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md
+  architecture/adr/0007-separate-ledger-identity-from-account-addresses.md
+  architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md
+  architecture/adr/README.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task5_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task5_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task5_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: record foundational architecture decisions" -- "${task5_paths[@]}"
 ```
 
 ### Task 6: Add version-controlled Mermaid diagrams
@@ -858,13 +979,13 @@ task6_paths=(
   architecture/tooling/package-lock.json
   architecture/tooling/package.json
 )
-git add "${task6_paths[@]}"
+git add -- "${task6_paths[@]}"
 test "$(git ls-files -s architecture/scripts/render-diagrams.sh | awk '{print $1}')" = 100755
 expected_staged="$(mktemp)"
 actual_staged="$(mktemp)"
 trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
 printf '%s\n' "${task6_paths[@]}" | LC_ALL=C sort >"$expected_staged"
-git diff --cached --name-only -- "${task6_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+git diff --cached --name-only --no-renames -- "${task6_paths[@]}" | LC_ALL=C sort >"$actual_staged"
 diff -u "$expected_staged" "$actual_staged"
 git diff --cached --name-status -- "${task6_paths[@]}"
 git status --short -- architecture/arc42
@@ -882,6 +1003,7 @@ Expected: the staged-name comparison is exact for Task 6, and the status command
 - Create: `architecture/proposals/full-poc-platform.md`
 - Create: `architecture/proposals/production-platform.md`
 - Create: `architecture/proposals/providers-and-reconciliation.md`
+- Modify: `architecture/proposals/README.md`
 - Modify: `architecture/infrastructure/infra-ubuntu24.04-poc.md`
 - Modify: `docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md`
 - Modify: `docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md`
@@ -941,7 +1063,7 @@ Do not add a proposal backlink to the already-implemented accounting-kernel plan
 
 - [ ] **Step 7: Resolve proposal inventory rows and validate**
 
-Update every proposal-classified inventory row with its exact real proposal anchor and `resolved`; put the exact `<!-- migration-source: SOURCE_KEY -->` marker in the selected proposal section. Run:
+Update every proposal-classified inventory row with its exact real proposal anchor and `resolved`; put the exact `<!-- migration-source: SOURCE_KEY -->` marker in the selected proposal section and remove that row's superseded provisional marker from `architecture/proposals/README.md`. The global marker inventory must contain no provisional governance marker after remapping. Run:
 
 ```bash
 python3 architecture/scripts/validate_architecture.py --root . --checks metadata,links,migration,traceability
@@ -954,22 +1076,59 @@ Expected: metadata, links, migration inventory, bidirectional traceability, acce
 - [ ] **Step 8: Commit proposal separation**
 
 ```bash
-git add architecture/proposals architecture/infrastructure/infra-ubuntu24.04-poc.md architecture/adr architecture/archive/comprehensive-design-migration-inventory.md docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "docs: separate proposed architecture from current state"
+task7_paths=(
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+  architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
+  architecture/adr/0003-use-signed-integer-minor-units.md
+  architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md
+  architecture/adr/0005-use-immutable-journals-and-additive-corrections.md
+  architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md
+  architecture/adr/0007-separate-ledger-identity-from-account-addresses.md
+  architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/infrastructure/infra-ubuntu24.04-poc.md
+  architecture/proposals/account-identifiers-and-nip-inbound.md
+  architecture/proposals/conventional-deposit-products-and-accrual.md
+  architecture/proposals/full-poc-platform.md
+  architecture/proposals/non-interest-banking-products.md
+  architecture/proposals/production-platform.md
+  architecture/proposals/providers-and-reconciliation.md
+  architecture/proposals/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md
+  docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md
+)
+git add -- "${task7_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task7_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task7_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: separate proposed architecture from current state" -- "${task7_paths[@]}"
 ```
 
 ### Task 8: Complete archive cutover and repair documentation links
 
 **Files:**
-- Move: `architecture/modern-core-banking-comprehensive-design-revised.md` to `architecture/archive/modern-core-banking-comprehensive-design-revised.md`
+
+Review-evidence commit (`task8_review_paths`):
+
 - Create: `architecture/archive/comprehensive-design-migration-review.md`
+- Modify: `architecture/scripts/validate_architecture.py`
+- Modify: `architecture/scripts/tests/test_validate_architecture.py`
+
+Archive-cutover commit (`task8_cutover_paths`):
+
+- Move: `architecture/modern-core-banking-comprehensive-design-revised.md` to `architecture/archive/modern-core-banking-comprehensive-design-revised.md` (both exact paths belong to the array)
 - Modify: `ARCHITECTURE.md`
 - Modify: `architecture/README.md`
 - Modify: `services/funds-core/README.md`
 - Modify: `architecture/infrastructure/infra-ubuntu24.04-poc.md`
 - Modify: `docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md`
-- Modify: `architecture/scripts/validate_architecture.py`
-- Modify: `architecture/scripts/tests/test_validate_architecture.py`
 
 **Interfaces:**
 - Consumes: a migration inventory with all 27 sections resolved and existing replacement destinations.
@@ -1053,8 +1212,19 @@ The descriptive text after `Reviewed commit`, `Reviewer`, `Implementer`, and `In
 ```bash
 python3 architecture/scripts/validate_architecture.py --root . --checks migration,archive,archive-review,links
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
-git add architecture/archive/comprehensive-design-migration-review.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "docs: approve comprehensive design migration"
+task8_review_paths=(
+  architecture/archive/comprehensive-design-migration-review.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task8_review_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task8_review_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task8_review_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: approve comprehensive design migration" -- "${task8_review_paths[@]}"
 review_commit="$(git rev-parse --verify 'HEAD^{commit}')"
 test "$(git rev-parse --verify "$review_commit^")" = "$reviewed_commit"
 python3 architecture/scripts/validate_architecture.py --root . --checks migration,archive,archive-review,links
@@ -1088,7 +1258,7 @@ Run:
 python3 architecture/scripts/validate_architecture.py --root .
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 architecture/scripts/render-diagrams.sh
-git diff --check
+git diff --check -- ARCHITECTURE.md architecture/README.md architecture/archive/modern-core-banking-comprehensive-design-revised.md architecture/infrastructure/infra-ubuntu24.04-poc.md architecture/modern-core-banking-comprehensive-design-revised.md docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md services/funds-core/README.md
 ```
 
 Expected: validation, unit tests, Mermaid rendering, and whitespace checks pass.
@@ -1096,8 +1266,28 @@ Expected: validation, unit tests, Mermaid rendering, and whitespace checks pass.
 - [ ] **Step 8: Commit the archive cutover**
 
 ```bash
-git add ARCHITECTURE.md architecture/archive/modern-core-banking-comprehensive-design-revised.md architecture/README.md architecture/infrastructure/infra-ubuntu24.04-poc.md services/funds-core/README.md docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
-git commit -m "docs: complete architecture documentation migration"
+task8_cutover_paths=(
+  ARCHITECTURE.md
+  architecture/README.md
+  architecture/archive/modern-core-banking-comprehensive-design-revised.md
+  architecture/infrastructure/infra-ubuntu24.04-poc.md
+  architecture/modern-core-banking-comprehensive-design-revised.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  services/funds-core/README.md
+)
+# `git mv` has already staged the rename. Restore only these two task-owned
+# index entries so the required exact-array `git add` can stage both sides.
+git restore --staged -- \
+  architecture/modern-core-banking-comprehensive-design-revised.md \
+  architecture/archive/modern-core-banking-comprehensive-design-revised.md
+git add -- "${task8_cutover_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task8_cutover_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task8_cutover_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: complete architecture documentation migration" -- "${task8_cutover_paths[@]}"
 ```
 
 ### Task 9: Report stale architecture verification without blocking
@@ -1143,8 +1333,19 @@ Expected: tests pass; any stale documents print deterministic warnings and the c
 - [ ] **Step 5: Commit stale reporting**
 
 ```bash
-git add architecture/README.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "feat: report stale architecture verification"
+task9_paths=(
+  architecture/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task9_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task9_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task9_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "feat: report stale architecture verification" -- "${task9_paths[@]}"
 ```
 
 ### Task 10: Enforce architecture documentation in pull requests and CI
@@ -1299,7 +1500,7 @@ python3 architecture/scripts/validate_architecture.py --root .
 npm ci --prefix architecture/tooling
 architecture/scripts/render-diagrams.sh
 python3 architecture/scripts/validate_architecture.py --root . --checks workflow
-git diff --check
+git diff --check -- .github/pull_request_template.md .github/workflows/architecture-docs.yml architecture/README.md architecture/scripts/tests/test_validate_architecture.py architecture/scripts/validate_architecture.py
 base_ref=refs/codex/architecture-docs-framework-base
 architecture_base="$(git rev-parse --verify "$base_ref^{commit}")"
 printf '%s' "$architecture_base" | grep -Eq '^[0-9a-f]{40}$'
@@ -1313,8 +1514,21 @@ Expected: all unit tests pass; repository validation prints `architecture valida
 - [ ] **Step 7: Commit workflow enforcement**
 
 ```bash
-git add .github/pull_request_template.md .github/workflows/architecture-docs.yml architecture/README.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
-git commit -m "ci: enforce architecture documentation contracts"
+task10_paths=(
+  .github/pull_request_template.md
+  .github/workflows/architecture-docs.yml
+  architecture/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+git add -- "${task10_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task10_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task10_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "ci: enforce architecture documentation contracts" -- "${task10_paths[@]}"
 ```
 
 ### Task 11: Finalize immutable implementation evidence
@@ -1340,7 +1554,13 @@ Expected: a 40-character hash and subject `ci: enforce architecture documentatio
 
 - [ ] **Step 2: Append evidence without rewriting rationale**
 
-Change only `Implementation status: Partial` to `Implementation status: Complete` and append the full Task 10 hash plus these verified commands under `## Implementation evidence`:
+Change only `Implementation status: Partial` to `Implementation status: Complete`. Generate the exact path-bound entry with the captured Task 10 hash:
+
+```bash
+printf -- '- %s changed: .github/pull_request_template.md; .github/workflows/architecture-docs.yml; architecture/README.md; architecture/scripts/tests/test_validate_architecture.py; architecture/scripts/validate_architecture.py\n' "$framework_commit"
+```
+
+Append that command's one-line output under `## Implementation evidence` and verify that every listed path is present in that commit's changed-path set. Then append these verified commands under the same section:
 
 ```text
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
@@ -1359,7 +1579,7 @@ python3 architecture/scripts/validate_architecture.py --root .
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$framework_commit"
 npm ci --prefix architecture/tooling
 architecture/scripts/render-diagrams.sh
-git diff --check
+git diff --check -- architecture/adr/0001-manage-architecture-as-versioned-code.md
 git diff -- architecture/adr/0001-manage-architecture-as-versioned-code.md
 ```
 
@@ -1368,8 +1588,17 @@ Expected: all automated checks pass, the git-aware accepted-ADR check accepts th
 - [ ] **Step 4: Commit evidence finalization**
 
 ```bash
-git add architecture/adr/0001-manage-architecture-as-versioned-code.md
-git commit -m "docs: finalize architecture framework evidence"
+task11_paths=(
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+)
+git add -- "${task11_paths[@]}"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task11_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only --no-renames -- "${task11_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git commit --only -m "docs: finalize architecture framework evidence" -- "${task11_paths[@]}"
 ```
 
 ## Final Verification
@@ -1395,9 +1624,67 @@ git diff --check "$architecture_base..HEAD"
 python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$architecture_base" --adr-edge-head-ref HEAD
 task10_commit="$(git rev-parse --verify 'HEAD^')"
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$task10_commit" --adr-head-ref HEAD
-git diff --quiet
-git diff --cached --quiet
-scoped_status="$(git status --short -- ARCHITECTURE.md architecture .github .gitignore services/funds-core/README.md docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md)"
+framework_paths=(
+  .github/pull_request_template.md
+  .github/workflows/architecture-docs.yml
+  .gitignore
+  ARCHITECTURE.md
+  architecture/README.md
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+  architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
+  architecture/adr/0003-use-signed-integer-minor-units.md
+  architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md
+  architecture/adr/0005-use-immutable-journals-and-additive-corrections.md
+  architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md
+  architecture/adr/0007-separate-ledger-identity-from-account-addresses.md
+  architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md
+  architecture/adr/README.md
+  architecture/adr/template.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/archive/comprehensive-design-migration-review.md
+  architecture/archive/modern-core-banking-comprehensive-design-revised.md
+  architecture/archive/proposals/README.md
+  architecture/diagrams/README.md
+  architecture/diagrams/containers.mmd
+  architecture/diagrams/context.mmd
+  architecture/diagrams/funds-core-components.mmd
+  architecture/diagrams/posting-sequence.mmd
+  architecture/diagrams/single-vm-deployment.mmd
+  architecture/infrastructure/infra-ubuntu24.04-poc.md
+  architecture/modern-core-banking-comprehensive-design-revised.md
+  architecture/proposals/README.md
+  architecture/proposals/account-identifiers-and-nip-inbound.md
+  architecture/proposals/conventional-deposit-products-and-accrual.md
+  architecture/proposals/full-poc-platform.md
+  architecture/proposals/non-interest-banking-products.md
+  architecture/proposals/production-platform.md
+  architecture/proposals/providers-and-reconciliation.md
+  architecture/scripts/render-diagrams.sh
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  architecture/tooling/package-lock.json
+  architecture/tooling/package.json
+  docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md
+  docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md
+  services/funds-core/README.md
+)
+git diff --quiet -- "${framework_paths[@]}"
+git diff --cached --quiet -- "${framework_paths[@]}"
+scoped_status="$(git status --short -- "${framework_paths[@]}")"
 test -z "$scoped_status"
 git status --short --branch
 git update-ref -d "$base_ref" "$architecture_base"
@@ -1414,15 +1701,17 @@ Expected results:
 - `package-lock.json` resolves `@mermaid-js/mermaid-cli` exactly to `11.16.0`; no `node_modules` or output below `architecture/diagrams/generated/` is tracked. SVGs elsewhere remain permitted when they are explicitly classified, approved architecture derivatives.
 - The twelve implementation commits after the captured base contain no whitespace errors: eleven task-ending commits plus Task 8's separate independent-review evidence commit.
 - The durable baseline ref resolves to a verified commit before its final range check and is deleted only after all other verification succeeds.
-- There is no tracked working-tree or index diff, and scoped status contains no framework artifacts. Unrelated untracked/user state shown by the final status report is left untouched and does not fail acceptance.
+- There is no framework-owned working-tree or index diff, and scoped status contains no framework artifacts. The unscoped final status is informational only: unrelated tracked, staged, untracked, and user state is left untouched and does not fail framework acceptance.
 - `ARCHITECTURE.md` is under 180 lines.
 - All twelve arc42 files are `current` or `deprecated`; none is `proposed`.
 - ADR identifiers are contiguous from `0001` through `0008`.
+- Every local ADR evidence hash is paired with exact repository paths and `changed` or `snapshot` mode; each hash is a commit, every path exists in its commit tree, every `changed` path is in the commit's root/merge-aware changed-path set, and `snapshot` is described only as observed state. Every stable GitHub pull-request URL matches the normalized current `origin` owner/repository.
 - Every foundational ADR names existing affected arc42 paths, and ADR/arc42 references are reciprocal in both directions.
 - Every diagram's declared arc42 section contains a link back to that exact diagram source.
 - Every proposal has reciprocal ADR and plan links; the three unimplemented plans link their proposals, while the implemented accounting-kernel plan links current arc42 sections and retrospective ADRs without a proposal backlink.
 - The granular migration inventory covers every material heading under top-level sections `1` through `27`, has unique stable source keys, zero unresolved rows, and existing required destination anchors, exact source-key backlinks, and evidence paths.
 - Every inventory row has non-empty exact material-block coverage and disposition rationale; each heading-relative block is covered exactly once, including after archive cutover.
+- The global multiset of governed `migration-source` marker occurrences equals the active inventory's deduplicated `(path, anchor, source-key)` destination set exactly; no orphan, extra, duplicate, wrong-section, or superseded provisional marker remains.
 - The independent review record names distinct reviewer and implementer identities, `APPROVED`, zero unresolved rows, an existing reviewed pre-cutover commit, and the exact inventory blob that remains current after cutover.
 - The old comprehensive-design path is absent and its archived copy is explicitly non-authoritative.
 - Pull-request `opened`, `synchronize`, `reopened`, `edited`, and `ready_for_review` events are all gated; PR and known-base push whitespace use their verified ranges, while ADR immutability is checked on every parent-to-child edge for every ranged commit in oldest-first/topological order with all-parent merge semantics. An unavailable push base falls back to an empty-tree-versus-current-tree whitespace check plus the same all-parent edge validation over reachable history.
