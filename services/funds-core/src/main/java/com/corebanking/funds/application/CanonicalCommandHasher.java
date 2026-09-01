@@ -12,8 +12,8 @@ import java.util.Objects;
 /**
  * Versioned, domain-separated hashes for typed financial commands, i.e. request_hash_scheme
  * TYPED_V2. Every digest starts with a domain string, so a posting hash and a reversal hash can
- * never coincide for the same bytes; fields use the same length-prefixed encoding as
- * CanonicalJournalHasher but are never null. The legacy V004_OPAQUE scheme has no algorithm
+ * never coincide for the same bytes; fields are length-prefixed like CanonicalJournalHasher's
+ * but carry no null tag because they are never null. The legacy V004_OPAQUE scheme has no algorithm
  * here: such commands are replayed by rebuilding a typed hash from verified stored facts.
  */
 public final class CanonicalCommandHasher {

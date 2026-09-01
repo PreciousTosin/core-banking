@@ -11,14 +11,15 @@ import java.util.Objects;
 import java.util.UUID;
 
 /**
- * Application-side admission rules for a journal draft. Each rule mirrors a database guard, so
- * a bad draft fails before any lock is taken and a bypass of this class still fails at commit:
- * per-currency zero sum (V003 journal_balanced_per_currency), 256 postings (V005
+ * Application-side admission rules for a journal draft. The accounting rules mirror database
+ * guards, so a bad draft fails before any lock is taken and a bypass of this class still fails
+ * at commit: per-currency zero sum (V003 journal_balanced_per_currency), 256 postings (V005
  * journal_reversible_posting_count), 32 dimensions and 8192 dimension bytes (V005
  * posting_dimensions_count_check / posting_dimensions_bytes_check). Zero and Long.MIN_VALUE
- * amounts never reach here: PostingLine rejects them, mirrored by the signed_minor_units CHECKs,
- * because an exact reversal must be able to negate every amount. Runs before the posting
- * transaction and again after account sequences are assigned.
+ * amounts never reach here: PostingLine rejects them, mirrored by the signed_minor_units CHECKs
+ * (a zero line has no meaning; Long.MIN_VALUE cannot be negated by an exact reversal). Runs
+ * inside the posting transaction before any lock is taken, and again in the repository once
+ * account sequences are assigned.
  */
 public class JournalValidator {
     // Must equal the V005 CHECKs on funds.posting and the 2..256 envelope enforced by
@@ -29,7 +30,7 @@ public class JournalValidator {
 
     public void validate(JournalDraft draft) {
         Objects.requireNonNull(draft, "draft");
-        // timestamptz keeps microseconds. Finer precision would be truncated on insert and the
+        // timestamptz keeps microseconds. Finer precision would be lost on insert and the
         // journal re-hashed from the database would no longer match the draft.
         if (draft.bookingTime().getNano() % 1_000 != 0) {
             throw new InvalidJournalException(

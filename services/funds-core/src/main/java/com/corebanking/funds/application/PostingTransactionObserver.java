@@ -5,7 +5,7 @@ import java.util.UUID;
 
 /**
  * Test seam for crash and failure injection inside the posting transaction. Production wires
- * the no-op bean below. PostingCrashRecoveryIT halts the JVM from beforeCommit and
+ * the no-op bean below. PostingCrashRecoveryIT halts a child JVM from beforeCommit and
  * afterCommitBeforeReturn to prove replay recovers a command on either side of the commit;
  * PostingAtomicityIT throws from afterFinancialRowsBeforeOutbox to prove the whole transaction
  * rolls back. Hooks fire in declaration order, the first three from JdbcLedgerRepository and

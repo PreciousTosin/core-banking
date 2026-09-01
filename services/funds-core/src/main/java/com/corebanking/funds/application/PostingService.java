@@ -16,7 +16,7 @@ import javax.sql.DataSource;
  * Transactional entry point for posting a journal. Owns the SERIALIZABLE transaction, the
  * transaction-local deadlines, idempotency replay, retry and rollback; JdbcLedgerRepository
  * owns the SQL. Two entry points share one choreography: the public generic path and the
- * package-private trusted-reversal path that only ReversalService may call.
+ * package-private trusted-reversal path reserved for ReversalService.
  */
 @ApplicationScoped
 public class PostingService {
@@ -76,8 +76,9 @@ public class PostingService {
     }
 
     /**
-     * Posts a reversal assembled by ReversalService. Package-private so no other caller can
-     * present reversal metadata; the request hash was already verified as reversalV2 there.
+     * Posts a reversal assembled by ReversalService. Package-private so no caller outside this
+     * package can present reversal metadata; the request hash was already verified as
+     * reversalV2 there.
      */
     PostingResult postTrustedReversal(PostingCommand command) {
         return post(command, true);
@@ -115,8 +116,8 @@ public class PostingService {
                     // Deadlines go first so every later statement, the replay lookup included,
                     // is bounded before any financial row is read or locked.
                     transactionTimeouts.apply(connection);
-                    // Same-content replay short-circuits with the stored result; the read-only
-                    // transaction is rolled back rather than committed. A same-key,
+                    // Same-content replay short-circuits with the stored result; the transaction
+                    // has only read and is rolled back rather than committed. A same-key,
                     // different-content command fails inside findCompleted as a conflict.
                     var completed = repository.findCompleted(connection, command);
                     if (completed.isPresent()) {
@@ -143,7 +144,8 @@ public class PostingService {
                 observer.afterCommitBeforeReturn(command.commandId());
                 return result;
             } catch (SQLException connectionFailure) {
-                // Acquiring or closing the connection failed outside the transaction body.
+                // Acquiring, configuring or closing the connection failed outside the
+                // transaction body.
                 throw SqlState.persistenceFailure(connectionFailure);
             }
         });

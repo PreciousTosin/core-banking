@@ -42,8 +42,8 @@ public class ReversalService {
     static final int MAX_POSTINGS_PER_JOURNAL = JournalValidator.MAX_POSTINGS_PER_JOURNAL;
     static final int MAX_DIMENSIONS_PER_POSTING = JournalValidator.MAX_DIMENSIONS_PER_POSTING;
     static final int MAX_DIMENSION_JSON_BYTES = JournalValidator.MAX_DIMENSION_JSON_BYTES;
-    // Client-side cancel backstop for the pre-flight reads; the server-side 1s/3s/5s deadlines
-    // from PostingTransactionTimeouts are applied to the same connection as well.
+    // Client-side cancel backstop for the pre-flight reads; the server-side deadlines from
+    // PostingTransactionTimeouts are applied to the same connection as well.
     static final int QUERY_TIMEOUT_SECONDS = 5;
     private static final int MAX_DIMENSION_ROWS =
         MAX_POSTINGS_PER_JOURNAL * MAX_DIMENSIONS_PER_POSTING;

@@ -56,7 +56,7 @@ public class CanonicalJournalHasher {
         encoder.field("legalEntityId", draft.legalEntityId());
         encoder.field("bookId", draft.bookId());
         // The only V004_V1 / V2 difference: V2 binds the fact to the governed chart it was
-        // posted under, so a chart rotation can never leave two journals hash-identical.
+        // posted under.
         if (includeChartVersion) {
             encoder.field("chartVersionId", draft.chartVersionId());
         }

@@ -10,11 +10,11 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
  * Transaction-local PostgreSQL deadlines applied before posting reads or locks. Defaults are
- * 1s lock, 3s statement and 5s idle-in-transaction (funds.posting.* properties). The ordering
- * lock < statement < idle is a requirement, not a style: a lock wait happens inside a
- * statement, so a longer lock_timeout could never fire and a blocked lock would surface as
- * 57014 (query cancelled) instead of 55P03 (lock not available); the idle deadline catches a
- * client that stops issuing statements mid-transaction and must outlast any single statement.
+ * 1s lock, 3s statement and 5s idle-in-transaction (funds.posting.* properties). The
+ * constructor enforces lock < statement < idle: a lock wait happens inside a statement, so a
+ * longer lock_timeout could never fire and a blocked lock would surface as 57014 (query
+ * cancelled) instead of 55P03 (lock not available); the idle deadline catches a client that
+ * stops issuing statements mid-transaction.
  */
 @ApplicationScoped
 public class PostingTransactionTimeouts {
@@ -73,7 +73,7 @@ public class PostingTransactionTimeouts {
         }
     }
 
-    // Values are sent as whole milliseconds; a sub-millisecond duration would round to "0ms",
+    // Values are sent as whole milliseconds; a sub-millisecond duration would truncate to "0ms",
     // which PostgreSQL treats as "disabled".
     private static Duration positiveMillis(Duration value, String name) {
         Objects.requireNonNull(value, name);

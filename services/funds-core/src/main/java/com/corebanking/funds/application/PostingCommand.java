@@ -6,8 +6,9 @@ import java.util.UUID;
 
 /**
  * Idempotent posting request: the command identity, the caller's TYPED_V2 request hash and the
- * journal it claims to describe. The hash is only format-checked here; PostingService proves it
- * equals postingV2(journal) before opening a transaction.
+ * journal it claims to describe. The hash is only format-checked here; the generic posting path
+ * proves it equals postingV2(journal) before opening a transaction, and the trusted reversal
+ * path relies on ReversalService's reversalV2 check.
  */
 public record PostingCommand(UUID commandId, String requestHash, JournalDraft journal) {
     public PostingCommand {
