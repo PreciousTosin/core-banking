@@ -64,10 +64,50 @@ import org.postgresql.PGConnection;
 import org.postgresql.PGStatement;
 import org.postgresql.ds.PGSimpleDataSource;
 
+/**
+ * Proves ACC-32 stored-result recovery with real process death: a posting owner terminated
+ * immediately before commit leaves no trace and an identical retry posts exactly once; an owner
+ * terminated after commit but before it could return leaves a stored result that an identical
+ * replay returns without posting again. Also proves {@code PostgresRetryPolicy} closes a failed
+ * attempt's connection before opening the next, and that a real repository statement blocked on
+ * a held account lock can be cancelled with no ledger effect. Catches duplicate or partial
+ * financial effects after a crash, and a harness that could hang the suite behind a dead child's
+ * locks.
+ *
+ * <p>Child protocol. {@code startWorker} launches {@link CrashPostingWorker} as a separate JVM
+ * (the current {@code java.home} binary on the surefire test class path) with the command id and
+ * crash point as arguments and the test datasource credentials in the {@code CB_TEST_*}
+ * environment; combined stdout/stderr is redirected to a file under the {@code @TempDir}. The
+ * child posts a fixed two-line NGN journal through the same {@code TestPostingStack} and installs
+ * a {@link PostingTransactionObserver} that, at the chosen hook, prints {@code REACHED:<point>}
+ * and calls {@code Runtime.halt(91)}: {@code beforeCommit} runs with every row written and the
+ * SERIALIZABLE transaction still open, {@code afterCommitBeforeReturn} runs after commit but
+ * before the result reaches the caller. Halting skips shutdown hooks and JDBC close, so the
+ * server sees a dropped connection exactly as on a crash. The parent never signals the child; it
+ * waits for exit within {@link #PROCESS_TIMEOUT}, then {@code assertHaltedAt} requires exit code
+ * 91 and that single output line, proving the halt happened at the intended hook and nowhere
+ * else. {@code WorkerHandle.close()} force-kills only a child that is still alive.
+ *
+ * <p>Recovery proof. {@code CrashProbe} reads the database directly on an isolated short-timeout
+ * datasource. Before commit: {@code awaitRollbackComplete} polls a {@code FOR UPDATE} on the two
+ * fixture accounts until the server has rolled back the dead session (55P03 while its locks are
+ * held), the snapshot must equal the pre-crash snapshot, and an in-process post of the identical
+ * command must satisfy {@code assertOneCompletedEffect}. After commit:
+ * {@code awaitCommittedJournal} polls until the journal is visible, then the identical replay must
+ * return the stored journal id and sequence with an unchanged snapshot.
+ *
+ * <p>Bounding. Every database call and output-file read runs through {@code runBounded} /
+ * {@code runJdbcBounded}: a virtual-thread task under a {@code Deadline}, with statement cancel
+ * and connection abort on timeout and a check that no JDBC resource is left live; the child's
+ * exit wait is a {@code Process.waitFor} under the same deadline. The remaining tests are
+ * self-tests of that harness, some against the real database and some with deterministic clock,
+ * process, executor and filesystem doubles.
+ */
 @QuarkusTest
 class PostingCrashRecoveryIT {
     private static final UUID BEFORE_COMMIT_COMMAND_ID = TestPostingStack.uuid(40);
     private static final UUID AFTER_COMMIT_COMMAND_ID = TestPostingStack.uuid(50);
+    // Bound for each child wait and each probe; no single operation in this class may block longer.
     private static final Duration PROCESS_TIMEOUT = Duration.ofSeconds(10);
 
     @Inject
@@ -93,6 +133,9 @@ class PostingCrashRecoveryIT {
         TestPostingStack.reset(dataSource);
     }
 
+    // Harness self-test: an unchanged snapshot alone cannot prove rollback. While another session
+    // holds the account locks the snapshot is identical yet the release probe still sees 55P03,
+    // which is why the crash tests wait on awaitRollbackComplete before comparing snapshots.
     @Test
     void unchangedMvccSnapshotDoesNotClaimRollbackWhileAccountLocksRemainHeld() throws Exception {
         CrashSnapshot before = rows.snapshot(BEFORE_COMMIT_COMMAND_ID);
@@ -361,6 +404,9 @@ class PostingCrashRecoveryIT {
             () -> assertTrue(throwableTreeContains(failure, "live resource diagnostic")));
     }
 
+    // The first prepared statement executed on the first connection raises SQLSTATE 40001, so
+    // PostgresRetryPolicy must run a second attempt on a second connection; both physical
+    // connections must end closed and the ledger must show exactly one effect.
     @Test
     void realRepositoryRetryClosesAndClearsTheFailedAttemptBeforeOpeningTheNextConnection() throws Exception {
         UUID commandId = TestPostingStack.uuid(60);
@@ -392,12 +438,20 @@ class PostingCrashRecoveryIT {
         assertOneCompletedEffect(command, result, before, after);
     }
 
+    /**
+     * Sequence: a holder session locks both fixture accounts {@code FOR UPDATE}; the real
+     * {@code PostingService} then blocks inside {@code lock_account_mapping_for_posting}; the 2 s
+     * bound must cancel that statement, abort its connection and leave the snapshot unchanged.
+     */
     @Test
     void boundedCancellationCancelsTheBlockingRealRepositoryStatementAndAbortsItsConnection() throws Exception {
         UUID commandId = TestPostingStack.uuid(61);
         PostingCommand command = CrashPostingWorker.command(commandId);
         CrashSnapshot before = rows.snapshot(commandId);
         PGSimpleDataSource slowDataSource = timeoutDataSource(credentials);
+        // Driver and session-level server timeouts are widened past the 2 s bound so the driver
+        // is not the one that cancels; PostingService still applies its transaction-local 1 s lock
+        // deadline on top of these.
         slowDataSource.setSocketTimeout(5);
         slowDataSource.setQueryTimeout(5);
         slowDataSource.setOptions("-c statement_timeout=5000 -c lock_timeout=5000");
@@ -446,6 +500,9 @@ class PostingCrashRecoveryIT {
             }));
     }
 
+    // This and the next three tests drive WorkerHandle and the startWorker failure path with a
+    // MutableNanoClock and process, wait and file doubles, so budget arithmetic is asserted
+    // exactly without a real process or filesystem.
     @Test
     void workerOperationAndCleanupBudgetsStartFreshAfterLongVisibilityPhase() {
         var clock = new MutableNanoClock();
@@ -617,6 +674,12 @@ class PostingCrashRecoveryIT {
             () -> assertSame(deletionFailure, startFailure.getSuppressed()[0]));
     }
 
+    /**
+     * Sequence: the child halts in {@code beforeCommit} with every row written but uncommitted;
+     * the parent waits until the server has released the dead session's account locks and checks
+     * the snapshot equals the pre-crash one; the identical command posted in-process must then
+     * produce exactly one effect.
+     */
     @Test
     void processDeathBeforeCommitRollsBackAndIdenticalRetryPostsOnce() throws Exception {
         PostingCommand command = CrashPostingWorker.command(BEFORE_COMMIT_COMMAND_ID);
@@ -636,6 +699,12 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Sequence: the child commits and halts in {@code afterCommitBeforeReturn}, so no caller ever
+     * saw the result; the parent waits for the committed journal to become visible, then for the
+     * exit; replaying the identical command must return the stored journal id and sequence and
+     * change nothing in the database.
+     */
     @Test
     void processDeathAfterCommitReturnsStoredResultWithoutReposting() throws Exception {
         PostingCommand command = CrashPostingWorker.command(AFTER_COMMIT_COMMAND_ID);
@@ -688,6 +757,13 @@ class PostingCrashRecoveryIT {
             }));
     }
 
+    /**
+     * Launches {@link CrashPostingWorker} as a child JVM from the same {@code java.home} on the
+     * surefire test class path. Its combined stdout/stderr goes to a temp file the parent reads
+     * after exit; the database credentials travel in the {@code CB_TEST_*} environment variables
+     * the worker requires, taken from the injected datasource so the child hits the migrated
+     * test database.
+     */
     private WorkerHandle startWorker(CrashPostingWorker.CrashPoint point, UUID commandId) throws IOException {
         Path outputFile = Files.createTempFile(tempDirectory, "crash-posting-" + point + '-', ".log");
         var builder = new ProcessBuilder(
@@ -731,6 +807,8 @@ class PostingCrashRecoveryIT {
                 timedWaits,
                 files);
         } catch (IOException startFailure) {
+            // No handle exists to clean up, so the output file is deleted here, still within the
+            // bound, and any deletion failure is suppressed onto the start failure.
             boolean restoreInterrupt = Thread.interrupted();
             Deadline cleanupDeadline = Deadline.after(timeout, nanoTime);
             try {
@@ -755,6 +833,8 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    // Pulls URL, user and password out of the Agroal configuration so the child JVM and the probe
+    // datasource use exactly the database the test profile migrated.
     private static DatabaseCredentials databaseCredentials(DataSource dataSource) throws SQLException {
         AgroalDataSource agroal = dataSource.unwrap(AgroalDataSource.class);
         var factory = agroal
@@ -771,6 +851,12 @@ class PostingCrashRecoveryIT {
         return new DatabaseCredentials(factory.jdbcUrl(), username, password);
     }
 
+    /**
+     * Isolated probe datasource: one-second driver timeouts plus {@code statement_timeout=1000}
+     * and {@code lock_timeout=200} as session options, so no probe can wait behind a crashed
+     * child's locks. The lock timeout is what turns a still-held lock into the 55P03 the release
+     * probes poll on. Session options stay off the Quarkus pool, which a separate test checks.
+     */
     private static PGSimpleDataSource timeoutDataSource(DatabaseCredentials credentials) {
         var isolated = new PGSimpleDataSource();
         isolated.setURL(credentials.jdbcUrl());
@@ -785,6 +871,8 @@ class PostingCrashRecoveryIT {
         return isolated;
     }
 
+    // Exit code 91 and exactly one REACHED line prove the child halted at the intended hook and
+    // not from an earlier validation, connection or database failure.
     private static void assertHaltedAt(WorkerExit exit, CrashPostingWorker.CrashPoint point) {
         assertAll(
             () -> assertEquals(91, exit.exitCode()),
@@ -793,6 +881,14 @@ class PostingCrashRecoveryIT {
                 exit.output().lines().filter(line -> !line.isBlank()).toList()));
     }
 
+    /**
+     * Database-side proof, from {@code CrashProbe} snapshots, that exactly one posting effect
+     * exists: one COMPLETED command whose result JSON names the journal, one journal carrying the
+     * command's facts and V2 canonical hash, both postings at the next account sequence, balance
+     * and control deltas of exactly ±{@code POSTING_AMOUNT} with the independent control
+     * untouched, and one unpublished {@code JournalPosted} outbox row. Passing after a crash means
+     * neither a duplicate nor a partial effect survived.
+     */
     private static void assertOneCompletedEffect(
         PostingCommand command,
         PostingResult result,
@@ -994,6 +1090,13 @@ class PostingCrashRecoveryIT {
         return runBounded(deadline, description, operation, () -> null, () -> null, executor);
     }
 
+    /**
+     * Core of the bounding harness. Runs the operation on the given executor under one deadline,
+     * reserving part of the budget (half, at most 3 s) for cleanup. On every exit path the task
+     * is cancelled, the executor shut down, {@code releaseVerification} consulted and the
+     * interrupt flag restored; cleanup failures are suppressed onto the primary failure so a
+     * timeout diagnostic is never hidden by what happened while tearing down.
+     */
     private static <T> T runBounded(
         Deadline deadline,
         String description,
@@ -1204,6 +1307,11 @@ class PostingCrashRecoveryIT {
         return new CleanupOutcome(restoreInterrupt, cleanupFailure);
     }
 
+    /**
+     * JDBC flavour of {@code runBounded}: {@link JdbcResources} tracks the single live connection
+     * and statement so a timeout can cancel the statement and abort the connection, and release
+     * verification fails the test if either is still live afterwards.
+     */
     private static <T> T runJdbcBounded(
         Duration timeout,
         String description,
@@ -1250,6 +1358,10 @@ class PostingCrashRecoveryIT {
 
     private record WorkerExit(int exitCode, String output) {}
 
+    /**
+     * View of every table a posting writes, scoped to one command and the two fixture accounts
+     * and compared whole by equality.
+     */
     private record CrashSnapshot(
         List<IdempotencyState> idempotency,
         List<JournalState> journals,
@@ -1313,6 +1425,13 @@ class PostingCrashRecoveryIT {
         int publishAttempts
     ) {}
 
+    /**
+     * Tracks at most one live connection and one live statement per bounded operation through
+     * dynamic proxies. Gives the harness a handle to cancel and abort on timeout, detects the race
+     * where a connection or statement is obtained after cancellation, and reports anything left
+     * open. Failures during close or abort are recorded, not thrown, so they surface as suppressed
+     * diagnostics instead of replacing the primary failure.
+     */
     private static final class JdbcResources {
         private final DataSource dataSource;
         private final String description;
@@ -1362,6 +1481,8 @@ class PostingCrashRecoveryIT {
                 abortAndClose(delegate);
                 throw new IllegalStateException(description + " opened concurrent JDBC connections");
             }
+            // Re-check after registering: cancelActive may have run between the two reads and
+            // missed a connection that was not yet visible to it.
             if (cancelled.get()) {
                 cancelConnection(connection);
                 throw new SQLTimeoutException(description + " acquisition lost the cancellation race");
@@ -1605,6 +1726,7 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /** DataSource handed to the real PostingService so its connections are the tracked ones. */
     private static final class TrackingDataSource implements DataSource {
         private final DataSource delegate;
         private final JdbcResources resources;
@@ -1663,6 +1785,13 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Inspects the database directly on the short-timeout probe datasource, independent of the
+     * service under test. {@code snapshot} is scoped to one command and the two fixture accounts;
+     * {@code awaitCommittedJournal} polls for journal visibility; {@code awaitRollbackComplete}
+     * polls a {@code FOR UPDATE} on the fixture accounts until the dead child's locks are gone,
+     * treating 55P03 as "still held" and any other SQL failure as a real error.
+     */
     private static final class CrashProbe {
         private final PGSimpleDataSource dataSource;
 
@@ -1747,6 +1876,8 @@ class PostingCrashRecoveryIT {
             });
         }
 
+        // Must see exactly the two fixture accounts, then roll back so the probe never becomes a
+        // lock holder itself.
         private void probeRollbackReleaseOnceWithinBound(JdbcResources resources) throws Exception {
             resources.withConnection(connection -> {
                 connection.setAutoCommit(false);
@@ -1981,6 +2112,7 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /** Seam for process waits and bounded calls so self-tests can drive WorkerHandle by clock. */
     private interface TimedWaits {
         boolean waitFor(Process process, long remainingNanos) throws InterruptedException;
 
@@ -2025,6 +2157,7 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /** Seam for the child's output file so self-tests need no real filesystem. */
     private interface WorkerFiles {
         String read(Path path) throws IOException;
 
@@ -2042,12 +2175,20 @@ class PostingCrashRecoveryIT {
         @Override
         public void delete(Path path) throws IOException {
             Files.deleteIfExists(path);
+            // Re-check so a file that somehow survives deleteIfExists is reported as a cleanup
+            // failure instead of leaking silently.
             if (Files.exists(path)) {
                 throw new IOException("worker output file still exists after deletion: " + path.getFileName());
             }
         }
     }
 
+    /**
+     * Owns a launched child JVM and its output file. {@code awaitExit} waits within the bound and
+     * returns exit code plus captured output; {@code close()} pre-starts a bounded deletion of the
+     * output file, force-kills a child that is still alive, joins the deletion inside a reserved
+     * tail of the budget, and throws every cleanup failure combined so nothing leaks silently.
+     */
     private static final class WorkerHandle implements AutoCloseable {
         private final Process process;
         private final CrashPostingWorker.CrashPoint point;
@@ -2085,6 +2226,8 @@ class PostingCrashRecoveryIT {
             this.files = files;
             this.timeout = timeout;
             this.nanoTime = nanoTime;
+            // One tenth of the budget (at most 1 s) is held back so the output file can still be
+            // deleted after a slow forced kill consumed the rest.
             this.deletionReserve = Math.min(
                 SECONDS.toNanos(1),
                 Math.max(1, timeout.toNanos() / 10));
@@ -2201,6 +2344,11 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Schedules a task now but holds it behind a latch until {@code releaseAndJoin}. Used for
+     * output-file deletion so the task is already running on its thread before process cleanup
+     * starts and cannot be starved of a start slot once the budget is nearly spent.
+     */
     private static final class SystemDeferredCall<T> implements DeferredCall<T> {
         private final ExecutorService executor;
         private final Future<T> future;
@@ -2357,6 +2505,10 @@ class PostingCrashRecoveryIT {
         return existing;
     }
 
+    /**
+     * Monotonic, overflow-safe deadline over an injectable nano clock. {@code reservingTail}
+     * derives an earlier deadline that leaves the reserved nanos for cleanup that must follow.
+     */
     private static final class Deadline {
         private final long expiresAt;
         private final LongSupplier nanoTime;
@@ -2389,6 +2541,7 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /** Process double: alive until destroyed or marked exited, then reports exit code 91. */
     private static final class DeterministicExitProcess extends Process {
         private final AtomicBoolean exited = new AtomicBoolean();
 
@@ -2452,6 +2605,7 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /** Records every budget WorkerHandle hands out and advances the fake clock as time passes. */
     private static final class RecordingTimedWaits implements TimedWaits {
         private final MutableNanoClock clock;
         private final List<Long> observedBudgets = new ArrayList<>();
@@ -2516,6 +2670,10 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Simulates a driver that hands back a connection only after the caller's timeout has already
+     * interrupted it; the harness must abort and close that late connection, not leak it.
+     */
     private static final class InterruptReturningDataSource extends PGSimpleDataSource {
         private final CountDownLatch acquisitionStarted = new CountDownLatch(1);
         private final CountDownLatch acquisitionFinished = new CountDownLatch(1);
@@ -2566,6 +2724,10 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Executor whose {@code shutdownNow} throws and whose {@code awaitTermination} interrupts, to
+     * prove both diagnostics and the interrupt flag survive a hostile cleanup.
+     */
     private static final class InterruptingCleanupExecutor extends AbstractExecutorService {
         private final AtomicBoolean shutdown = new AtomicBoolean();
         private final AtomicBoolean terminated = new AtomicBoolean();
@@ -2606,6 +2768,10 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Raises SQLSTATE 40001 on the first statement execution it sees and keeps every physical
+     * connection, so a test can prove the retry closed the failed attempt's connection.
+     */
     private static final class SerializationFailureOnceDataSource implements DataSource {
         private final DataSource delegate;
         private final AtomicBoolean serializationFailureInjected = new AtomicBoolean();
@@ -2688,6 +2854,11 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    /**
+     * Watches the {@code lock_account_mapping_for_posting} statement, the point where the real
+     * repository blocks behind a held account lock, and records whether it was cancelled and
+     * whether its connection was aborted and closed.
+     */
     private static final class BlockingStatementObservationDataSource implements DataSource {
         private final DataSource delegate;
         private final CountDownLatch blockingStatementStarted = new CountDownLatch(1);
@@ -2779,6 +2950,8 @@ class PostingCrashRecoveryIT {
         }
     }
 
+    // Unwraps InvocationTargetException so the delegate's own SQLSTATE-bearing failure reaches the
+    // caller unchanged through the proxies.
     private static Object invoke(Object target, Method method, Object[] arguments) throws Throwable {
         try {
             return method.invoke(target, arguments);

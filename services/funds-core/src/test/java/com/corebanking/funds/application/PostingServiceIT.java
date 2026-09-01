@@ -47,6 +47,18 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 
+/**
+ * End-to-end PostingService contract on the Quarkus dev-services PostgreSQL container
+ * (Testcontainers): the Example A inflow as one atomic ledger effect (ACC-02); same-hash
+ * replay, same-content replay that wins before later governance changes, and different-hash
+ * conflict (ACC-32); closed-period and currency-mismatch rejection with zero committed rows
+ * (ACC-01, ACC-20); checked-overflow and capacity failures that roll back every earlier write;
+ * the SERIALIZABLE retry loop (fresh connection per attempt, at most five, only for retryable
+ * SQLSTATEs, suppressed rollback failures preserved); and a full post-and-reverse through a
+ * real login that holds nothing but funds_app (ACC-24). Catches a partially committed
+ * posting, a retry reusing a poisoned connection, an overflow mapped to the wrong exception,
+ * or a service path that needs more privilege than funds_app.
+ */
 @QuarkusTest
 class PostingServiceIT {
     private static final UUID BOOK_ID = uuid(1);
@@ -63,6 +75,7 @@ class PostingServiceIT {
     private static final UUID CUSTOMER_POSTING_ID = uuid(23);
     private static final CurrencyCode NGN = new CurrencyCode("NGN");
     private static final CurrencyCode USD = new CurrencyCode("USD");
+    // Well-formed lowercase SHA-256 text that is not postingV2 of any journal in this class.
     private static final String DIFFERENT_HASH = "f".repeat(64);
 
     @Inject
@@ -73,6 +86,7 @@ class PostingServiceIT {
 
     @BeforeEach
     void setUp() throws SQLException {
+        // A trigger left behind by an aborted overflow test would make every other test fail.
         removeScopedControlOverflowTrigger();
         truncateAllTables();
         try (var connection = dataSource.getConnection()) {
@@ -146,6 +160,9 @@ class PostingServiceIT {
         }
     }
 
+    // After the first post, the period is closed, the book policy bumped and the chart retired by
+    // direct SQL. A same-content replay must still return the stored result: replay is decided
+    // on the completed command, before any governance guard that would now reject a fresh post.
     @Test
     void completedSameContentReplayWinsBeforeLaterPeriodChartAndPolicyChanges()
         throws SQLException {
@@ -173,6 +190,9 @@ class PostingServiceIT {
         }
     }
 
+    // The conflicting command carries a hash that is not postingV2 of its own journal, so the
+    // service rejects it in admission: the recording data source must see zero connections and
+    // the stored row must keep the original hash.
     @Test
     void completedCommandWithDifferentHashIsAnIdempotencyConflict() throws SQLException {
         var command = exampleACommand(COMMAND_ID, JOURNAL_ID);
@@ -223,6 +243,8 @@ class PostingServiceIT {
         assertNoPostingRows();
     }
 
+    // The balance is seeded at Long.MAX_VALUE by direct SQL; a one-unit debit must fail in the
+    // checked Java addition and leave the seeded row, sequence and version untouched.
     @Test
     void materialisedBalanceOverflowRollsBackEveryChange() throws SQLException {
         execute("""
@@ -290,6 +312,9 @@ class PostingServiceIT {
         }
     }
 
+    // Only the provider control projection is at Long.MAX_VALUE; both materialised balances are
+    // updated before the projections, so the failure must undo writes that already succeeded
+    // earlier in the same transaction, not just the one that overflowed.
     @Test
     void controlProjectionOverflowRollsBackEarlierMaterialisedAndControlChanges() throws SQLException {
         seedProjectionState(
@@ -322,6 +347,9 @@ class PostingServiceIT {
         }
     }
 
+    // The database-side counterpart of the Java overflow tests: a trigger installed by direct DDL
+    // raises SQLSTATE 22003 on the provider control update. It must be mapped to
+    // MonetaryOverflowException, not retried, and roll back everything written before it.
     @Test
     void postgresNumericOverflowIsMappedAndRollsBackEveryEarlierWrite() throws SQLException {
         seedProjectionState(
@@ -357,6 +385,10 @@ class PostingServiceIT {
         }
     }
 
+    // The scripted repository fails twice with a 40001 buried under IllegalStateException, so the
+    // retry policy must classify by walking the cause chain. Asserts three distinct connections
+    // (two rolled back, one committed), jitter pauses for attempts 1 and 2 only, and the very
+    // same command instance on every attempt.
     @Test
     void postingServiceRetriesWithFreshSerializableTransactionsAndUnchangedCommand() throws SQLException {
         var delayedAttempts = new ArrayList<Integer>();
@@ -404,6 +436,11 @@ class PostingServiceIT {
             () -> assertEquals(2, recordingDataSource.rollbackCount()));
     }
 
+    // Sequence: create a throwaway LOGIN role that is a member of funds_app only, connect with a
+    // plain PGSimpleDataSource that runs SET ROLE funds_app on every connection, and script one
+    // 40001 on the first posting attempt. Expects 3 repository calls (two posting attempts plus
+    // the reversal) and 4 connections (those three plus the reversal's read-only preflight),
+    // every one of them as funds_app and none able to SET ROLE funds_migrator.
     @Test
     void postsAndReversesThroughFreshConnectionsRestrictedToFundsApp() throws SQLException {
         String loginRole = "funds_app_path_" + UUID.randomUUID().toString().replace("-", "");
@@ -457,6 +494,8 @@ class PostingServiceIT {
         }
     }
 
+    // Self-test of TemporaryLoginRole: a failed GRANT (42704, undefined object) inside the
+    // try-with-resources must still drop the role, or reruns would collide on role names.
     @Test
     void temporaryLoginRoleIsDroppedWhenSetupFails() throws SQLException {
         String loginRole = "funds_app_cleanup_" + UUID.randomUUID().toString().replace("-", "");
@@ -476,6 +515,8 @@ class PostingServiceIT {
         }
     }
 
+    // 40P01 (deadlock) is retryable, so the cap is what stops it: PostgresRetryPolicy allows five
+    // attempts, hence five connections, five rollbacks and pauses after attempts 1 to 4 only.
     @Test
     void postingServiceStopsAfterFiveFreshRolledBackTransactions() {
         var delayedAttempts = new ArrayList<Integer>();
@@ -525,6 +566,8 @@ class PostingServiceIT {
             () -> assertSingleRolledBackAttempt(recordingDataSource));
     }
 
+    // A 513-byte narration trips the octet_length(narration) <= 512 CHECK from V002 (SQLSTATE
+    // 23514), which is a plain constraint failure and must be surfaced after one attempt.
     @Test
     void ordinaryPostgreSqlConstraintFailureIsNotRetried() {
         var recordingDataSource = new RecordingDataSource(dataSource, false);
@@ -540,6 +583,11 @@ class PostingServiceIT {
             () -> assertSingleRolledBackAttempt(recordingDataSource));
     }
 
+    /**
+     * The "Example A" provider inflow of the architecture document and the kernel plan: debit
+     * the provider asset, credit the customer liability, 100_000 minor units, one dimension per
+     * line so dimension persistence is covered by every test that uses it.
+     */
     private PostingCommand exampleACommand(UUID commandId, UUID journalId) {
         return command(journal(
             commandId,
@@ -701,6 +749,10 @@ class PostingServiceIT {
         }
     }
 
+    /**
+     * Places both materialised balances and both control projections at chosen values by direct
+     * SQL, bypassing the posting path, so an overflow can be staged at one exact write.
+     */
     private void seedProjectionState(
         BalanceState providerBalance,
         BalanceState customerBalance,
@@ -736,6 +788,11 @@ class PostingServiceIT {
         }
     }
 
+    /**
+     * Direct DDL that bypasses the service: a BEFORE UPDATE trigger raising 22003 only for the
+     * PROVIDER-CASH projection row, so the customer projection path stays real. The task6 name
+     * refers to Task 6 of the kernel plan (the serializable posting transaction).
+     */
     private void installScopedControlOverflowTrigger() throws SQLException {
         removeScopedControlOverflowTrigger();
         execute("""
@@ -969,6 +1026,11 @@ class PostingServiceIT {
 
     private record ControlState(long signedPostingTotal, long latestJournalSequence) {}
 
+    /**
+     * Fails the first N post attempts with a supplied exception and then delegates, recording
+     * every command it saw. Lets the retry loop be driven without provoking real serialization
+     * failures.
+     */
     private static final class ScriptedLedgerRepository implements LedgerRepository {
         private final LedgerRepository delegate;
         private final int failuresBeforeSuccess;
@@ -1007,6 +1069,11 @@ class PostingServiceIT {
         }
     }
 
+    /**
+     * Records, per connection, the autocommit/isolation/commit/rollback/close events in order,
+     * so a test can assert "one fresh SERIALIZABLE transaction per attempt". With failRollback
+     * the rollback itself throws 08006 after running, to exercise suppressed-failure handling.
+     */
     private static final class RecordingDataSource implements DataSource {
         private final DataSource delegate;
         private final boolean failRollback;
@@ -1109,6 +1176,11 @@ class PostingServiceIT {
         }
     }
 
+    /**
+     * Unpooled connections as the temporary login, each switched to funds_app with SET ROLE and
+     * fingerprinted (session user, current role, whether funds_migrator could be assumed) so
+     * the test can prove which identity did the financial work.
+     */
     private static final class FundsAppDataSource extends PGSimpleDataSource {
         private final List<ConnectionIdentity> identities = new ArrayList<>();
 
@@ -1147,6 +1219,10 @@ class PostingServiceIT {
         }
     }
 
+    /**
+     * Drops the throwaway login role on close. Its live backends are terminated first because
+     * PostgreSQL refuses to drop a role that still has sessions.
+     */
     private static final class TemporaryLoginRole implements AutoCloseable {
         private final DataSource administratorDataSource;
         private final String roleName;

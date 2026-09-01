@@ -32,6 +32,18 @@ import org.postgresql.ds.PGSimpleDataSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
+/**
+ * Proves that the additive V005 and V006 upgrades preserve authentic V004 history (the
+ * V004→V2 hash boundary in the README). Each test starts its own Testcontainers PostgreSQL,
+ * migrates with Flyway to target {@code 004}, seeds V004-era facts by raw SQL (journals hashed
+ * with the V004 scheme, opaque command hashes, no chart or scheme columns yet), then migrates on
+ * to {@code 005} and {@code 006} and proves through the real {@link PostingService} and
+ * {@link ReversalService} stack that history still verifies: same-content replays return the
+ * stored V004 hashes, every mutated replay raises {@link IdempotencyConflictException}, and new
+ * work is written under the {@code TYPED_V2}/{@code V2} schemes. The negative test proves V005
+ * fails closed on V004 rows the typed model cannot round-trip. Catches a migration that rewrites,
+ * re-hashes or silently invalidates committed history.
+ */
 class MigrationUpgradeIT {
     private static final UUID BOOK = uuid(1);
     private static final UUID CHART = uuid(3);
@@ -48,6 +60,13 @@ class MigrationUpgradeIT {
     private static final UUID LEGACY_REVERSAL_COMMAND = uuid(32);
     private static final UUID LEGACY_REVERSAL_JOURNAL = uuid(33);
 
+    /**
+     * Sequence: migrate to 004 and seed; migrate to 005 and check product kind/finance principle
+     * moved onto the version without reclassifying the existing account, the V004 hash, chart
+     * backfill and {@code V004_OPAQUE/V004_V1} tags are intact; add a NON_INTEREST version 2;
+     * migrate to 006 and check the same facts plus {@code rotate_chart_version}; then run the
+     * live replay/reversal proof.
+     */
     @Test
     void v006PreservesTheAuthenticV005UpgradeWhileAddingGovernedRotation()
         throws Exception {
@@ -159,6 +178,11 @@ class MigrationUpgradeIT {
         }
     }
 
+    /**
+     * V005 adds {@code posting_dimensions_string_values_check} as a CHECK, which PostgreSQL
+     * validates against existing rows, so a V004 posting with a non-string dimension fails the
+     * upgrade itself rather than surviving as a fact the typed V2 hasher cannot reproduce.
+     */
     @Test
     void v005RejectsLegacyDimensionsThatCannotRoundTripAsTypedStringFacts()
         throws Exception {
@@ -182,6 +206,15 @@ class MigrationUpgradeIT {
         }
     }
 
+    /**
+     * Runs the real posting/reversal stack against the upgraded schema. Sequence: close the V004
+     * period, advance the book policy and open a new period; replay the V004 journal and the
+     * legacy reversal from typed V2 request hashes and expect the stored V004 hashes back; expect
+     * {@link IdempotencyConflictException} for changed amounts, a changed chart and a changed
+     * reason; book a new exact reversal into the open period; retire the original chart and
+     * expect the legacy replay to still return its stored result; finally check the new command
+     * carries {@code TYPED_V2/V2} and its postings negate the original line for line.
+     */
     private static void proveMigratedReplayAndReversal(PostgreSQLContainer postgres)
         throws SQLException {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
@@ -197,6 +230,8 @@ class MigrationUpgradeIT {
         var reversalService = new ReversalService(dataSource, postingService);
 
         try (Connection connection = dataSource.getConnection()) {
+            // Governance changes first: a same-content replay must return the stored result
+            // before the closed period or new policy version is ever validated (ACC-32).
             execute(connection, """
                 UPDATE funds.accounting_period SET status = 'CLOSED' WHERE period_id = ?
                 """, uuid(4));
@@ -265,6 +300,7 @@ class MigrationUpgradeIT {
         var correction = reversalService.reverse(request);
 
         try (Connection connection = dataSource.getConnection()) {
+            // Retiring the chart the history was booked under must not break its replay.
             execute(connection, """
                 UPDATE funds.chart_version
                 SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-02-11 00:00:00+00'
@@ -320,6 +356,13 @@ class MigrationUpgradeIT {
             .load();
     }
 
+    /**
+     * Writes V004-shaped rows by raw SQL because the current Java stack can only produce V2 rows:
+     * journals carry no chart version or scheme tag (V005 backfills both), canonical hashes come
+     * from {@link CanonicalJournalHasher#v004Sha256}, and command request hashes are opaque. One
+     * transfer plus one already-reversed transfer give the upgrade proof both a replayable
+     * original and a replayable legacy reversal; balances and projections are seeded to match.
+     */
     private static void seedV004History(Connection connection) throws SQLException {
         connection.setAutoCommit(false);
         try {

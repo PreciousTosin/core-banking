@@ -6,6 +6,13 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 
+/**
+ * ACC-29 Java fixture prerequisites: integer money with checked arithmetic, canonical
+ * currency codes, natural-balance sign rendering, and required-field presence on the
+ * reference-data records (Book, LedgerAccount, ProductDefinition, ProductVersion). Catches a
+ * regression that lets an amount wrap or saturate instead of failing with
+ * MonetaryOverflowException, or that lets reference data be built with a missing field.
+ */
 class MoneyTest {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
 
@@ -32,6 +39,8 @@ class MoneyTest {
         assertThrows(IllegalArgumentException.class, () -> CurrencyCode.of("NAIRA"));
     }
 
+    // Positive signed units are debits, so a credit-normal account renders -10_000 as +10_000 owed
+    // (README "Reading the accounting model"); negating Long.MIN_VALUE must fail, not wrap.
     @Test void rendersDebitAndCreditNormalBalances() {
         assertEquals(10_000, NormalBalance.DEBIT.toNatural(10_000));
         assertEquals(10_000, NormalBalance.CREDIT.toNatural(-10_000));

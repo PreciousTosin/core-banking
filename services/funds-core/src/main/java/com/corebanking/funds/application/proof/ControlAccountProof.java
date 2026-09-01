@@ -4,6 +4,14 @@ import com.corebanking.funds.domain.CurrencyCode;
 import java.math.BigInteger;
 import java.util.Objects;
 
+/**
+ * Outcome of one control-account proof. sourceTotal is recomputed from postings through the
+ * chart mapping in force for each journal; projectionTotal is the materialised
+ * control_account_projection row; a non-zero difference means the projection total is
+ * corrupted (a lagging projection is rejected by the repository before a proof is built). The
+ * record guarantees only the arithmetic identity, not that the difference is zero; deciding
+ * that is the caller's job.
+ */
 public record ControlAccountProof(
     String controlCode,
     CurrencyCode currency,

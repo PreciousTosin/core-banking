@@ -7,6 +7,15 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Supplier;
 
+/**
+ * Re-runs a whole posting transaction after a serialization failure (40001) or deadlock
+ * (40P01), the only SQLSTATEs SqlState.isRetryable accepts. Both abort the transaction with
+ * nothing persisted, and the idempotency row makes a repeat safe, so the operation handed to
+ * execute() is the complete unit: connection, deadlines, replay check, post and commit. Lock
+ * and statement deadlines (LedgerTimeoutException) and every other failure surface at once.
+ * At most five attempts; between attempts a random pause of 1 to 2^attempt milliseconds
+ * (capped at 32 ms) de-synchronises the contenders that just collided.
+ */
 @ApplicationScoped
 public class PostgresRetryPolicy {
     private static final int MAX_ATTEMPTS = 5;
@@ -41,6 +50,7 @@ public class PostgresRetryPolicy {
         throw new IllegalStateException("retry loop exhausted without a result");
     }
 
+    /** Pause taken after a retryable failed attempt; tests inject a no-op to stay deterministic. */
     @FunctionalInterface
     public interface RetryJitter {
         void pause(UUID commandId, int failedAttempt);

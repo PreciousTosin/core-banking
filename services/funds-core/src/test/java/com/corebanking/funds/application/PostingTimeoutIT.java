@@ -29,6 +29,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the ACC-25 transaction-local deadlines: the 1s lock, 3s statement and 5s
+ * idle-in-transaction timeouts are set on the posting connection before any financial work,
+ * and a blocked row lock or a cancelled statement surfaces as a typed
+ * {@link LedgerTimeoutException} that {@link PostgresRetryPolicy} never retries. Runs on the
+ * Quarkus dev-services PostgreSQL container (Testcontainers) over the TestPostingStack
+ * fixture graph. Catches a posting path that would hang on a contended account row, or a
+ * retry policy quietly widened to cover timeouts.
+ */
 @QuarkusTest
 class PostingTimeoutIT {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
@@ -36,6 +45,8 @@ class PostingTimeoutIT {
     @Inject
     DataSource dataSource;
 
+    // Bound from funds.posting.* in the main application.properties; the test profile does not
+    // override them, so this is the production 1s/3s/5s configuration.
     @Inject
     PostingTransactionTimeouts configuredTimeouts;
 
@@ -63,6 +74,10 @@ class PostingTimeoutIT {
         }
     }
 
+    // Sequence: a holder connection takes PROVIDER_ASSET FOR UPDATE and never commits; a service
+    // with a 250ms lock timeout then posts against that account. Asserts SQLSTATE 55P03 in the
+    // cause chain, zero retry pauses, an elapsed time bounded by the lock timeout rather than the
+    // statement timeout, and no command, journal, posting or outbox row left behind.
     @Test
     void blockedAccountLockHasATypedFiniteOutcomeAndIsNotRetried() throws SQLException {
         var retryPauses = new AtomicInteger();
@@ -98,6 +113,8 @@ class PostingTimeoutIT {
         }
     }
 
+    // pg_sleep(1) against a 150ms statement_timeout exercises the 57014 (query_canceled) mapping
+    // directly, without a posting, so the SqlState classification is tested on its own.
     @Test
     void statementDeadlineMapsToTheSameTypedNonRetryableOutcome() throws SQLException {
         var timeouts = new PostingTransactionTimeouts(
@@ -137,6 +154,10 @@ class PostingTimeoutIT {
         return new PostingCommand(commandId, new CanonicalCommandHasher().postingV2(draft), draft);
     }
 
+    /**
+     * Direct SQL that bypasses the service: holds the ledger_account row FOR UPDATE on a
+     * connection that never commits, so the service's own account lock must time out.
+     */
     private static void lockAccount(Connection connection, UUID accountId) throws SQLException {
         try (var statement = connection.prepareStatement("""
             SELECT account_id FROM funds.ledger_account WHERE account_id = ? FOR UPDATE

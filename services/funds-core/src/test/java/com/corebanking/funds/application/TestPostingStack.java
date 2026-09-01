@@ -8,6 +8,14 @@ import java.util.Objects;
 import java.util.UUID;
 import javax.sql.DataSource;
 
+/**
+ * Shared PostgreSQL fixture and wiring for the posting integration tests: a real
+ * JdbcLedgerRepository and PostingService over a caller-supplied DataSource and observer, plus one
+ * deterministic reference graph (book, active chart, open period, product, a debit-normal provider
+ * asset and a credit-normal customer liability) with pre-seeded projections. The crash-recovery
+ * child JVM (CrashPostingWorker) uses the same constants, so every identity here is fixed rather
+ * than random and both processes agree on it without exchanging state.
+ */
 final class TestPostingStack {
     static final UUID BOOK_ID = uuid(1);
     static final UUID CHART_VERSION_ID = uuid(2);
@@ -22,6 +30,10 @@ final class TestPostingStack {
     static final String CUSTOMER_CONTROL = "CUSTOMER-DEPOSITS";
     static final String INDEPENDENT_CONTROL = "INDEPENDENT-CONTROL";
 
+    // Projections start non-zero so tests assert deltas (total, sequence, version) against a known
+    // baseline instead of a fresh row. The provider control is pre-seeded to match its account; the
+    // customer control is deliberately absent so posting exercises the insert path; the independent
+    // control has no mapped account and must never move.
     static final long PROVIDER_INITIAL_TOTAL = 11_000;
     static final long PROVIDER_INITIAL_SEQUENCE = 3;
     static final long PROVIDER_INITIAL_VERSION = 3;
@@ -37,6 +49,11 @@ final class TestPostingStack {
         this.postingService = postingService;
     }
 
+    /**
+     * Wires the production posting path (validator, hasher, JDBC repository, PostingService) with
+     * the given observer injected into both repository and service. The retry policy keeps its
+     * real attempt loop but a no-op pause, so serialization retries do not sleep under test.
+     */
     static TestPostingStack create(DataSource dataSource, PostingTransactionObserver observer) {
         Objects.requireNonNull(dataSource, "dataSource");
         Objects.requireNonNull(observer, "observer");
@@ -51,6 +68,7 @@ final class TestPostingStack {
         return postingService;
     }
 
+    /** Truncates every ledger table and reinstalls the reference graph and projection baselines. */
     static void resetAndSeed(DataSource dataSource) throws SQLException {
         reset(dataSource);
         try (var connection = dataSource.getConnection()) {
@@ -59,6 +77,10 @@ final class TestPostingStack {
         }
     }
 
+    /**
+     * Empties every funds table in one statement. TRUNCATE needs a privilege V004 never grants to
+     * funds_app, so this is test-only teardown and can never be reached through the service role.
+     */
     static void reset(DataSource dataSource) throws SQLException {
         try (var connection = dataSource.getConnection()) {
             execute(connection, """
@@ -82,6 +104,8 @@ final class TestPostingStack {
         }
     }
 
+    // The chart is inserted DRAFT, both accounts are mapped, and only then is it activated: V005
+    // rejects charts created directly ACTIVE and activation requires every open account mapped.
     private static void insertReferenceGraph(Connection connection) throws SQLException {
         execute(connection, """
             INSERT INTO funds.book
@@ -199,6 +223,7 @@ final class TestPostingStack {
             INDEPENDENT_CONTROL_TOTAL);
     }
 
+    /** Runs one parameterised update; UUIDs bind via setObject so PostgreSQL sees uuid values. */
     static void execute(Connection connection, String sql, Object... values) throws SQLException {
         try (var statement = connection.prepareStatement(sql)) {
             for (int index = 0; index < values.length; index++) {
@@ -208,6 +233,7 @@ final class TestPostingStack {
         }
     }
 
+    /** Deterministic UUID from a small integer; the number is the whole identity of a fixture. */
     static UUID uuid(long value) {
         return new UUID(0, value);
     }

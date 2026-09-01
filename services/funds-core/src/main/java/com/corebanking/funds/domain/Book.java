@@ -4,6 +4,12 @@ import java.time.ZoneId;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * The accounting book a journal posts into: one legal entity, functional currency and
+ * timezone. The timezone turns a journal's booking instant into the book-local date that must
+ * fall inside its accounting period. policyVersion is the book's current accounting policy;
+ * a journal whose policyVersion differs is rejected at commit.
+ */
 public record Book(
     UUID id,
     UUID legalEntityId,

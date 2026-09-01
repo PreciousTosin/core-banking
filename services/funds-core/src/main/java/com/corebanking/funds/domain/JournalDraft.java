@@ -6,6 +6,22 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * A journal as submitted for posting, before the repository assigns sequences. Every field
+ * except the postings' accountSequence is pinned into the canonical hash
+ * (CanonicalJournalHasher); chartVersionId is the one field the V2 scheme adds over V004_V1,
+ * which is the hash-scheme boundary the README describes. Postings are hashed in canonical
+ * account/posting UUID order, so their order in this list is not significant.
+ *
+ * <p>This constructor guards presence and shape only. Balance per currency, the 256/32/8192
+ * limits, duplicate posting IDs and booking-time precision are JournalValidator's job; period,
+ * chart, policy and account governance are checked under lock at commit.
+ *
+ * <p>transactionType "REVERSAL" and a non-null reversalOfJournalId are reserved for the trusted
+ * path from ReversalService; the generic posting path rejects both. policyVersion must equal
+ * the book's current accounting policy at commit, and periodId names the period explicitly
+ * rather than being derived from the dates.
+ */
 public record JournalDraft(
     UUID journalId,
     UUID commandId,

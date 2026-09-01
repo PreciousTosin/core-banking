@@ -5,6 +5,13 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * One immutable, approved version of a product family. Customer ledger accounts bind to a
+ * version, not a definition, and the version owns the kind, finance principle, effective
+ * window, approval reference and policy hash. A later version is a new row; the
+ * product_version_immutable trigger rejects UPDATE and DELETE, so historical classification
+ * of existing accounts cannot be rewritten.
+ */
 public record ProductVersion(
     UUID id,
     ProductDefinition productDefinition,
@@ -40,6 +47,7 @@ public record ProductVersion(
         return value;
     }
 
+    // Normalised to lowercase so equal policy documents compare equal regardless of hex case.
     private static String requireSha256Hex(String value) {
         value = requireNonBlank(value, "policyJsonHash");
         if (!value.matches("[0-9a-fA-F]{64}")) {

@@ -9,6 +9,12 @@ import java.lang.reflect.RecordComponent;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
+/**
+ * ACC-38 foundation portion: the NUBAN check-digit algorithm (six-digit institution code plus
+ * nine-digit serial), per-scheme construction rules for AccountIdentifier, and the rule that an
+ * identifier is an address only and never carries money or balance. Catches a check-digit
+ * regression, an IBAN fabrication slipping through, or a balance field leaking onto the address.
+ */
 class NubanTest {
     @Test void validatesPublishedCbnAlgorithmFixture() {
         assertEquals('9', AccountIdentifier.nubanCheckDigit("000011", "000001457"));
@@ -28,6 +34,8 @@ class NubanTest {
     @Test void rejectsNonDigitsAndKeepsSyntheticFixtureValid() {
         assertFalse(AccountIdentifier.isValidNuban("05800X", "0012345672"));
         assertFalse(AccountIdentifier.isValidNuban("058000", "00123456X2"));
+        // Institution 000000 / NUBAN 0000000017 is the deterministic SIMULATOR_ONLY fixture from
+        // the README; it must stay algorithmically valid without being production-routable.
         assertTrue(AccountIdentifier.isValidNuban("000000", "0000000017"));
     }
 
@@ -48,6 +56,8 @@ class NubanTest {
         }
     }
 
+    // Every identifier built here is routed SIMULATOR_ONLY (the routing_scope CHECK value in V001),
+    // so a fixture can never be mistaken for a production-routable address.
     private static AccountIdentifier identifier(
         AccountIdentifierScheme scheme, String value, String institutionCode, UUID providerId) {
         return new AccountIdentifier(

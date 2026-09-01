@@ -49,12 +49,25 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves ACC-20, plus the reversal side of ACC-32, for ReversalService on the Quarkus
+ * dev-services PostgreSQL container (Testcontainers): an exact linked reversal of a
+ * closed-period journal into the current open period, one reversal per original, no reversal
+ * of a reversal, the current book policy on the correction, stored-result replay and
+ * stale-hash conflict before any database work, the 256-posting / 32-dimension / 8192-byte
+ * limits at their exact boundaries, and the read-only REPEATABLE READ preflight (finite query
+ * timeouts, coherent header-plus-postings read, connection restored on failure). Catches a
+ * correction that mutates or mis-negates its original, a second reversal slipping through a
+ * race, or a preflight read issued without a deadline.
+ */
 @QuarkusTest
 class ReversalServiceIT {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
     private static final UUID ORIGINAL_COMMAND_ID = TestPostingStack.uuid(200);
     private static final UUID ORIGINAL_JOURNAL_ID = TestPostingStack.uuid(201);
     private static final UUID REVERSAL_COMMAND_ID = TestPostingStack.uuid(210);
+    // February 2026 becomes the "current" period once closeOriginalAndOpenNextPeriod has closed
+    // the seeded January period; the reversal booking time and value date fall inside it.
     private static final UUID NEXT_PERIOD_ID = TestPostingStack.uuid(211);
     private static final Instant REVERSAL_BOOKING_TIME = Instant.parse("2026-02-15T09:30:00Z");
     private static final LocalDate REVERSAL_VALUE_DATE = LocalDate.of(2026, 2, 15);
@@ -78,6 +91,10 @@ class ReversalServiceIT {
         TestPostingStack.reset(dataSource);
     }
 
+    // Sequence: post Example A in January, close January and open February, reverse twice with
+    // the same request (the second call is a replay). Asserts the original row is unchanged, the
+    // reversal sits in February with reversalOfJournalId set, every line is an exact negation
+    // with the same dimensions, and every table has exactly doubled.
     @Test
     void reversesClosedPeriodJournalInCurrentPeriodWithoutChangingOriginal() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -230,6 +247,9 @@ class ReversalServiceIT {
                 TestPostingStack.BOOK_ID)));
     }
 
+    // Once REVERSAL_COMMAND_ID is COMPLETED, the command lookup decides everything: same content
+    // replays the stored result, different content conflicts, even where the changed original
+    // (a nonexistent journal, or the reversal itself) would otherwise have failed validation.
     @Test
     void completedCommandPreflightWinsBeforeInvalidOriginalLookup() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -260,6 +280,9 @@ class ReversalServiceIT {
             () -> assertEquals(before, databaseCounts()));
     }
 
+    // Every mutation keeps the baseline's typed V2 hash but changes one field, so the hash no
+    // longer describes the request. Rejection must happen in admission: no original is even
+    // posted, and the row counts are identical before and after.
     @Test
     void staleReversalHashConflictsForEveryFinancialRequestFieldWithoutDatabaseWork()
         throws SQLException {
@@ -411,6 +434,9 @@ class ReversalServiceIT {
         assertEquals(before, databaseCounts());
     }
 
+    // "é" is two bytes in UTF-8, so 256 of them are exactly the 512-byte bound that both
+    // ReversalRequest.reason and the journal narration CHECK enforce; the reason becomes the
+    // reversal's narration. One more character must be refused by the request constructor.
     @Test
     void requestRequiresLowercaseSha256AndUtf8BoundedReason() throws SQLException {
         String exactBoundary = "é".repeat(256);
@@ -440,6 +466,10 @@ class ReversalServiceIT {
                 REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, exactBoundary + "a")));
     }
 
+    // Sequence: the proxied data source pauses the preflight the moment its journal-header result
+    // set closes; a mutator then tries to append two balanced lines to the original by direct
+    // SQL and is rejected by the completed-journal guard (an SQLException is expected); the
+    // preflight resumes. The reversal must reflect exactly the two original lines.
     @Test
     void originalHeaderAndPostingsComeFromOneRepeatableReadSnapshot() throws Exception {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -476,6 +506,10 @@ class ReversalServiceIT {
                     .map(PostingSnapshot::signedMinorUnits).sorted().toList()));
     }
 
+    // The first preflight query fails with an injected 57014 (and the proxy asserts a positive
+    // setQueryTimeout preceded it). The event trail must show read-only REPEATABLE READ being
+    // set, a rollback, and readOnly/autoCommit restored before close, so a pooled connection is
+    // never returned in the preflight's configuration.
     @Test
     void everyReadHasFiniteTimeoutAndFailureRollsBackAndRestoresConnection() {
         var timeoutSet = new AtomicBoolean();
@@ -501,6 +535,8 @@ class ReversalServiceIT {
             () -> assertEquals("close", events.getLast()));
     }
 
+    // Pins the number of preflight reads (5) as well as the timeout rule, so a newly added read
+    // that forgets setQueryTimeout fails here rather than hanging in production.
     @Test
     void everyReversalReadSetsTimeoutBeforeExecution() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -519,6 +555,9 @@ class ReversalServiceIT {
             () -> assertEquals(prepared.get(), executed.get()));
     }
 
+    // An IN_PROGRESS row for the reversal command is planted by direct SQL, standing in for an
+    // owner that died before commit. A different-content request must conflict on it; the
+    // matching request must take the row over and complete it.
     @Test
     void matchingInProgressCommandContinuesButDifferentHashConflictsFirst() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -556,6 +595,9 @@ class ReversalServiceIT {
         assertEquals(before, databaseCounts());
     }
 
+    // timestamptz stores microseconds, so JournalValidator rejects any nanosecond remainder;
+    // otherwise the canonical hash computed from the request could never be recomputed from the
+    // persisted row. Both a posting and a reversal are checked at the exact microsecond.
     @Test
     void postingAndReversalHashesMatchPersistedMicrosecondBookingTimes() throws SQLException {
         Instant originalTime = Instant.parse("2026-01-15T10:00:00.123456Z");
@@ -603,6 +645,9 @@ class ReversalServiceIT {
 
     }
 
+    // 8_183 is chosen against jsonb's text form, which prints a space after the colon:
+    // {"k": "x...x"} is 7 + 8_183 + 2 = 8_192 bytes, the limit exactly. The reversal must copy
+    // that maximal dimension object without pushing it over.
     @Test
     void acceptsDimensionJsonAtExactPocByteLimit() throws SQLException {
         postDimensionFixture(Map.of("k", "x".repeat(8_183)));
@@ -657,6 +702,10 @@ class ReversalServiceIT {
         assertEquals(before, databaseCounts());
     }
 
+    // ReversalService derives reversal posting IDs as name-UUIDs of
+    // "funds-reversal:<commandId>:posting:<originalPostingId>". Posting an unrelated journal that
+    // already uses the ID the reversal will derive makes the reversal's insert fail on the
+    // primary key, an ordinary constraint that must surface as LedgerPersistenceException.
     @Test
     void unrelatedDatabaseConstraintRemainsAPersistenceFailure() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -693,6 +742,10 @@ class ReversalServiceIT {
         assertEquals(before, databaseCounts());
     }
 
+    // Two different commands reverse the same original. A barrier inside postTrustedReversal
+    // holds both until each has passed preflight (neither saw an existing reversal), so the
+    // decision falls to the database: one_reversal_per_original_idx lets exactly one commit and
+    // the loser surfaces as InvalidJournalException.
     @Test
     void concurrentDistinctCommandsCreateExactlyOneReversal() throws Exception {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
@@ -854,6 +907,7 @@ class ReversalServiceIT {
             request.valueDate(), request.reason());
     }
 
+    /** Direct SQL: closes the seeded January period and opens February as the current period. */
     private void closeOriginalAndOpenNextPeriod() throws SQLException {
         try (var connection = dataSource.getConnection()) {
             TestPostingStack.execute(connection, """
@@ -867,6 +921,11 @@ class ReversalServiceIT {
         }
     }
 
+    /**
+     * Direct SQL that bypasses the service: an IN_PROGRESS command with a journal and two
+     * postings but no completion, i.e. what an owner that died mid-transaction would leave.
+     * The service must refuse to reverse a journal whose command never completed.
+     */
     private void insertIncompleteOriginal() throws SQLException {
         try (var connection = dataSource.getConnection()) {
             connection.setAutoCommit(false);
@@ -904,6 +963,11 @@ class ReversalServiceIT {
         }
     }
 
+    /**
+     * Direct SQL that tries to forge a balanced append to a completed journal, with matching
+     * balance and projection updates so nothing but journal finality would notice. Callers
+     * expect the V003.2 posting_requires_in_progress_command guard to reject the whole batch.
+     */
     private void appendBalancedLinesToOriginal() throws SQLException {
         try (var connection = dataSource.getConnection()) {
             connection.setAutoCommit(false);
@@ -947,6 +1011,11 @@ class ReversalServiceIT {
         }
     }
 
+    /**
+     * Proxy chain that fires once: when the first result set of a "FROM funds.journal" query is
+     * closed it signals headerRead and blocks until appendCommitted, opening a window between the
+     * header read and the postings read for a concurrent writer.
+     */
     private static DataSource interleavingDataSource(
         DataSource delegate,
         CountDownLatch headerRead,
@@ -992,6 +1061,11 @@ class ReversalServiceIT {
         });
     }
 
+    /**
+     * Proxy chain that records connection-state events and turns the first executeQuery into a
+     * deterministic SQLTimeoutException (57014), failing loudly if no positive query timeout was
+     * set on that statement first.
+     */
     private static DataSource timingOutDataSource(
         DataSource delegate,
         AtomicBoolean timeoutSet,
@@ -1034,6 +1108,11 @@ class ReversalServiceIT {
         });
     }
 
+    /**
+     * Counts prepared and executed preflight reads and asserts each had a positive query timeout
+     * before execution. The set_config('lock_timeout') statement is excluded: it is the deadline
+     * setup itself, not a read.
+     */
     private static DataSource timeoutRecordingDataSource(
         DataSource delegate,
         java.util.concurrent.atomic.AtomicInteger prepared,
@@ -1096,6 +1175,11 @@ class ReversalServiceIT {
         Object invoke(java.lang.reflect.Method method, Object[] args) throws Throwable;
     }
 
+    /**
+     * Pairs lines by position (both lists are ordered by account_sequence, posting_id). The
+     * +1 on account_sequence holds because each fixture account has exactly one earlier posting,
+     * the original's; new posting and journal IDs prove the reversal is a new fact.
+     */
     private static void assertExactNegations(List<PostingSnapshot> original, List<PostingSnapshot> reversal) {
         assertEquals(original.size(), reversal.size());
         for (int index = 0; index < original.size(); index++) {
@@ -1112,6 +1196,11 @@ class ReversalServiceIT {
         }
     }
 
+    /**
+     * Order-insensitive variant for journals with many identical lines per account, where
+     * positional pairing would be arbitrary; compares (account, currency, amount, dimensions)
+     * multiplicities.
+     */
     private static void assertExactNegationMultiset(
         List<PostingSnapshot> original,
         List<PostingSnapshot> reversal
@@ -1233,6 +1322,11 @@ class ReversalServiceIT {
         }
     }
 
+    /**
+     * Placeholder digest that satisfies the request constructor's lowercase-SHA-256 check;
+     * canonical() replaces it with the real typed V2 hash, so the label carries no meaning. Only
+     * the stale-hash test keeps a hash on purpose, and it copies the canonical one.
+     */
     private static String hash(String value) {
         try {
             return java.util.HexFormat.of().formatHex(

@@ -1,3 +1,11 @@
+-- V006: governed chart rotation. Adds the owner-only funds.rotate_chart_version
+-- operation and moves the posting lock routine, the journal governance trigger
+-- and the mapping-mutation trigger onto one canonical lock order: chart rows
+-- in UUID order, then the stable book row. V005 introduced chart governance
+-- but left rotation as two lifecycle UPDATEs and took posting locks through a
+-- single join, so governance and posting could not be proven deadlock-free.
+-- Nothing here rewrites stored facts.
+
 -- V004 transferred the schema to the non-login migration owner. Every later
 -- migration executes as that role so new routines inherit fail-closed ACLs.
 SET ROLE funds_migrator;
@@ -55,6 +63,9 @@ BEGIN
 END
 $function$;
 
+-- Same checks as V005; only lock acquisition changes. Delegating to
+-- lock_book_chart_for_posting means a direct journal INSERT takes chart then
+-- book exactly as the service and rotate_chart_version do.
 CREATE OR REPLACE FUNCTION funds.enforce_journal_governance()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -204,6 +215,10 @@ $function$;
 -- Operational rotation is one statement. It locks both lifecycle rows in
 -- canonical UUID order before the stable book row, revalidates all facts under
 -- those locks, and changes both statuses atomically.
+-- Deliberately SECURITY INVOKER (the default): the caller must itself hold
+-- UPDATE on chart_version, which only the owner funds_migrator does. A definer
+-- routine would let one stray EXECUTE grant hand rotation to funds_app; the
+-- REVOKE below withdraws EXECUTE as well, so the runtime cannot even call it.
 CREATE FUNCTION funds.rotate_chart_version(
     p_book_id uuid,
     p_current_chart_version_id uuid,
@@ -286,6 +301,10 @@ BEGIN
     FROM funds.chart_version chart
     WHERE chart.chart_version_id = p_candidate_chart_version_id;
 
+    -- Revalidated under the locks, never trusted from the caller: same book,
+    -- ACTIVE current, DRAFT candidate, version strictly advancing, and an
+    -- effective time no earlier than the current activation and not in the
+    -- future.
     IF current_book_id IS DISTINCT FROM p_book_id
        OR candidate_book_id IS DISTINCT FROM p_book_id THEN
         RAISE EXCEPTION 'both chart versions must belong to the governed book'
@@ -320,6 +339,10 @@ BEGIN
 
     -- Chart validity is half-open [activated_at, retired_at). A retroactive
     -- boundary must not make an already accepted journal historically invalid.
+    -- A journal booked exactly at p_effective_at belongs to the candidate, so
+    -- any current-chart journal with booking_time >= the boundary would fall
+    -- outside its own chart's window; >= here is what makes the interval
+    -- half-open rather than closed.
     IF EXISTS (
         SELECT 1
         FROM funds.journal journal
@@ -332,6 +355,9 @@ BEGIN
                   CONSTRAINT = 'chart_rotation_historical_cutoff';
     END IF;
 
+    -- Same completeness rule as the V005 activation trigger, evaluated here
+    -- under the book lock so no account can be opened between check and
+    -- activation.
     IF EXISTS (
         SELECT 1
         FROM funds.ledger_account account
@@ -351,6 +377,8 @@ BEGIN
                   CONSTRAINT = 'chart_mapping_incomplete';
     END IF;
 
+    -- Retire first, then activate: one_active_chart_per_book_idx is checked per
+    -- row, and both UPDATEs still pass the V005 forward-transition trigger.
     UPDATE funds.chart_version
     SET status = 'RETIRED', retired_at = p_effective_at
     WHERE chart_version_id = p_current_chart_version_id;

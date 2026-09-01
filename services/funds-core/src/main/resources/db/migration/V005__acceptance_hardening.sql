@@ -1,3 +1,14 @@
+-- V005: acceptance hardening. Additive upgrade of a V004 database: tags every
+-- stored hash with the scheme that wrote it (V004_OPAQUE / V004_V1 legacy,
+-- TYPED_V2 / V2 current), binds completed idempotency results to their own
+-- journal, moves product classification onto immutable product versions,
+-- introduces governed chart lifecycle plus per-chart
+-- ledger_account_chart_mapping, pins each journal to one chart, adds the
+-- reversibility envelope (2..256 lines, 32 dimensions, 8192 bytes, no
+-- Long.MIN_VALUE) and narrows proof-reader grants to exact columns. Every DO
+-- block validates existing V004 facts and fails the upgrade rather than
+-- rewriting them. V006 later reworks the lock order introduced here.
+
 -- V004 transferred the schema to the non-login migration owner. Every later
 -- migration must execute as that role so ownership and its default privileges
 -- remain fail-closed even when Flyway connects through a bootstrap superuser.
@@ -39,6 +50,9 @@ BEGIN
 END
 $validate_completed_command_results$;
 
+-- Composite link: a completed command may reference only the journal that
+-- names it back. Deferred because completion and journal insert commit in one
+-- transaction in either order.
 ALTER TABLE funds.journal
     ADD CONSTRAINT journal_command_link_identity_key
         UNIQUE (journal_id, command_id);
@@ -48,6 +62,8 @@ ALTER TABLE funds.idempotency_command
         REFERENCES funds.journal(journal_id, command_id)
         DEFERRABLE INITIALLY DEFERRED;
 
+-- result_json must restate its journal's id, sequence and canonical hash, so a
+-- replay served from the cached result can never describe a different journal.
 CREATE FUNCTION funds.enforce_completed_command_result()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -78,6 +94,7 @@ EXECUTE FUNCTION funds.enforce_completed_command_result();
 
 -- Product definitions are stable commercial families. Classification belongs
 -- to the immutable terms version to which a customer account is bound.
+-- Immutability is lifted only for the one-time backfill and restored below.
 DROP TRIGGER product_version_immutable ON funds.product_version;
 
 ALTER TABLE funds.product_version
@@ -119,6 +136,8 @@ BEFORE UPDATE OR DELETE ON funds.product_version
 FOR EACH ROW
 EXECUTE FUNCTION funds.reject_product_version_mutation();
 
+-- Families are stable keys; renaming or deleting one would orphan its versions
+-- and the accounts bound to them.
 CREATE FUNCTION funds.reject_product_definition_identity_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -137,6 +156,9 @@ FOR EACH ROW
 EXECUTE FUNCTION funds.reject_product_definition_identity_mutation();
 
 -- Govern chart activation and retain an approved, bounded validity history.
+-- The book revision is a write, not a read: every governance path bumps it so
+-- concurrent activation, mapping and onboarding transactions conflict on one
+-- row instead of racing on a predicate.
 ALTER TABLE funds.book
     ADD COLUMN chart_governance_revision bigint NOT NULL DEFAULT 0,
     ADD CONSTRAINT book_chart_governance_revision_check
@@ -153,6 +175,8 @@ SET approval_reference = 'MIGRATED-V005-' || version::text;
 ALTER TABLE funds.chart_version
     ALTER COLUMN approval_reference SET NOT NULL,
     ADD CONSTRAINT chart_governance_revision_check CHECK (governance_revision >= 0),
+    -- Status and timestamps move together: DRAFT has neither, ACTIVE only
+    -- activated_at, RETIRED both with a non-negative validity window.
     ADD CONSTRAINT chart_activation_fields_check CHECK (
         (status = 'DRAFT' AND activated_at IS NULL AND retired_at IS NULL)
         OR (status = 'ACTIVE' AND activated_at IS NOT NULL AND retired_at IS NULL)
@@ -160,10 +184,15 @@ ALTER TABLE funds.chart_version
             AND retired_at >= activated_at)
     );
 
+-- One ACTIVE chart per book. Rotation (V006) retires before it activates so
+-- this is never violated mid-rotation.
 CREATE UNIQUE INDEX one_active_chart_per_book_idx
     ON funds.chart_version (book_id)
     WHERE status = 'ACTIVE';
 
+-- Forward-only lifecycle DRAFT -> ACTIVE -> RETIRED with immutable identity and
+-- approval facts; activation additionally requires a mapping for every OPEN
+-- account so a frozen chart is never incomplete.
 CREATE FUNCTION funds.enforce_chart_version_transition()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -240,6 +269,8 @@ BEFORE UPDATE OR DELETE ON funds.chart_version
 FOR EACH ROW
 EXECUTE FUNCTION funds.enforce_chart_version_transition();
 
+-- Direct ACTIVE creation is rejected: every chart earns activation through the
+-- completeness check above. Inserting also bumps the book revision.
 CREATE FUNCTION funds.require_new_chart_version_draft()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -267,11 +298,17 @@ FOR EACH ROW
 EXECUTE FUNCTION funds.require_new_chart_version_draft();
 
 -- Stable ledger identity is separated from its versioned chart classification.
+-- The composite keys let a mapping reference the account together with its
+-- book and immutable currency, which is what rules out cross-currency
+-- classification by foreign key alone.
 ALTER TABLE funds.ledger_account
     ADD CONSTRAINT ledger_account_book_identity_key UNIQUE (account_id, book_id),
     ADD CONSTRAINT ledger_account_book_currency_identity_key
         UNIQUE (account_id, book_id, currency);
 
+-- Per-chart classification of a stable account. currency_policy is fixed to
+-- ACCOUNT_CURRENCY in this slice; permitted_direction restricts the sign a
+-- line may carry under this chart.
 CREATE TABLE funds.ledger_account_chart_mapping (
     account_id uuid NOT NULL,
     book_id uuid NOT NULL,
@@ -295,6 +332,8 @@ CREATE TABLE funds.ledger_account_chart_mapping (
         REFERENCES funds.chart_version(book_id, chart_version_id)
 );
 
+-- Seed each existing account's classification into its current chart before
+-- those columns are dropped from ledger_account below.
 INSERT INTO funds.ledger_account_chart_mapping (
     account_id, book_id, chart_version_id, account_code, account_currency, account_class,
     normal_balance, control_account_code, account_role
@@ -303,6 +342,8 @@ SELECT account_id, book_id, chart_version_id, account_code, currency, account_cl
        normal_balance, control_account_code, account_scope
 FROM funds.ledger_account;
 
+-- Mappings are editable only while their chart is DRAFT; once ACTIVE or
+-- RETIRED the classification history is frozen. Lock order is reworked in V006.
 CREATE FUNCTION funds.reject_chart_mapping_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -425,6 +466,8 @@ BEFORE INSERT OR UPDATE OF status ON funds.ledger_account
 FOR EACH ROW
 EXECUTE FUNCTION funds.reject_ungoverned_active_chart_account_onboarding();
 
+-- Chart and control code now live on the mapping, so only book and currency
+-- remain part of account identity (narrows V003.1).
 DROP TRIGGER ledger_account_identity_immutable ON funds.ledger_account;
 CREATE OR REPLACE FUNCTION funds.enforce_ledger_account_identity_immutability()
 RETURNS trigger
@@ -446,6 +489,7 @@ BEFORE UPDATE ON funds.ledger_account
 FOR EACH ROW
 EXECUTE FUNCTION funds.enforce_ledger_account_identity_immutability();
 
+-- From here the mapping table is the only source of classification.
 ALTER TABLE funds.ledger_account
     DROP COLUMN chart_version_id,
     DROP COLUMN account_code,
@@ -454,9 +498,13 @@ ALTER TABLE funds.ledger_account
     DROP COLUMN control_account_code;
 
 -- Every journal pins the one governed chart used to resolve all of its lines.
+-- Immutability is lifted only for the backfill and restored below.
 DROP TRIGGER journal_immutable ON funds.journal;
 ALTER TABLE funds.journal ADD COLUMN chart_version_id uuid;
 
+-- Each historical journal must resolve to exactly one chart through its lines;
+-- a journal that mixes chart versions aborts the upgrade. A journal with no
+-- mapped lines falls back to the book's ACTIVE chart.
 DO $backfill_journal_chart$
 BEGIN
     IF EXISTS (
@@ -494,9 +542,13 @@ SET CONSTRAINTS ALL IMMEDIATE;
 
 ALTER TABLE funds.journal
     ALTER COLUMN chart_version_id SET NOT NULL,
+    -- The pinned chart must belong to the journal's own book.
     ADD CONSTRAINT journal_chart_book_fk
         FOREIGN KEY (book_id, chart_version_id)
         REFERENCES funds.chart_version(book_id, chart_version_id),
+    -- REVERSAL type and reversal link imply each other, and a journal cannot
+    -- reverse itself. PostingService rejects reversal metadata on the generic
+    -- path; this makes the same rule hold for direct DML.
     ADD CONSTRAINT journal_reversal_linkage_check CHECK (
         (reversal_of_journal_id IS NULL AND transaction_type <> 'REVERSAL')
         OR (reversal_of_journal_id IS NOT NULL AND transaction_type = 'REVERSAL'
@@ -508,11 +560,19 @@ BEFORE UPDATE OR DELETE ON funds.journal
 FOR EACH ROW
 EXECUTE FUNCTION funds.reject_ledger_mutation();
 
+-- Widened from V003.2: the linkage CHECK now guarantees a link implies
+-- REVERSAL, so the predicate no longer needs the type. Same name, so
+-- ReversalService.SINGLE_REVERSAL_CONSTRAINT keeps mapping the violation.
 DROP INDEX funds.one_reversal_per_original_idx;
 CREATE UNIQUE INDEX one_reversal_per_original_idx
     ON funds.journal (reversal_of_journal_id)
     WHERE reversal_of_journal_id IS NOT NULL;
 
+-- Commit-side governance for every journal insert, independent of the service
+-- (ACC-01): chart belongs to the book and is ACTIVE at booking time, policy is
+-- current, the period is the book's, OPEN, and contains both the book-local
+-- booking date and the value date. Replaces V002's legal-entity-only trigger.
+-- Re-created in V006 to take its locks through lock_book_chart_for_posting.
 CREATE FUNCTION funds.enforce_journal_governance()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -650,6 +710,8 @@ BEFORE INSERT ON funds.posting
 FOR EACH ROW
 EXECUTE FUNCTION funds.enforce_posting_chart_mapping();
 
+-- Helpers for the dimension CHECKs below; IMMUTABLE so they are legal in a
+-- CHECK constraint.
 CREATE FUNCTION funds.jsonb_object_size(value jsonb)
 RETURNS integer
 LANGUAGE sql
@@ -661,6 +723,8 @@ AS $function$
     SELECT count(*)::integer FROM pg_catalog.jsonb_object_keys(value)
 $function$;
 
+-- Dimensions are a flat string-to-string map (PostingLine's Map<String,String>);
+-- nested or typed values would not survive the canonical hash encoding.
 CREATE FUNCTION funds.jsonb_object_values_are_strings(value jsonb)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -681,6 +745,10 @@ BEGIN
 END
 $function$;
 
+-- Database mirror of the Java admission rules (ACC-20): Long.MIN_VALUE is
+-- rejected by PostingLine because its negation overflows and a reversal must
+-- be exact; 32 dimensions and 8192 JSON bytes are
+-- JournalValidator.MAX_DIMENSIONS_PER_POSTING and MAX_DIMENSION_JSON_BYTES.
 ALTER TABLE funds.posting
     ADD CONSTRAINT posting_reversible_amount_check
         CHECK (signed_minor_units <> '-9223372036854775808'::bigint),
@@ -753,6 +821,10 @@ BEGIN
 END
 $validate_historical_reversibility$;
 
+-- Commit-time reversibility envelope: 2..256 lines per journal (upper bound is
+-- JournalValidator.MAX_POSTINGS_PER_JOURNAL), a linked reversal is an exact
+-- line-by-line negation of its original (EXCEPT ALL in both directions catches
+-- missing and extra lines alike), and a reversal cannot itself be reversed.
 CREATE FUNCTION funds.enforce_journal_reversibility()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -831,6 +903,8 @@ BEGIN
 END
 $function$;
 
+-- Deferred on both tables, like V003's balance check, so the run at commit
+-- sees the complete set of lines.
 CREATE CONSTRAINT TRIGGER journal_reversibility_deferred
 AFTER INSERT OR UPDATE OR DELETE ON funds.journal
 DEFERRABLE INITIALLY DEFERRED
@@ -867,6 +941,9 @@ AS $function$
     FOR SHARE OF book, chart
 $function$;
 
+-- Exclusive account lock (balance update) plus shared mapping lock
+-- (classification), resolved through the journal's pinned chart. Callers lock
+-- accounts in canonical UUID-string order.
 CREATE FUNCTION funds.lock_account_mapping_for_posting(
     p_account_id uuid,
     p_chart_version_id uuid
@@ -909,6 +986,8 @@ GRANT SELECT (book_id, control_account_code, currency, signed_posting_total,
               latest_journal_sequence)
     ON funds.control_account_projection TO funds_proof_reader;
 
+-- New V005 objects and columns the kernel touches. The V004 lock routines are
+-- dropped so no posting path can bypass the chart pin.
 GRANT SELECT ON funds.chart_version, funds.ledger_account_chart_mapping TO funds_app;
 GRANT INSERT (request_hash_scheme) ON funds.idempotency_command TO funds_app;
 GRANT INSERT (chart_version_id, canonical_hash_scheme) ON funds.journal TO funds_app;
@@ -919,6 +998,8 @@ GRANT EXECUTE ON FUNCTION funds.jsonb_object_values_are_strings(jsonb) TO funds_
 DROP FUNCTION funds.lock_book_for_posting(uuid);
 DROP FUNCTION funds.lock_account_for_posting(uuid);
 
+-- Defaults advance only now, after every existing row has been tagged with the
+-- legacy scheme it was written under.
 ALTER TABLE funds.idempotency_command
     ALTER COLUMN request_hash_scheme SET DEFAULT 'TYPED_V2';
 ALTER TABLE funds.journal

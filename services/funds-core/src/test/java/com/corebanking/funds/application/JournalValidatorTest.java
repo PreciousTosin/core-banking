@@ -24,6 +24,14 @@ import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the pre-database journal contract: ACC-01 (unbalanced and mixed-currency journals
+ * reject), ACC-20 (the 256/32/8192 posting, dimension and dimension-byte limits and the
+ * reversible signed-amount domain) and the ACC-29 canonical-hash prerequisites (every financial
+ * field changes the hash; V004_V1 and V2 golden bytes stay fixed). Catches a validator that lets an
+ * out-of-envelope journal reach PostgreSQL, or a hasher change that would silently invalidate every
+ * stored canonical hash.
+ */
 class JournalValidatorTest {
     private static final UUID JOURNAL_ID = uuid(1);
     private static final UUID COMMAND_ID = uuid(2);
@@ -89,6 +97,11 @@ class JournalValidatorTest {
         assertEquals(hasher.sha256(fixtureJournal(a, b)), hasher.sha256(fixtureJournal(b, a)));
     }
 
+    /**
+     * Golden hash: the V004 verifier must keep reproducing hashes already persisted under the
+     * V004_V1 scheme tag, so it must ignore the chart field that V2 pins. A changed constant
+     * here is a scheme break, not a value to update.
+     */
     @Test
     void v004VerifierRetainsItsGoldenBytesAndDoesNotPinTheLaterChartField() {
         JournalDraft original = fixtureJournal(
@@ -154,6 +167,8 @@ class JournalValidatorTest {
             () -> line(POSTING_A, ASSET_ACCOUNT, "NGN", Long.MIN_VALUE));
     }
 
+    // The three limits are mirrored by database CHECK constraints (ACC-20); this proves the
+    // validator alone rejects input beyond each limit, before the repository is reached.
     @Test
     void rejectsJournalAndDimensionInputsBeyondTheReversalEnvelope() {
         var tooManyPostings = new ArrayList<PostingLine>();
@@ -406,6 +421,7 @@ class JournalValidatorTest {
         return new PostingLine(postingId, accountId, CurrencyCode.of(currency), amount, 0, dimensions);
     }
 
+    // Fixed UUIDs keep the golden hashes above reproducible; a random UUID would change them.
     private static UUID uuid(long value) {
         return new UUID(0, value);
     }

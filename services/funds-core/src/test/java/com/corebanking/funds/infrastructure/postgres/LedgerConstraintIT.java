@@ -23,6 +23,33 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.postgresql.util.PSQLException;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the ledger's database-level invariants directly with SQL on the migrated Quarkus test
+ * datasource, bypassing {@code PostingService} and {@code JdbcLedgerRepository}, so a regressed
+ * trigger or CHECK is caught even when the Java path still behaves. Covers ACC-01 (per-currency
+ * balance and reference consistency at commit) and ACC-24 (a {@code funds_app} session cannot
+ * mutate, disable triggers, redefine functions or escalate; an actual {@code funds_proof_reader}
+ * session reads only proof columns), plus journal, posting and completed-command immutability.
+ * Grouped by mechanism:
+ * <ul>
+ *   <li>{@code journal_balance_deferred} / {@code posting_balance_deferred} (V003): balance is
+ *       checked per currency at COMMIT, mirroring {@code JournalValidator};</li>
+ *   <li>{@code posting_reference_consistency} (V002) and {@code journal_governance} (V005/V006,
+ *       which replaced V002's {@code journal_reference_consistency}): 23514 at row insert for
+ *       currency, book or legal-entity mismatch;</li>
+ *   <li>{@code book_identity_immutable} (V003.1), {@code ledger_account_identity_immutable}
+ *       (V003.1, narrowed by V005) and {@code ledger_account_chart_mapping_frozen} (V005/V006):
+ *       55000 for any
+ *       identity or classification change, while operational status changes stay allowed;</li>
+ *   <li>{@code journal_immutable} / {@code posting_immutable} ({@code reject_ledger_mutation},
+ *       V003) and {@code posting_requires_in_progress_command} (V003.2): no update, delete or
+ *       late append once a command is COMPLETED, including across concurrent sessions;</li>
+ *   <li>{@code completed_idempotency_immutable} (V004): even the owner role cannot rewrite or
+ *       delete a stored result.</li>
+ * </ul>
+ * Most tests run in a transaction that is rolled back; those needing a committed baseline or a
+ * second session truncate every funds table before and after.
+ */
 @QuarkusTest
 class LedgerConstraintIT {
     private static final UUID BOOK_ID = uuid(1);
@@ -50,6 +77,8 @@ class LedgerConstraintIT {
     @Inject
     AgroalDataSource dataSource;
 
+    // +100 NGN and -100 USD net to zero overall but not per currency. Both inserts succeed because
+    // the balance trigger is a DEFERRED constraint trigger; only COMMIT raises 23514.
     @Test
     void rejectsCrossCurrencyNetZeroJournalAtCommitAfterBothPostingInsertsSucceed() throws Exception {
         inRollbackTransaction(connection -> {
@@ -218,6 +247,14 @@ class LedgerConstraintIT {
             uuid(399), JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 1, 2)));
     }
 
+    /**
+     * Sequence: the creator session writes a journal and marks its command COMPLETED without
+     * committing; a second session tries to append balanced postings to that journal. The
+     * finality trigger's lookup cannot see the uncommitted journal, so it must fail with
+     * {@code posting_requires_in_progress_command} (either immediately or after waiting on the
+     * creator's lock) instead of passing the guard and appending to a journal that is completed
+     * by the time the append commits.
+     */
     @Test
     void rejectsAppendWhoseCompletedJournalWasUncommittedAtTriggerLookup() throws Exception {
         truncateAllTables();
@@ -276,6 +313,12 @@ class LedgerConstraintIT {
         }
     }
 
+    /**
+     * Sequence: a committed IN_PROGRESS journal exists; session A inserts more postings, whose
+     * finality trigger takes {@code FOR UPDATE} on the command row and holds it; session B's
+     * completion UPDATE must block on that row (observed in pg_stat_activity) until A commits,
+     * then succeed. Completion can therefore never overtake in-flight assembly.
+     */
     @Test
     void visibleInProgressAssemblySerializesBeforeCompletion() throws Exception {
         truncateAllTables();
@@ -453,6 +496,16 @@ class LedgerConstraintIT {
         }
     }
 
+    /**
+     * ACC-24 in one session. Sequence: as {@code funds_app}, perform the complete legitimate
+     * posting write set (command, journal, postings, balances, projection, outbox, completion) to
+     * prove the grants suffice; still as {@code funds_app}, every bypass is 42501 (sequence
+     * setval/read, outbox publish columns, journal/posting UPDATE/DELETE, DISABLE TRIGGER, DDL,
+     * redefining the guard function, closing a period, SET ROLE to the owner) while rewriting a
+     * completed result is 55000 from the trigger; as {@code funds_migrator}, the owner is still
+     * blocked from touching completed results but may delete an IN_PROGRESS row; as an actual
+     * {@code funds_proof_reader} session, only the proof columns are readable.
+     */
     @Test
     void applicationRoleCannotBypassLedgerControls() throws Exception {
         truncateAllTables();
@@ -523,6 +576,9 @@ class LedgerConstraintIT {
                     WHERE command_id = '%s' AND state = 'IN_PROGRESS'
                     """.formatted(
                         JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
+                // The deferred balance and reversibility constraint triggers and the deferred
+                // command-journal link FK would otherwise run only at a commit this rolled-back
+                // test never performs.
                 execute(connection, "SET CONSTRAINTS ALL IMMEDIATE");
 
                 long allocatedSequence = queryLong(connection,
@@ -587,6 +643,8 @@ class LedgerConstraintIT {
                         'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')::integer
                     """));
 
+                // SET ROLE alone proves nothing here: the test login may assume any role. Only
+                // a session actually authorised as funds_app shows the escalation is denied.
                 execute(connection, "RESET ROLE");
                 execute(connection, "SET SESSION AUTHORIZATION funds_app");
                 assertSqlState(connection, "42501", "SET ROLE funds_migrator");
@@ -664,6 +722,8 @@ class LedgerConstraintIT {
         }
     }
 
+    // Commits a balanced journal whose command is still IN_PROGRESS, then runs the mutation in a
+    // rolled-back transaction so the immutability triggers are exercised against committed rows.
     private void withCommittedJournal(SqlConsumer mutation) throws Exception {
         truncateAllTables();
         try {
@@ -683,6 +743,7 @@ class LedgerConstraintIT {
         }
     }
 
+    // Same as withCommittedJournal but the command is COMPLETED, so the finality guard applies.
     private void withFinalizedJournal(SqlConsumer mutation) throws Exception {
         truncateAllTables();
         try {
@@ -768,6 +829,8 @@ class LedgerConstraintIT {
         }
     }
 
+    // Synchronises on the real database state instead of a sleep: returns once the appender has
+    // finished (immediate rejection) or its backend shows a Lock wait in pg_stat_activity.
     private void awaitAppendAtConstraintBoundary(AtomicInteger backendPid, Future<?> append)
         throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -791,6 +854,8 @@ class LedgerConstraintIT {
         throw new AssertionError("append neither rejected nor blocked at its foreign-key boundary");
     }
 
+    // Unlike awaitAppendAtConstraintBoundary, finishing early is a failure: the operation must
+    // have blocked on the command row.
     private void awaitBackendLock(AtomicInteger backendPid, Future<?> operation) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
@@ -813,6 +878,8 @@ class LedgerConstraintIT {
         throw new AssertionError("operation did not block on command-row serialization");
     }
 
+    // Chart inserted DRAFT, accounts mapped, then activated: V005 requires a mapping for every
+    // open account before activation and rejects ungoverned onboarding onto an ACTIVE chart.
     private static void insertReferenceGraph(Connection connection) throws SQLException {
         execute(connection, """
             INSERT INTO funds.book
@@ -949,6 +1016,8 @@ class LedgerConstraintIT {
             """.formatted(commandId, requestHash, state, journalValue, resultValue, completedValue);
     }
 
+    // canonical_hash reuses REQUEST_HASH so a COMPLETED result built from the same constant
+    // satisfies completed_command_result_consistency (V005); the value itself is arbitrary.
     private static String journalInsert(
         UUID journalId,
         UUID commandId,
@@ -1042,6 +1111,8 @@ class LedgerConstraintIT {
         }
     }
 
+    // The savepoint keeps one expected failure from aborting the enclosing transaction, so a test
+    // can probe several rejections in sequence.
     private static void assertSqlState(Connection connection, String expectedSqlState, String sql)
         throws SQLException {
         Savepoint beforeViolation = connection.setSavepoint();

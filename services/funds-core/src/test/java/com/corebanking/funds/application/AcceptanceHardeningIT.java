@@ -32,6 +32,19 @@ import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.postgresql.util.PSQLException;
 
+/**
+ * Database-boundary evidence for ACC-01, ACC-20, ACC-40 and ACC-42 on the Quarkus
+ * dev-services PostgreSQL container (Testcontainers). Guards the service already enforces are
+ * exercised again by direct SQL that bypasses PostingService, so the V005/V006 triggers and
+ * constraints must reject on their own: book-local booking and value dates, period ownership
+ * and status, current policy, effective chart, immutable product classification, current hash
+ * schemes, coherent completed-command results, exact single reversals, the 256/32/8192
+ * posting domains, the chart lifecycle (DRAFT first, complete mappings, frozen after
+ * activation) and funds.rotate_chart_version with its chart-before-book lock order under
+ * concurrent mapping DML and direct journal inserts. Catches a guard that exists only in
+ * Java, a rotation that can deadlock or activate from a stale snapshot, and any reopening of
+ * the V004 hash boundary.
+ */
 @QuarkusTest
 class AcceptanceHardeningIT {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
@@ -101,6 +114,9 @@ class AcceptanceHardeningIT {
         }
     }
 
+    // V004_OPAQUE and V004_V1 are the legacy scheme tags kept only for rows that predate V005.
+    // New command and journal rows must take the current schemes, otherwise a writer could
+    // route a new fact through the legacy verifier.
     @Test
     void newFactsCannotClaimLegacyHashSchemes() throws SQLException {
         UUID commandId = TestPostingStack.uuid(995);
@@ -132,6 +148,9 @@ class AcceptanceHardeningIT {
         }
     }
 
+    // Two incoherent completions: a different command completing against a journal it does not
+    // own, and the owning command completing with a result canonicalHash that is not the
+    // journal's. Both must fail on completed_command_result_consistency.
     @Test
     void completedCommandsMustIdentifyTheirOwnExactJournalResult() throws SQLException {
         try (var connection = dataSource.getConnection()) {
@@ -147,6 +166,9 @@ class AcceptanceHardeningIT {
         assertEquals(0, count("funds.journal"));
     }
 
+    // 2026-01-31T23:30Z is already 00:30 on 1 February in Africa/Lagos (UTC+1), the book's
+    // timezone, so the booking date is outside the January period although the UTC date is
+    // inside it. Both the service and the journal_booking_date_period guard must use book time.
     @Test
     void serviceAndDatabaseUseTheLagosBookingDateForTheSelectedOpenPeriod() throws SQLException {
         PostingCommand outsideAtLagosMidnight = command(
@@ -242,6 +264,10 @@ class AcceptanceHardeningIT {
         assertEquals(0, count("funds.journal"));
     }
 
+    // Sequence: post under chart 1; create a DRAFT chart 2 with copied mappings; a direct
+    // activation must fail on one_active_chart_per_book_idx, so rotation is the only path; after
+    // rotation every insert/update/delete on chart 2's mappings is frozen; a new post lands on
+    // chart 2 while the historical journal still resolves its classification through chart 1.
     @Test
     void chartRotationPinsHistoricalJournalsAndRequiresOneMappingVersion() throws SQLException {
         PostingResult historical = postingService.post(command(
@@ -322,6 +348,10 @@ class AcceptanceHardeningIT {
             """, historical.journalId(), TestPostingStack.CUSTOMER_LIABILITY));
     }
 
+    // Sequence: creating an OPEN account after activation is deferred in this PoC and rejected;
+    // a chart inserted directly as ACTIVE is rejected; rotating to a chart that maps only the
+    // provider account fails on chart_mapping_incomplete and leaves both charts as they were;
+    // mapping the customer account completes the candidate and the same rotation succeeds.
     @Test
     void chartActivationRequiresCompleteMappingsAndDraftCreation() throws SQLException {
         UUID partialChart = TestPostingStack.uuid(1_150);
@@ -377,6 +407,9 @@ class AcceptanceHardeningIT {
             governed.journalId()));
     }
 
+    // Three rejected effective times: equal to an existing journal's booking time (historical
+    // cutoff), before the current chart's activation, and in the future. Each must leave the
+    // current chart ACTIVE and the candidate DRAFT.
     @Test
     void governedChartRotationRejectsHistoricalAndInvalidEffectiveBoundsAtomically()
         throws SQLException {
@@ -408,6 +441,9 @@ class AcceptanceHardeningIT {
             candidateChart));
     }
 
+    // One call per argument guard of funds.rotate_chart_version. The tail on the other book shows
+    // the two lifecycle rules: the candidate must be a newer version than the current, and a
+    // retired chart cannot come back as a candidate because a candidate must be DRAFT.
     @Test
     void governedChartRotationRequiresDistinctExistingLifecycleRowsForOneBook()
         throws SQLException {
@@ -541,6 +577,9 @@ class AcceptanceHardeningIT {
             """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
     }
 
+    // The delete commits first, so this run must end with a defined rejection rather than a
+    // deadlock: rotation revalidates completeness after its lock wait and fails on
+    // chart_mapping_incomplete, leaving the current chart ACTIVE and the candidate DRAFT.
     @RepeatedTest(5)
     void governedChartRotationDoesNotDeadlockWithCandidateMappingDelete() throws Exception {
         UUID candidateChart = TestPostingStack.uuid(1_161);
@@ -572,6 +611,11 @@ class AcceptanceHardeningIT {
             """, candidateChart));
     }
 
+    // Sequence: a blocker holds the candidate chart row; rotation locks the charts in UUID order
+    // and stalls on the candidate; a direct journal insert then stalls on the current chart row
+    // rotation already holds (journal governance locks chart before book too). Releasing the
+    // blocker must let rotation commit and the journal fail on journal_effective_chart, since
+    // its chart is now retired; a 40P01 on either side would mean the lock orders diverged.
     @Test
     void directJournalGovernanceWaitsForChartBeforeBookDuringRotation() throws Exception {
         UUID candidateChart = TestPostingStack.uuid(1_162);
@@ -649,6 +693,15 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Forces the exact interleaving in which a divergent lock order would deadlock. Sequence:
+     * a blocker holds the book row FOR UPDATE; the candidate mapping DML takes the candidate
+     * chart row (chart first) and stalls on the book; rotation locks the charts in UUID order
+     * and stalls on the candidate held by the mapping session, which pg_blocking_pids confirms;
+     * the blocker commits, the mapping commits, then rotation runs against the committed mapping
+     * state. Returns rotation's outcome (null on success) after asserting the mutation succeeded
+     * and neither side hit 40P01.
+     */
     private SQLException raceGovernedRotationWithCandidateMutation(
         UUID candidateChart,
         ConnectionSqlAction candidateMutation
@@ -727,6 +780,8 @@ class AcceptanceHardeningIT {
         }
     }
 
+    // Under REPEATABLE READ the rotation's snapshot predates the delete, so after its lock wait
+    // it must fail with 40001 rather than activate a chart its stale snapshot saw as complete.
     @Test
     void repeatableReadGovernedRotationSerializesAgainstAConcurrentMappingDeletion()
         throws Exception {
@@ -756,6 +811,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    // The current chart is retired first so a direct UPDATE to ACTIVE is the activation path
+    // under test (no ACTIVE chart remains to rotate from). An uncommitted OPEN account created
+    // concurrently must turn the REPEATABLE READ activation into a 40001, never an activation
+    // that leaves the new account unmapped.
     @Test
     void repeatableReadActivationSerializesAgainstConcurrentOpenAccountCreation()
         throws Exception {
@@ -789,6 +848,9 @@ class AcceptanceHardeningIT {
         }
     }
 
+    // Under READ COMMITTED the rotation sees the committed delete once its lock wait ends and
+    // must reject on chart_mapping_incomplete: same protection as the REPEATABLE READ case, via
+    // revalidation instead of a serialization failure.
     @Test
     void readCommittedGovernedRotationRevalidatesAfterConcurrentMappingDeletion()
         throws Exception {
@@ -815,6 +877,10 @@ class AcceptanceHardeningIT {
             candidateChart));
     }
 
+    // An OPEN account insert is left uncommitted, then a REPEATABLE READ session creates, maps
+    // and activates a whole new chart. Whether that session blocks on the book lock or runs to
+    // its commit, it must end in 40001 once the account commits: the chart would otherwise
+    // activate while missing an open account. Repeated because the interleaving varies.
     @RepeatedTest(5)
     void repeatableReadChartCreationSerializesAgainstAnEarlierOpenAccountInsert()
         throws Exception {
@@ -899,6 +965,9 @@ class AcceptanceHardeningIT {
         }
     }
 
+    // A reversal link on a journal whose type is not REVERSAL is a disguised correction
+    // (journal_reversal_linkage_check); a REVERSAL whose lines are half the original's amounts
+    // is inexact (reversal_exact_negation). Neither may reach the ledger.
     @Test
     void databaseRejectsDisguisedAndInexactReversalFacts() throws SQLException {
         PostingResult original = postingService.post(command(
@@ -918,11 +987,15 @@ class AcceptanceHardeningIT {
         assertEquals(1, count("funds.journal"));
     }
 
+    // Each fixture is one past a limit that JournalValidator also enforces: Long.MIN_VALUE (the
+    // one amount that cannot be negated), 33 dimensions, 8_193 bytes of dimension JSON, and a
+    // non-string dimension value.
     @Test
     void databaseRejectsEveryIrreversibleDirectPostingDomain() throws SQLException {
         String tooManyDimensions = IntStream.rangeClosed(1, 33)
             .mapToObj(index -> "\"k" + index + "\":\"v\"")
             .collect(Collectors.joining(",", "{", "}"));
+        // jsonb prints {"k": "x...x"} with a space, so 8_184 x's make 8_193 bytes: one over.
         String tooManyBytes = "{\"k\":\"" + "x".repeat(8_184) + "\"}";
         try (var connection = dataSource.getConnection()) {
             assertConstraint("posting_reversible_amount_check",
@@ -941,6 +1014,8 @@ class AcceptanceHardeningIT {
         assertEquals(0, count("funds.journal"));
     }
 
+    // 129 provider debits of 1 against 128 customer credits (the last one -2) sum to zero, so
+    // only the journal_reversible_posting_count guard, not the balance guard, can refuse them.
     @Test
     void databaseRejectsTheTwoHundredFiftySeventhDirectPosting() throws SQLException {
         try (var connection = dataSource.getConnection()) {
@@ -971,6 +1046,11 @@ class AcceptanceHardeningIT {
         assertEquals(4, count("funds.posting"));
     }
 
+    /**
+     * Balanced two-line provider/customer journal through the real service. Correlation,
+     * business-transaction and posting IDs are derived from the command and journal seeds at
+     * fixed offsets, so fixtures within one test cannot collide with each other.
+     */
     private static PostingCommand command(
         UUID commandId,
         UUID journalId,
@@ -1023,6 +1103,10 @@ class AcceptanceHardeningIT {
         String type,
         int policyVersion
     ) throws SQLException {
+        // Direct SQL that bypasses the service: an IN_PROGRESS command plus a journal header with
+        // no postings. The header insert alone fires the journal governance triggers, which is
+        // what these tests probe; autocommit is restored so a rejection does not poison the
+        // shared connection.
         connection.setAutoCommit(false);
         try {
             execute(connection, """
@@ -1050,6 +1134,11 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Direct SQL that bypasses the service: a REVERSAL journal whose lines are half the
+     * original's amounts, completed like a real command. The exact-negation check runs as a
+     * deferred constraint trigger, so the rejection is expected at the commit inside.
+     */
     private static void insertInexactReversal(Connection connection, UUID originalJournalId)
         throws SQLException {
         UUID commandId = TestPostingStack.uuid(1_210);
@@ -1100,6 +1189,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Direct SQL that bypasses the service: a single-line journal (deliberately unbalanced) so
+     * that a per-posting domain constraint is the first thing that can fail.
+     */
     private static void insertDirectPostingFixture(
         Connection connection,
         UUID commandId,
@@ -1127,6 +1220,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Direct SQL that bypasses the service: 257 balanced lines generated in the database, with
+     * md5-derived posting IDs, completed as a command so the deferred count guard runs at commit.
+     */
     private static void insertDirectJournalWithTooManyPostings(
         Connection connection,
         UUID commandId,
@@ -1159,6 +1256,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Direct SQL that bypasses the service: a correctly negated, completed REVERSAL of the
+     * 100-unit fixture journal, used to occupy the one permitted reversal slot.
+     */
     private static void insertExactDirectReversal(
         Connection connection,
         UUID commandId,
@@ -1186,6 +1287,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Direct SQL: the IN_PROGRESS command and journal header every direct fixture starts from.
+     * Runs inside the caller's transaction so header and postings commit or fail together.
+     */
     private static void insertDirectHeader(
         Connection connection,
         UUID commandId,
@@ -1214,6 +1319,11 @@ class AcceptanceHardeningIT {
             transactionType, originalJournalId, "d".repeat(64));
     }
 
+    /**
+     * Direct SQL: completes {@code completedCommandId} against a journal owned by
+     * {@code journalOwnerCommandId}. Passing a different command, or corruptResult, produces
+     * the two incoherent completions the result-consistency trigger must refuse.
+     */
     private static void attemptIncoherentCompletion(
         Connection connection,
         UUID journalOwnerCommandId,
@@ -1252,6 +1362,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Direct SQL: marks a command COMPLETED with the same result_json shape the service writes
+     * (journalId, journalSequence, canonicalHash), so completion itself is not what fails.
+     */
     private static void completeDirectCommand(
         Connection connection,
         UUID commandId,
@@ -1269,6 +1383,10 @@ class AcceptanceHardeningIT {
             """, journalId, journalId, journalId, "d".repeat(64), commandId);
     }
 
+    /**
+     * Leaves a DRAFT version-2 chart that maps only PROVIDER_ASSET: incomplete by design, since
+     * the seeded CUSTOMER_LIABILITY account is open and unmapped on it.
+     */
     private static void createChartWithProviderMappingOnly(
         Connection connection,
         UUID chartVersionId
@@ -1292,6 +1410,10 @@ class AcceptanceHardeningIT {
             TestPostingStack.PROVIDER_ASSET);
     }
 
+    /**
+     * A complete candidate plus a directly retired current chart, leaving the book with no
+     * ACTIVE chart so that a direct UPDATE to ACTIVE, not rotation, is the activation under test.
+     */
     private static void createCompleteCandidateAndRetireCurrent(
         Connection connection,
         UUID chartVersionId
@@ -1304,6 +1426,7 @@ class AcceptanceHardeningIT {
             """, TestPostingStack.CHART_VERSION_ID);
     }
 
+    /** Leaves a DRAFT version-2 chart mapping both seeded accounts: ready to be rotated in. */
     private static void createCompleteCandidate(
         Connection connection,
         UUID chartVersionId
@@ -1323,6 +1446,10 @@ class AcceptanceHardeningIT {
             TestPostingStack.CUSTOMER_LIABILITY);
     }
 
+    /**
+     * Direct SQL that bypasses the service: a balanced 100-unit journal pinned to an arbitrary
+     * chart version, left IN_PROGRESS.
+     */
     private static void insertDirectBalancedJournal(
         Connection connection,
         UUID commandId,
@@ -1364,6 +1491,10 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Leaves a second book with its own ACTIVE chart and OPEN January period, so cross-book
+     * references (foreign period, foreign chart) can be attempted against the seeded book.
+     */
     private static void insertOtherBookGovernance(
         Connection connection,
         UUID bookId,
@@ -1393,6 +1524,11 @@ class AcceptanceHardeningIT {
             """, chartVersionId);
     }
 
+    /**
+     * Asserts the action fails on the named PostgreSQL constraint, which the V005/V006 triggers
+     * set explicitly via USING CONSTRAINT. Walks getNextException, the chain the JDBC driver
+     * uses for server errors, not getCause.
+     */
     private static PSQLException assertConstraint(String expected, SqlAction action) {
         SQLException failure = assertThrows(SQLException.class, action::run);
         for (SQLException candidate = failure; candidate != null;
@@ -1408,6 +1544,10 @@ class AcceptanceHardeningIT {
             failure);
     }
 
+    /**
+     * Runs one statement in its own transaction and restores autocommit, so a rejected statement
+     * neither leaks a partial change nor leaves the shared connection in an aborted state.
+     */
     private static void executeInRollback(Connection connection, String sql, Object... values)
         throws SQLException {
         connection.setAutoCommit(false);
@@ -1468,6 +1608,11 @@ class AcceptanceHardeningIT {
         }
     }
 
+    /**
+     * Polls pg_stat_activity until the backend reports a real lock wait. Completing without
+     * ever waiting is itself a failure here: it would mean the lock protocol never engaged and
+     * the race being staged did not happen.
+     */
     private void awaitBackendLock(int backendPid, Future<?> operation) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
@@ -1488,6 +1633,10 @@ class AcceptanceHardeningIT {
         throw new AssertionError("governed database operation did not reach its expected lock");
     }
 
+    /**
+     * Like awaitBackendLock but accepts completion, for the one race whose valid outcomes
+     * include the lifecycle finishing before it ever has to wait.
+     */
     private void awaitBackendLockOrCompletion(int backendPid, Future<?> operation)
         throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -1534,6 +1683,12 @@ class AcceptanceHardeningIT {
             chartVersionId, transactionIsolation, concurrentMutation, false);
     }
 
+    /**
+     * Generic lifecycle race. Sequence: the mutation runs uncommitted on one connection; on a
+     * second connection at the requested isolation, rotation (or a direct UPDATE to ACTIVE)
+     * starts and is observed waiting on a lock; the mutation commits; the lifecycle outcome is
+     * returned (null on success) for the caller to judge against the isolation level's contract.
+     */
     private SQLException raceChartLifecycle(
         UUID chartVersionId,
         int transactionIsolation,
@@ -1612,6 +1767,10 @@ class AcceptanceHardeningIT {
             """, TestPostingStack.BOOK_ID));
     }
 
+    /**
+     * Calls the owner-only funds.rotate_chart_version routine on the caller's connection and
+     * transaction; nulls are passed through so the routine's own argument guards can be tested.
+     */
     private static void rotateChart(
         Connection connection,
         UUID bookId,

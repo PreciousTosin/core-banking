@@ -35,8 +35,23 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.postgresql.util.PSQLException;
 
+/**
+ * Generated-history state-machine test for the ACC-02 accounting invariants. Each of 32
+ * deterministic seeds drives 128 operations (posts, same-hash and different-hash retries,
+ * reversals, unbalanced submissions) through the real PostingService on the Quarkus
+ * dev-services PostgreSQL container (Testcontainers) and, after every operation, compares the
+ * database with the in-memory {@link ReferenceLedgerModel}: per-currency journal balance,
+ * materialised balance equal to immutable-posting replay, control projection equal to an
+ * independent SQL aggregation, exactly one outbox event and one COMPLETED command per journal,
+ * unchanged original hashes, and reversals that are exact negations with identical dimensions.
+ * On failure the exact operation prefix is replayed once on a fresh database so a real
+ * regression can be told from an infrastructure blip. Catches drift between kernel and
+ * reference model on interleavings no hand-written scenario reaches.
+ */
 @QuarkusTest
 class AccountingStateMachineIT {
+    // Fixed so every failure is reproducible from the seed in the message; the value reads as
+    // CB 2026-08-30, the date of the accounting-kernel plan. Any stable value would do.
     private static final long BASE_SEED = 0xCB20260830L;
     private static final int SEED_COUNT = 32;
     private static final int OPERATIONS_PER_SEED = 128;
@@ -65,6 +80,9 @@ class AccountingStateMachineIT {
         assertDatabaseCounts(totals, "complete deterministic run");
     }
 
+    // Calls postTrustedReversal directly with a hand-altered line, bypassing ReversalService's own
+    // negate-and-copy construction; the reversal_exact_negation trigger must still reject a line
+    // whose dimensions differ from the original, and the ledger must remain fully consistent.
     @Test
     void databaseReversalComparisonRejectsDimensionMismatch() throws SQLException {
         long seed = BASE_SEED;
@@ -107,6 +125,8 @@ class AccountingStateMachineIT {
         assertAllInvariants(fixture, model);
     }
 
+    // Model-only (no database work): pins the reference model's own candidate rule, since a
+    // model that offered reversals of reversals would make the generator predict wrongly.
     @Test
     void reversalCandidatesExcludeCorrectionsAndAlreadyReversedOriginals() {
         long seed = BASE_SEED;
@@ -176,6 +196,12 @@ class AccountingStateMachineIT {
         return prefix.size();
     }
 
+    /**
+     * Operation mix per draw: 45% post, 20% same-hash retry, 10% different-hash retry, 15%
+     * reversal, 10% unbalanced. Retry and reversal branches fall through to a post while the
+     * model has no history to retry or reverse. An unbalanced journal is off by exactly one
+     * minor unit so it can only be caught by the balance check, never by a range check.
+     */
     private static GeneratedLedgerOperation generate(
         SplittableRandom random,
         ReferenceLedgerModel model,
@@ -346,6 +372,8 @@ class AccountingStateMachineIT {
             fixture.periodId(),
             transactionType,
             "seed=" + seed + ", operation=" + operationIndex,
+            // 2026-01-15T10:40:00Z plus a seed-dependent offset under one day: every booking date
+            // stays inside the January fixture period whichever way the Lagos offset rounds it.
             Instant.ofEpochSecond(1_768_473_600L + Math.floorMod(seed, 86_400)),
             VALUE_DATE,
             reversalOf,
@@ -377,6 +405,8 @@ class AccountingStateMachineIT {
         return new UUID(random.nextLong(), random.nextLong());
     }
 
+    // Every fixture, header and line ID is a pure function of (seed, operation, salt), so a
+    // replayed prefix reproduces the same IDs.
     private static UUID deterministicUuid(long seed, int operationIndex, int salt) {
         long streamSeed = seed * 0x9E3779B97F4A7C15L
             + (long) operationIndex * 0xD1B54A32D192ED03L
@@ -385,6 +415,7 @@ class AccountingStateMachineIT {
         return randomUuid(random);
     }
 
+    // Operation index -1 keeps fixture IDs out of the space used by operations 0..127.
     private static Fixture seedFixture(long seed) {
         UUID debitAccountId = deterministicUuid(seed, -1, 7);
         UUID creditAccountId = deterministicUuid(seed, -1, 8);
@@ -400,6 +431,11 @@ class AccountingStateMachineIT {
             Map.of(debitAccountId, "ASSET-CONTROL", creditAccountId, "LIABILITY-CONTROL"));
     }
 
+    /**
+     * Leaves one book with an ACTIVE chart, an OPEN January period, one product version and two
+     * mapped OPEN accounts (internal debit, customer credit). Books from different seeds coexist
+     * in the same database, so every invariant query is scoped by fixture.bookId().
+     */
     private void seedFixture(Fixture fixture, int seedIndex) throws SQLException {
         try (Connection connection = dataSource.getConnection()) {
             execute(connection, """
@@ -545,6 +581,12 @@ class AccountingStateMachineIT {
         assertEquals(totals.journals, actual.outbox(), context + " outbox count");
     }
 
+    /**
+     * The invariant set checked after every single operation, all scoped to the fixture book:
+     * per-currency balance of every journal, materialised == replayed totals, projected ==
+     * independent control totals, one JournalPosted event and one COMPLETED command per
+     * journal, deterministic outbox IDs, and unchanged hashes plus exact-negation reversals.
+     */
     private void assertAllInvariants(Fixture fixture, ReferenceLedgerModel model) throws SQLException {
         try (Connection connection = dataSource.getConnection()) {
             assertEquals(0, scalarLong(connection, """
@@ -705,6 +747,8 @@ class AccountingStateMachineIT {
         PostingService service,
         PostingCommand command
     ) {
+        // Generic post() rejects reversal metadata by design; generated reversals must go through
+        // postTrustedReversal, the package-private path ReversalService itself uses.
         if (command.journal().reversalOfJournalId() != null) {
             return service.postTrustedReversal(command);
         }
@@ -748,6 +792,9 @@ class AccountingStateMachineIT {
         }
     }
 
+    // Lines are compared as multisets keyed by (account, currency, amount, typed dimensions)
+    // because reversal posting IDs differ from the original's and row order is not part of the
+    // contract. Carrying the JSON type means a numeric 1 would not pass for the string "1".
     private static Map<LineValue, Integer> lineMultiset(
         List<ReferenceLedgerModel.ModelLine> lines,
         boolean negate
@@ -817,6 +864,11 @@ class AccountingStateMachineIT {
         return Map.copyOf(values);
     }
 
+    /**
+     * Reruns the failing prefix from a clean database and attaches the outcome to the original
+     * failure as a suppressed error: "reproduced" points at the kernel, "unexpectedly passed"
+     * points at infrastructure. It never masks the original failure.
+     */
     private void replayOnce(
         long seed,
         List<GeneratedLedgerOperation> prefix,

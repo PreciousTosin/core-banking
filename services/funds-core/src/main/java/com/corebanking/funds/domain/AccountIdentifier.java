@@ -3,6 +3,13 @@ package com.corebanking.funds.domain;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * An address that resolves to a ledger account. The ledger-account UUID is the balance-bearing
+ * identity; this record holds no balance and is never used as a posting account, command or
+ * idempotency key. Scheme-specific shape is enforced here and mirrored by the
+ * account_identifier CHECK constraints and funds.is_valid_nuban in V001. Lifecycle status and
+ * routing scope are validated only by the database CHECK lists, not by this record.
+ */
 public record AccountIdentifier(
     UUID id,
     UUID ledgerAccountId,
@@ -13,6 +20,8 @@ public record AccountIdentifier(
     String lifecycleStatus,
     boolean primary,
     String routingScope) {
+    // Weights over the 6-digit institution code followed by the 9-digit serial. Must stay
+    // identical to the coefficients in funds.is_valid_nuban (V001) or Java and SQL disagree.
     private static final int[] NUBAN_WEIGHTS = {3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3};
 
     public AccountIdentifier {
@@ -23,6 +32,9 @@ public record AccountIdentifier(
         lifecycleStatus = requireNonBlank(lifecycleStatus, "lifecycleStatus");
         routingScope = requireNonBlank(routingScope, "routingScope");
 
+        // Each scheme is exclusive about its qualifier: a NUBAN is scoped by institution code
+        // and a provider virtual account by providerId. Mixing them would let one address
+        // resolve under two scopes, which the active-scope unique index relies on excluding.
         switch (scheme) {
             case NUBAN -> {
                 institutionCode = requireInstitutionCode(institutionCode);
@@ -42,6 +54,10 @@ public record AccountIdentifier(
         }
     }
 
+    /**
+     * Tenth NUBAN digit for a six-digit institution code and nine-digit serial: weighted sum
+     * mod 10, subtracted from 10, with 10 folding to 0.
+     */
     public static char nubanCheckDigit(String institutionCode, String serial) {
         institutionCode = requireInstitutionCode(institutionCode);
         if (serial == null || !serial.matches("[0-9]{9}")) {
@@ -57,6 +73,7 @@ public record AccountIdentifier(
         return (char) ('0' + (checkDigit == 10 ? 0 : checkDigit));
     }
 
+    /** Shape plus check-digit test; returns false rather than throwing so callers can probe. */
     public static boolean isValidNuban(String institutionCode, String nuban) {
         if (institutionCode == null || !institutionCode.matches("[0-9]{6}")
             || nuban == null || !nuban.matches("[0-9]{10}")) {
