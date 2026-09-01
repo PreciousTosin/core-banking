@@ -27,15 +27,28 @@ import java.util.UUID;
 import javax.sql.DataSource;
 import org.postgresql.util.PSQLException;
 
+/**
+ * Builds and posts the exact reversal of a completed journal. Pipeline: verify the reversalV2
+ * request hash; run a read-only pre-flight (loadCoherentFact) that either finds a completed
+ * replay or loads and re-hashes the original; negate every posting into a linked REVERSAL
+ * draft whose IDs derive from the commandId; hand it to PostingService.postTrustedReversal.
+ * The ledger mirrors the rules applied here (exact negation, one reversal per original, no
+ * reversal of a reversal) in V005's enforce_journal_reversibility and
+ * one_reversal_per_original_idx, so a bypass of this class still fails at commit.
+ */
 @ApplicationScoped
 public class ReversalService {
     // POC guardrails keep a single correction comfortably bounded on an 8 GiB VM.
     static final int MAX_POSTINGS_PER_JOURNAL = JournalValidator.MAX_POSTINGS_PER_JOURNAL;
     static final int MAX_DIMENSIONS_PER_POSTING = JournalValidator.MAX_DIMENSIONS_PER_POSTING;
     static final int MAX_DIMENSION_JSON_BYTES = JournalValidator.MAX_DIMENSION_JSON_BYTES;
+    // Client-side cancel backstop for the pre-flight reads; the server-side 1s/3s/5s deadlines
+    // from PostingTransactionTimeouts are applied to the same connection as well.
     static final int QUERY_TIMEOUT_SECONDS = 5;
     private static final int MAX_DIMENSION_ROWS =
         MAX_POSTINGS_PER_JOURNAL * MAX_DIMENSIONS_PER_POSTING;
+    // Partial unique index on journal.reversal_of_journal_id (V005). It is the authoritative
+    // guard when two reversals of one original both pass the pre-flight existence check.
     private static final String SINGLE_REVERSAL_CONSTRAINT = "one_reversal_per_original_idx";
 
     private final DataSource dataSource;
@@ -63,8 +76,16 @@ public class ReversalService {
         this.transactionTimeouts = Objects.requireNonNull(transactionTimeouts, "transactionTimeouts");
     }
 
+    /**
+     * Reverses a completed original exactly once. Returns the stored result on a same-content
+     * replay; throws IdempotencyConflictException on a request-hash mismatch and
+     * InvalidJournalException when the original is missing, incoherent, already reversed or
+     * itself a reversal.
+     */
     public PostingResult reverse(ReversalRequest request) {
         Objects.requireNonNull(request, "request");
+        // The request hash is checked here, against the ReversalRequest, because the trusted
+        // posting path receives a journal the caller never hashed.
         if (!request.requestHash().equals(commandHasher.reversalV2(request))) {
             throw new IdempotencyConflictException(request.commandId());
         }
@@ -73,11 +94,16 @@ public class ReversalService {
             return loaded.completedResult().orElseThrow();
         }
         OriginalJournal original = loaded.original();
+        // Reversing a reversal would re-apply the original under REVERSAL semantics; the
+        // database refuses it as well (reversal_of_reversal_forbidden).
         if (original.reversalOfJournalId() != null) {
             throw new InvalidJournalException(
                 "reversal of a reversal requires an explicit correction template policy");
         }
 
+        // IDs derive from the commandId so a retry rebuilds identical postings and collides on
+        // identity instead of duplicating. negateExact cannot overflow because Long.MIN_VALUE
+        // is rejected at posting admission; the guard stays for exactness.
         var reversalPostings = new ArrayList<PostingLine>(original.postings().size());
         for (PostingLine posting : original.postings()) {
             reversalPostings.add(new PostingLine(
@@ -89,6 +115,9 @@ public class ReversalService {
                 posting.dimensions()));
         }
 
+        // The reversal posts under the book's current ACTIVE chart and policy version and the
+        // caller's open period, not the original's historical coordinates: the repository
+        // would reject a journal whose governance is no longer current.
         var reversal = new JournalDraft(
             deterministicId(request.commandId(), "journal:" + original.journalId()),
             request.commandId(),
@@ -112,6 +141,8 @@ public class ReversalService {
                 request.requestHash(),
                 reversal));
         } catch (LedgerPersistenceException failure) {
+            // Concurrent reversals of one original can both pass rejectExistingReversal; the
+            // loser fails on the unique index and is reported as the same business error.
             if (hasConstraint(failure, SINGLE_REVERSAL_CONSTRAINT)) {
                 throw new InvalidJournalException(
                     "original journal already has an exact reversal: " + original.journalId());
@@ -120,12 +151,20 @@ public class ReversalService {
         }
     }
 
+    /**
+     * Read-only REPEATABLE READ pre-flight: either finds a completed same-content replay or
+     * returns a verified snapshot of the original. Nothing here writes; the posting itself runs
+     * later, SERIALIZABLE, inside PostingService. The pooled connection's autocommit,
+     * read-only flag and isolation are saved first and restored on every exit path.
+     */
     private LoadOutcome loadCoherentFact(ReversalRequest request) {
         try (Connection connection = dataSource.getConnection()) {
             ConnectionSettings settings = settings(connection);
             Throwable primary = null;
             try {
                 connection.setAutoCommit(false);
+                // One snapshot for header, postings and dimensions, so the re-hash below
+                // cannot mix two versions of the ledger.
                 connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
                 connection.setReadOnly(true);
                 transactionTimeouts.apply(connection);
@@ -182,6 +221,11 @@ public class ReversalService {
         }
     }
 
+    /**
+     * Idempotency replay for the reversal command. An IN_PROGRESS row must already carry this
+     * TYPED_V2 hash; a COMPLETED row must point coherently at its own journal, and its request
+     * hash is compared directly (TYPED_V2) or rebuilt from the journal (V004_OPAQUE).
+     */
     private Optional<PostingResult> preflightCompleted(
         Connection connection,
         ReversalRequest request
@@ -221,6 +265,8 @@ public class ReversalService {
                 UUID storedJournalId = parseUuid(rows.getString("stored_journal_id"));
                 long storedSequence = parseLong(rows.getString("stored_journal_sequence"));
                 String storedHash = rows.getString("stored_canonical_hash");
+                // Mirrors completed_command_result_consistency: result_json is a checked cache
+                // of the journal row, never an independent source of truth.
                 if (commandJournalId == null
                     || !commandJournalId.equals(joinedJournalId)
                     || !commandJournalId.equals(storedJournalId)
@@ -244,6 +290,12 @@ public class ReversalService {
         }
     }
 
+    /**
+     * Replay against a reversal committed under V004. Its stored request hash is opaque, so the
+     * legacy journal is re-verified with the V004_V1 hasher and the typed reversalV2 hash is
+     * rebuilt from the persisted header. The all-zero placeholder only satisfies the record's
+     * format check; reversalV2 never digests the hash field itself.
+     */
     private void verifyLegacyCompletedReversal(
         Connection connection,
         ReversalRequest request,
@@ -304,6 +356,8 @@ public class ReversalService {
                 }
                 UUID historicalChart = rows.getObject("chart_version_id", UUID.class);
                 int historicalPolicy = rows.getInt("policy_version");
+                // The legacy reversal's own chart and policy fill the "current" slots too:
+                // nothing is re-posted from this header, it is only re-hashed.
                 return new OriginalJournalHeader(
                     rows.getObject("journal_id", UUID.class),
                     rows.getObject("command_id", UUID.class),
@@ -328,6 +382,10 @@ public class ReversalService {
         }
     }
 
+    /**
+     * Loads the original's header together with the book's current policy version and ACTIVE
+     * chart. Only a journal that is the completed result of its own command may be reversed.
+     */
     private static OriginalJournalHeader loadVerifiedHeader(Connection connection, UUID journalId)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
@@ -388,6 +446,11 @@ public class ReversalService {
         }
     }
 
+    /**
+     * Reassembles the original's postings in account_sequence order, refusing anything past the
+     * POC limits instead of reading it. The bounds equal JournalValidator's and the V005 posting
+     * CHECKs, so exceeding one here means corrupted or out-of-envelope data, not a large input.
+     */
     private static List<PostingLine> loadBoundedPostings(Connection connection, UUID journalId)
         throws SQLException {
         Map<UUID, PostingBuilder> builders = loadPostingSummaries(connection, journalId);
@@ -414,6 +477,7 @@ public class ReversalService {
             """)) {
             statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
             statement.setObject(1, journalId);
+            // Fetch one row past the limit so an oversize journal is detected, not truncated.
             statement.setInt(2, MAX_POSTINGS_PER_JOURNAL + 1);
             try (var rows = statement.executeQuery()) {
                 Map<UUID, PostingBuilder> builders = new LinkedHashMap<>();
@@ -423,6 +487,7 @@ public class ReversalService {
                             "original journal exceeds POC posting limit of "
                                 + MAX_POSTINGS_PER_JOURNAL);
                     }
+                    // Same expression as posting_dimensions_bytes_check, evaluated server-side.
                     int dimensionBytes = rows.getInt("dimension_json_bytes");
                     if (dimensionBytes > MAX_DIMENSION_JSON_BYTES) {
                         throw new InvalidJournalException(
@@ -461,6 +526,7 @@ public class ReversalService {
             """)) {
             statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
             statement.setObject(1, journalId);
+            // Flattened key/value rows, again fetched one past the limit to detect overflow.
             statement.setInt(2, MAX_DIMENSION_ROWS + 1);
             int rowsRead = 0;
             try (var rows = statement.executeQuery()) {
@@ -485,6 +551,12 @@ public class ReversalService {
         }
     }
 
+    /**
+     * Rebuilds the persisted journal and recomputes its canonical hash with the verifier named
+     * by its scheme tag: V004_V1 for facts written before V005, V2 (which adds chartVersionId)
+     * for everything since. A mismatch means the stored postings no longer match the fact that
+     * was committed, and nothing derived from them may be posted.
+     */
     private OriginalJournal assembleAndVerifyOriginal(
         OriginalJournalHeader header,
         List<PostingLine> postings
@@ -534,6 +606,7 @@ public class ReversalService {
             connection.getTransactionIsolation());
     }
 
+    // A suppressed rollback failure must not hide the original cause.
     private static void rollback(Connection connection, Throwable primary) {
         try {
             connection.rollback();
@@ -542,6 +615,9 @@ public class ReversalService {
         }
     }
 
+    // Each setting is restored independently so one failure cannot skip the others. Restore
+    // failures attach to the primary error when there is one; otherwise they become the error,
+    // because returning a mis-configured connection to the pool is not acceptable.
     private static void restore(
         Connection connection,
         ConnectionSettings settings,
@@ -604,6 +680,7 @@ public class ReversalService {
         }
     }
 
+    // Walks the cause chain: the PSQLException arrives wrapped in LedgerPersistenceException.
     private static boolean hasConstraint(Throwable failure, String expectedConstraint) {
         for (Throwable current = failure; current != null; current = current.getCause()) {
             if (current instanceof PSQLException postgresFailure
@@ -616,15 +693,20 @@ public class ReversalService {
         return false;
     }
 
+    // Name-based UUIDs in a private namespace: the same command always yields the same journal
+    // and posting IDs, so a replay after a crash cannot mint a second identity.
     private static UUID deterministicId(UUID commandId, String component) {
         return UUID.nameUUIDFromBytes(
             ("funds-reversal:" + commandId + ":" + component).getBytes(StandardCharsets.UTF_8));
     }
 
+    /** Exactly one side is present: a completed replay result, or a fresh verified original. */
     private record LoadOutcome(Optional<PostingResult> completedResult, OriginalJournal original) {}
 
+    /** Pooled-connection state captured before the pre-flight and restored after it. */
     private record ConnectionSettings(boolean autoCommit, boolean readOnly, int isolation) {}
 
+    /** Persisted journal header plus the book's current governance coordinates. */
     private record OriginalJournalHeader(
         UUID journalId,
         UUID commandId,
@@ -646,6 +728,7 @@ public class ReversalService {
         int currentPolicyVersion,
         UUID currentChartVersionId) {}
 
+    /** Verified original: identity, reversal link, current governance and postings to negate. */
     private record OriginalJournal(
         UUID journalId,
         UUID legalEntityId,

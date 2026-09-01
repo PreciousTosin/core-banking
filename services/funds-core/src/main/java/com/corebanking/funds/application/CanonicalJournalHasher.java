@@ -12,13 +12,25 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * Canonical SHA-256 of a journal's financial facts. Each field is fed to the digest as a
+ * length-prefixed name, a one-byte null tag, then the length-prefixed UTF-8 of its string form,
+ * so field boundaries and absent values can never be confused. Postings are hashed in
+ * (accountId, postingId) string order and dimensions in key order, independent of input order.
+ * Two schemes exist and the persisted canonical_hash_scheme picks the verifier: V2 is the
+ * current writer and pins chartVersionId; V004_V1 verifies facts written before V005 and has
+ * no chart field. accountSequence is deliberately not hashed, so the digest is identical
+ * before and after the repository assigns sequences.
+ */
 public class CanonicalJournalHasher {
+    // UUID string order, the same order the repository locks accounts in; not UUID.compareTo.
     private static final Comparator<UUID> UUID_CANONICAL_ORDER =
         Comparator.comparing(UUID::toString);
     private static final Comparator<PostingLine> POSTING_ORDER = Comparator
         .comparing(PostingLine::accountId, Comparator.nullsFirst(UUID_CANONICAL_ORDER))
         .thenComparing(PostingLine::postingId, Comparator.nullsFirst(UUID_CANONICAL_ORDER));
 
+    /** Alias for the current (V2) scheme. */
     public String sha256(JournalDraft draft) {
         return v2Sha256(draft);
     }
@@ -43,6 +55,8 @@ public class CanonicalJournalHasher {
         encoder.field("businessTransactionId", draft.businessTransactionId());
         encoder.field("legalEntityId", draft.legalEntityId());
         encoder.field("bookId", draft.bookId());
+        // The only V004_V1 / V2 difference: V2 binds the fact to the governed chart it was
+        // posted under, so a chart rotation can never leave two journals hash-identical.
         if (includeChartVersion) {
             encoder.field("chartVersionId", draft.chartVersionId());
         }
@@ -80,6 +94,7 @@ public class CanonicalJournalHasher {
         }
     }
 
+    /** Length-prefixed, null-tagged field encoder feeding a single SHA-256 digest. */
     private static final class CanonicalEncoder {
         private final MessageDigest digest;
 

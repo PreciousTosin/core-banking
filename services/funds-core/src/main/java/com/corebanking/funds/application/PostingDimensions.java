@@ -5,7 +5,13 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 
-/** PostgreSQL-jsonb-compatible deterministic dimension encoding and sizing. */
+/**
+ * PostgreSQL-jsonb-compatible deterministic dimension encoding and sizing. Keys are emitted in
+ * sorted order with escaping only where JSON requires it, so equal maps always yield equal
+ * bytes. Two renderings exist: compactJson is what the repository sends on insert, and
+ * jsonbText reproduces the ", " and ": " spacing of jsonb::text so the byte count agrees with
+ * the posting_dimensions_bytes_check limit of 8192.
+ */
 public final class PostingDimensions {
     private PostingDimensions() {}
 
@@ -13,10 +19,15 @@ public final class PostingDimensions {
         return jsonbText(dimensions).getBytes(StandardCharsets.UTF_8).length;
     }
 
+    /** Insert form; PostgreSQL re-normalises it into jsonb, so spacing is irrelevant here. */
     public static String compactJson(Map<String, String> dimensions) {
         return encode(dimensions, false);
     }
 
+    /**
+     * Sizing form. jsonb stores keys in its own order (shortest first), which changes nothing
+     * about the length; only the separators and escaping have to match.
+     */
     static String jsonbText(Map<String, String> dimensions) {
         return encode(dimensions, true);
     }
@@ -43,6 +54,9 @@ public final class PostingDimensions {
         return json.append('}').toString();
     }
 
+    // Minimal escaping matching jsonb's text output: the two mandatory escapes, the short forms
+    // for common control characters, the four-hex-digit escape for the remaining control
+    // characters, everything else verbatim UTF-8.
     private static void jsonString(StringBuilder json, String value) {
         json.append('"');
         for (int index = 0; index < value.length(); index++) {

@@ -9,12 +9,22 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Objects;
 
-/** Versioned, domain-separated hashes for typed financial commands. */
+/**
+ * Versioned, domain-separated hashes for typed financial commands, i.e. request_hash_scheme
+ * TYPED_V2. Every digest starts with a domain string, so a posting hash and a reversal hash can
+ * never coincide for the same bytes; fields use the same length-prefixed encoding as
+ * CanonicalJournalHasher but are never null. The legacy V004_OPAQUE scheme has no algorithm
+ * here: such commands are replayed by rebuilding a typed hash from verified stored facts.
+ */
 public final class CanonicalCommandHasher {
     private static final String POSTING_V2 = "funds-core/posting-command/v2";
     private static final String REVERSAL_V2 = "funds-core/reversal-command/v2";
     private final CanonicalJournalHasher journalHasher = new CanonicalJournalHasher();
 
+    /**
+     * Request hash of a generic posting: the domain plus the V2 journal hash, so it covers
+     * every financial field of the journal without a second field list to keep in sync.
+     */
     public String postingV2(JournalDraft journal) {
         Objects.requireNonNull(journal, "journal");
         var digest = digest();
@@ -23,6 +33,10 @@ public final class CanonicalCommandHasher {
         return HexFormat.of().formatHex(digest.digest());
     }
 
+    /**
+     * Request hash of a reversal: every ReversalRequest field except the hash itself, so a
+     * replay that changes any field is an idempotency conflict rather than a second reversal.
+     */
     public String reversalV2(ReversalRequest request) {
         Objects.requireNonNull(request, "request");
         var digest = digest();

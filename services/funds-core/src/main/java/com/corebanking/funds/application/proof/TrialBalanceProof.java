@@ -5,6 +5,12 @@ import java.math.BigInteger;
 import java.util.Objects;
 import java.util.UUID;
 
+/**
+ * Outcome of one trial-balance proof. totalDebits and totalCredits are the absolute sums of the
+ * positive and negative signed postings (README sign convention) for a book and currency up to
+ * a journal_sequence cutoff, held as BigInteger because the SQL aggregates in numeric. A false
+ * balanced flag means persisted postings no longer sum to zero for that currency.
+ */
 public record TrialBalanceProof(
     UUID bookId,
     CurrencyCode currency,
