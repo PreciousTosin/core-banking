@@ -16,7 +16,11 @@
 
 - Every command runs inside the checkout the executor was given — main checkout or worktree. Anchor each block with `cd "$(git rev-parse --show-toplevel)"`; never a literal absolute path.
 - **The ADR, the decisions-index edit and the plan backlink are one commit.** Every split produces an intermediate tree that fails: the ADR alone fails both reciprocity checks, the backlink alone fails link resolution, the index alone fails nothing but proves nothing. There is no valid multi-commit ordering.
-- **If validation fails after the ADR is committed, fix it with `git commit --amend`, never a follow-up commit.** The record is `Accepted` from birth, and the validator freezes `Context`, `Decision drivers`, `Considered options`, `Decision` and `Consequences` byte-for-byte across every subsequent commit edge. A follow-up commit that edits those sections is an immutability violation that cannot be undone except by rewriting history.
+- **If validation fails after the ADR is committed, fix it with `git commit --amend`, never a follow-up commit.** The record is `Accepted` from birth, so from its very next commit edge the validator freezes, byte-for-byte:
+  - the sections `Context`, `Decision drivers`, `Considered options`, `Decision` and `Consequences`, plus any heading you added beyond the required ten;
+  - **every metadata field except `Status`, `Implementation status`, and the seven relationship fields.** `Scope`, `Deciders`, `Decision date` and `Retrospective` are frozen — editing `Scope` in a follow-up commit fails with `accepted ADR field changed: Scope`. This matters because D4 rests on the exact wording of `Scope`: get it right before committing, because afterwards the only cures are rewriting history or a superseding ADR.
+
+  `Compliance and verification` and `Implementation evidence`, like the relationship fields, are append-only rather than frozen: a later commit may add lines but never alter or remove existing ones.
 - Evidence hashes are **40 lowercase hex characters**. Uppercase fails the regex.
 - Relationship fields are separated by exactly `"; "` — one semicolon, one space. `;` alone or `;  ` fails.
 - Items in `Related architecture sections` and `Related implementation plans` must be **only** a Markdown link, with no other text in the item.
@@ -291,7 +295,7 @@ One commit. See the ADR ↔ plan link rule for why all three must land together.
 
 ### Task 2: Prove the retrospective introduction is legal
 
-The structural run in Task 1 Step 4 says nothing about whether a *new* record may be born `Accepted`. That rule lives in the git-history edge checks, which need a committed record to compare against its parent. This task is the real gate for a retrospective ADR.
+The structural run in Task 1 Step 5 says nothing about whether a *new* record may be born `Accepted`. That rule lives in the git-history edge checks, which need a committed record to compare against its parent. This task is the real gate for a retrospective ADR.
 
 **Files:** none — verification only.
 
@@ -387,7 +391,7 @@ The repository validates the PR body itself on `pull_request` events. The descri
 
 ## Rollback
 
-Before the record is merged, `git revert` or an amend removes it cleanly; nothing else references `ADR-0009`.
+Three things reference the record: the ADR file itself, the `related_adrs` entry and bullet in `architecture/arc42/09-decisions.md`, and the backlink in the enforcement plan. Because all three land in one commit, `git revert` of that commit — or an amend before it is pushed — removes them together, and that is the only rollback to use. Do not hand-remove the ADR file alone: the index entry and the backlink would be left dangling, failing both `validate_links` and the reciprocity checks.
 
 After it is merged, it cannot be deleted or renamed: `Accepted` records are permanent, and the number cannot be reused because numbering must stay contiguous. A reversal is a **new** ADR that supersedes 0009, with `Superseded by` appended to 0009's relationship field — that field is append-only, which the lifecycle permits. Removing the enforcement itself is a separate matter from the record and is covered by the enforcement plan's own rollback section.
 
@@ -395,7 +399,7 @@ After it is merged, it cannot be deleted or renamed: `Accepted` records are perm
 
 | Risk | Handling |
 |---|---|
-| The record is born `Accepted` and its core sections freeze on the next commit | Task 2 runs the edge checks immediately, and Step 3 amends rather than appending. Nothing is pushed until both checks pass |
+| The record is born `Accepted`, so five sections, every heading, and every field except `Status`, `Implementation status` and the seven relationship fields freeze on the next commit | Task 2 runs the edge checks immediately, and its Step 3 amends rather than appending. Nothing is pushed until both checks pass |
 | A naive structural-only run gives false confidence | Task 2 exists precisely because `validate_architecture.py --root .` alone cannot see the introduction rule |
 | Committing the ADR without one of its two reciprocal registrations | D1 and Task 1 Step 6 keep all three files in one commit; Step 5 catches either mismatch, by name, before any commit exists |
 | Evidence that looks right but is not | All eight lines were checked against the validator's own grammar and against each commit's real diff before this plan was written |
