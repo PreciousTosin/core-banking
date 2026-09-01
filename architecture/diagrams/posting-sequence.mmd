@@ -1,0 +1,31 @@
+---
+title: CURRENT — Posting transaction sequence
+---
+%% state: CURRENT
+%% abstraction: runtime-sequence
+%% question: How does one posting request become an atomic ledger result or rollback?
+%% owner: funds-core maintainers
+%% arc42: architecture/arc42/06-runtime-view.md
+%% adrs: ADR-0002, ADR-0004, ADR-0006
+%% last_verified: 2026-09-01
+sequenceDiagram
+  participant Caller
+  participant Service as PostingService
+  participant DB as PostgreSQL
+  Caller->>Service: typed command + request hash
+  Service->>Service: validate request hash
+  Service->>DB: begin serializable transaction
+  Service->>DB: acquire idempotency lock
+  Service->>DB: acquire account locks
+  Service->>Service: validate book, period, journal, amounts
+  Service->>DB: write immutable journal and postings
+  Service->>DB: update projections and balances
+  Service->>DB: write outbox intent
+  Service->>DB: complete idempotency result
+  alt all validation and writes succeed
+    Service->>DB: commit
+    Service-->>Caller: completed result
+  else validation or persistence fails
+    Service->>DB: rollback
+    Service-->>Caller: failure
+  end

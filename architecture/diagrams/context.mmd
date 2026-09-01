@@ -1,0 +1,23 @@
+---
+title: CURRENT — Funds-core system context
+---
+%% state: CURRENT
+%% abstraction: system-context
+%% question: Which implemented actors and systems exchange information with funds-core?
+%% owner: funds-core maintainers
+%% arc42: architecture/arc42/03-context-and-scope.md
+%% adrs: ADR-0004, ADR-0007
+%% last_verified: 2026-09-01
+flowchart LR
+  developer[Developer / operator]
+  tests[Test infrastructure]
+  funds[Implemented Java / Quarkus funds-core]
+  postgres[(Implemented PostgreSQL authoritative ledger)]
+  developer -->|configuration and operations| funds
+  tests -->|typed commands and integration checks| funds
+  funds -->|serializable transactions| postgres
+  subgraph boundary[CURRENT test/runtime boundary]
+    funds
+    postgres
+  end
+  proposed[PROPOSED ONLY: NIP/providers, Go services, brokers, and channels are not current containers or interfaces]

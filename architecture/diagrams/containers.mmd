@@ -1,0 +1,26 @@
+---
+title: PROPOSED — Full platform container view
+---
+%% state: PROPOSED
+%% abstraction: container
+%% question: How could the planned platform separate funds-core, Go services, and infrastructure?
+%% owner: architecture maintainers
+%% arc42: architecture/arc42/03-context-and-scope.md
+%% adrs: ADR-0001, ADR-0002, ADR-0004
+%% last_verified: 2026-09-01
+flowchart LR
+  subgraph implemented[IMPLEMENTED TODAY]
+    funds[Java / Quarkus funds-core]
+    postgres[(PostgreSQL ledger)]
+    funds --> postgres
+  end
+  subgraph unimplemented[UNIMPLEMENTED PROPOSED CONTAINERS]
+    channels[Go channel application services]
+    providers[Provider / NIP adapters]
+    relay[Outbox relay]
+    broker[Event broker]
+    channels --> funds
+    providers --> channels
+    funds -. outbox .-> relay
+    relay -. events .-> broker
+  end

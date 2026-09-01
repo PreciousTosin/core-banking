@@ -9,6 +9,7 @@
 **Tech Stack:** Markdown, Mermaid CLI 11.16.0, Python 3.12+ standard library, Node.js 20+, npm lockfile, GitHub Actions on Ubuntu 24.04.
 
 **Spec:** `docs/superpowers/specs/2026-09-01-architecture-documentation-and-adr-framework-design.md`
+**Governing ADR:** [ADR-0001: Manage architecture as versioned code](../../../architecture/adr/0001-manage-architecture-as-versioned-code.md)
 
 ## Global Constraints
 

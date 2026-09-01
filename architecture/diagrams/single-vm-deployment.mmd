@@ -1,0 +1,21 @@
+---
+title: PROPOSED — Single 8 GiB VM deployment envelope
+---
+%% state: PROPOSED
+%% abstraction: deployment
+%% question: How would a proposed 8 GiB host reserve memory while bounding profile-dependent component groups?
+%% owner: architecture maintainers
+%% arc42: architecture/arc42/07-deployment-view.md
+%% adrs: ADR-0008
+%% last_verified: 2026-09-01
+flowchart TB
+  host[PROPOSED 8 GiB single VM]
+  reserve[2,048 MiB host and page-cache reserve]
+  subgraph profiles[Profile-dependent proposed component groups]
+    funds[Funds-core JVM cgroup ceiling]
+    postgres[PostgreSQL cgroup ceiling]
+    support[Go services, relay, and observability cgroup ceilings]
+  end
+  host --> reserve
+  host --> profiles
+  note[This is a target envelope and evidence-suite input, not a deployed topology claim]

@@ -1,5 +1,9 @@
 # Accounting Kernel Implementation Plan
 
+**Current architecture:** [Building-block view](../../../architecture/arc42/05-building-block-view.md), [Runtime view](../../../architecture/arc42/06-runtime-view.md), and [Crosscutting concepts](../../../architecture/arc42/08-crosscutting-concepts.md)
+
+**Retrospective ADRs:** [ADR-0002](../../../architecture/adr/0002-centralize-financial-invariants-in-funds-core.md), [ADR-0003](../../../architecture/adr/0003-use-signed-integer-minor-units.md), [ADR-0004](../../../architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md), [ADR-0005](../../../architecture/adr/0005-use-immutable-journals-and-additive-corrections.md), and [ADR-0006](../../../architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the Java `funds-core` accounting kernel that owns books, chart-of-accounts reference data, immutable account-address and product-version foundations, immutable balanced journals, checked monetary arithmetic, idempotent posting, materialised balances, outbox facts, accounting periods, reversals, trial-balance proof and subledger/control-account proof.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Java 25 LTS; Quarkus 3.33.3.1 LTS; Maven 3.9.16 wrapper; PostgreSQL 18.6; JDBC/Agroal; Flyway; JUnit 6 on the Quarkus-managed platform; a deterministic in-repository property-case generator; Testcontainers through Quarkus Dev Services.
 
-**Spec:** `architecture/modern-core-banking-comprehensive-design-revised.md`
+**Historical specification label:** Modern Core Banking System comprehensive-design revision dated 2026-08-30 (archived and non-authoritative; numbered citations below are deliberately unlinked)
 
 ## Global Constraints
 
@@ -743,6 +747,8 @@ git commit -m "feat(funds-core): enforce immutable balanced journals"
 
 ---
 
+<a id="posting-command-delivery-detail"></a>
+<!-- migration-source: 09.01 -->
 ### Task 6: Implement the serializable posting transaction and idempotency state machine
 
 **Files:**
@@ -1259,6 +1265,8 @@ git commit -m "security(funds-core): enforce ledger database roles"
 
 ---
 
+<a id="java-memory-evidence-delivery-detail"></a>
+<!-- migration-source: 21.09::03 -->
 ### Task 13: Add memory-bounded configuration and complete the accounting-kernel gate
 
 **Files:**
@@ -1427,6 +1435,6 @@ Expected results:
 
 Before moving to the funds-control plan, request an independent review against:
 
-- architecture §§4–5, 8.1–8.3, 8.9–8.16, 9.1–9.2, 12.1.1, 13.7.1, 13.9, 16.1, 21.8–21.11 and 23;
+- historical comprehensive-design source labels §§4–5, 8.1–8.3, 8.9–8.16, 9.1–9.2, 12.1.1, 13.7.1, 13.9, 16.1, 21.8–21.11 and 23 (non-authoritative and intentionally unlinked);
 - this plan's interfaces and exclusions;
 - the exact base-to-head Git range for the accounting-kernel slice.

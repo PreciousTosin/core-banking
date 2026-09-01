@@ -1,7 +1,9 @@
 # funds-core accounting kernel
 
-This Java 25/Quarkus module is the implemented proof-of-concept accounting kernel. It owns exact journal validation, serializable PostgreSQL posting, immutable journals and reference foundations, idempotency, reversals, independent accounting proofs, and transactional outbox rows. The broader service topology and later delivery slices remain described in the [architecture](../../architecture/modern-core-banking-comprehensive-design-revised.md) and [implementation plan](../../docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md).
+This Java 25/Quarkus module is the implemented proof-of-concept accounting kernel. It owns exact journal validation, serializable PostgreSQL posting, immutable journals and reference foundations, idempotency, reversals, independent accounting proofs, and transactional outbox rows. The broader service topology and later delivery slices remain described in the [architecture entry point](../../ARCHITECTURE.md) and [implementation plan](../../docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md).
 
+<a id="journal-posting-model"></a>
+<!-- migration-source: 08.02 -->
 ## Reading the accounting model
 
 Positive amounts are debits; negative amounts are credits. The signs describe which side of the accounting equation a posting occupies, not whether a customer's displayed balance is positive. Natural balances are derived by multiplying signed postings by `+1` for debit-normal accounts and `-1` for credit-normal accounts.
@@ -25,6 +27,8 @@ NUBAN validation implements the six-digit institution-code plus nine-digit seria
 
 Customer accounts bind immutably to a versioned savings, current, fixed-deposit or domiciliary product. The definition is only the stable commercial family; each immutable product version owns its product kind, finance principle, effective dates, approval reference and policy hash. A later version therefore cannot reclassify an existing account or rewrite historical accounting. `CONVENTIONAL` and `NON_INTEREST` are distinct finance principles. A non-interest product is not a conventional product with a zero rate: it requires a separately approved contract, permitted asset/fee/profit mechanics, governance and allocation rules. This slice stores and constrains those foundations; interest accrual/capitalisation/maturity and non-interest pool allocation arrive in later plans.
 
+<a id="chart-governance-detail"></a>
+<!-- migration-source: 08.09::03 -->
 Ledger-account identity is stable across chart versions. A chart mapping is keyed by book, chart, account code and immutable account currency, with a database foreign key that prevents cross-currency classification. Every new chart begins in `DRAFT`; all open accounts must be mapped before activation, and mapping insert/update/delete are frozen afterward. Operational replacement uses the owner-only `funds.rotate_chart_version(book,current,candidate,effective_at)` operation: it locks both chart rows in UUID order and then the stable book row, validates lifecycle, mapping completeness and the half-open historical boundary, and retires/activates atomically. Mapping mutations and posting guards use the same chart-before-book order. V004 history upgrades without rewriting its hashes: persisted scheme tags select the exact V004 verifier, while same-content posting and reversal replays compare typed V2 hashes reconstructed from verified stored facts. New journals and commands use V2 schemes, and every completed command result must identify its own journal ID, sequence and canonical hash. Live creation or reopening of an open account after chart activation is deliberately rejected in this PoC until a governed atomic onboarding workflow is implemented.
 
 ## Database roles and startup
@@ -51,9 +55,19 @@ docker run --rm --entrypoint java --memory=640m --cpus=0.60 --pids-limit=256 \
 
 The test gate contains unit, deterministic generated-property, PostgreSQL integration, failure-injection and real child-process crash tests; no accounting test is intentionally skipped. Full service startup additionally requires the separately migrated profile database and is deferred to the deployment-profile plan.
 
+<a id="memory-boundary"></a>
+<!-- migration-source: 21.09::01 -->
 ## Memory boundary
 
 The image uses `-Xms128m -Xmx384m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m -Xss512k -XX:+ExitOnOutOfMemoryError` inside the planned 640 MiB container. The remainder is deliberate headroom for JIT code cache, native libraries, TLS/socket buffers and other RSS. Heap dumps are opt-in through an approved encrypted diagnostic workflow. The JDBC pool is bounded to 2–8 connections with a five-second acquisition timeout; the Quarkus worker pool is bounded to 2–8 threads plus 32 queued tasks and rejects overflow; request bodies are capped at 128 KiB. Every posting/reversal transaction applies local one-second lock, three-second statement and five-second idle-transaction deadlines before financial work. No application cache stores financial state. See the [health contract](docs/health-contract.md) for health, saturation and failure semantics.
+
+The container budget covers heap, metaspace, JIT code cache, thread stacks,
+direct/NIO buffers, native libraries, and socket buffers. Admission rejects
+overflow before financial work, and current database reads remain bounded by
+the service's explicit query and transaction limits. The comprehensive
+design's 448 MiB concurrency-replica setting, reconciliation/export streaming,
+and bounded read-through caches remain profile work; this implemented slice
+does not claim those controls.
 
 The target VM has 8 GiB RAM, but that is an evidence-suite budget across versioned normal, concurrency and restore profiles—not permission to run every component at peak simultaneously. Later profile work must measure and cap PostgreSQL connections and per-query memory, use bounded Go queues/goroutines and `GOMEMLIMIT`, stream/paginate file and projection work, bound broker retention/batches, cap workflow history/concurrency and observability queues/label cardinality. Those other-component controls and the exact orchestration limits are planned, not implemented by this module.
 

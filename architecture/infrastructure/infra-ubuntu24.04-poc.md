@@ -1,7 +1,22 @@
+---
+status: proposed
+owners:
+  - platform
+related_adrs:
+  - ADR-0008
+related_proposals:
+  - architecture/proposals/README.md#full-poc-platform
+---
+> **Architecture state: PROPOSED — non-current.**
+
 # Infrastructure Architecture: Single-VPS PoC on Ubuntu 24.04
 
-Parent document: @architecture/modern-core-banking-comprehensive-design-revised.md
-Summary: This document specifies the infrastructure blueprint required to deploy the Modern Core Banking PoC on a single Ubuntu 24.04 VPS. It translates the architecture decisions into concrete host requirements, container topology, storage composition, and operational runbooks that support reproducible PoC validation. Every requirement here is either traced to a section of the parent design or marked explicitly as a local decision.
+Governing decision: [ADR-0008 single-VM resource envelope](../adr/0008-target-an-eight-gib-single-vm-evidence-suite.md#single-vm-resource-envelope)
+Summary: This document specifies the infrastructure blueprint required to deploy the Modern Core Banking PoC on a single Ubuntu 24.04 VPS. It translates maintained decisions and proposal boundaries into concrete host requirements, container topology, storage composition, and operational runbooks that support reproducible PoC validation. Every requirement here is either traced to a maintained anchor, identified by a historical source label, or marked explicitly as a local decision.
+
+Governed proposal: [Full single-VM proof-of-concept platform](../proposals/README.md#full-poc-platform). The presence of this document, infrastructure manifests, or scripts is design evidence only; it is not evidence that a deployment exists or that an acceptance profile ran.
+
+Historical source labels such as `§21.1` below refer only to numbered sections in the non-authoritative pre-cutover comprehensive-design revision. They are deliberately non-links; the maintained authority is the governing proposal, ADR, and arc42 collection linked from this document.
 
 ---
 
@@ -29,7 +44,7 @@ Non-claims: no multi-region HA, no broker-availability or replicated-durability 
 | Go services | one toolchain version pinned in the build, recorded in the run manifest | local decision |
 | Redpanda, Temporal, Valkey, MinIO, proxy, Toxiproxy, OTel, Prometheus | pinned by **image digest** in the Compose base/overlay files | §21.1 |
 
-The parent design is silent on language and database versions; the pins above come from the implementation plans in `docs/superpowers/plans/` and are recorded, together with every image digest, in the run manifest described in §6 below.
+The historical comprehensive-design source is silent on language and database versions; the pins above come from the implementation plans in `docs/superpowers/plans/` and are recorded, together with every image digest, in the run manifest described in section 6 below.
 
 ---
 
@@ -74,7 +89,7 @@ Scaled services set no `container_name` and bind no duplicate fixed host ports; 
 
 ## 4) Resource profiles
 
-The tables below are the parent design's starting ceilings, reproduced exactly (§21.1). They are **not** measured promises, and the totals **include** the 2,048 MiB OS/Docker/page-cache/safety reserve row — the container fleet's own budget is the total minus 2,048 MiB.
+The tables below reproduce the historical comprehensive-design source's starting ceilings (§21.1). They are **not** measured promises, and the totals **include** the 2,048 MiB OS/Docker/page-cache/safety reserve row — the container fleet's own budget is the total minus 2,048 MiB.
 
 ### 4.1 Memory ceilings
 
@@ -132,21 +147,21 @@ The step order in `main()` is: preflight → time sync → apt environment → *
 
 | Host item | Setting | Origin |
 |---|---|---|
-| Container log rotation | `json-file` driver, `max-size=32m`, `max-file=5` in `/etc/docker/daemon.json` | **parent-mandated** (§21.14: logs rotate by size/time under a disk quota) |
+| Container log rotation | `json-file` driver, `max-size=32m`, `max-file=5` in `/etc/docker/daemon.json` | **historical-source requirement** (§21.14: logs rotate by size/time under a disk quota) |
 | `daemon.json` handling | the script **merges** its keys into any existing `/etc/docker/daemon.json` with `jq` (its keys win, everything else — `data-root`, registry mirrors, an existing `ip6tables` setting — is preserved) and refuses to touch a file that is not valid JSON | **local decision**: overwriting the file would break the "re-running converges the host" property and could silently undo provider defaults |
-| Swap | `swapoff -a`, systemd `.swap`/zram units masked (both `systemd-zram-setup@*` and `zram-tools`' `zramswap.service`); `/etc/fstab` amended only with `--persist-swap-off`. Swap is disabled on **every** run, including `--allow-undersized` ones: on a memory-tight host with swap genuinely in use, `swapoff -a` must fault every swapped page back into RAM, so it either fails (aborting the run) or invokes the OOM killer. Free memory, or `swapoff` by hand, before bootstrapping such a host | **parent-mandated** (§21.1) |
-| Free disk | at least **40 GiB** free on the filesystem that holds Docker's data root — `/var/lib/docker` when it already exists, otherwise `/var/lib` — and re-checked against `docker info --format '{{.DockerRootDir}}'` once Docker is installed | **local decision**: the parent names no figure; 40 GiB is sized for PostgreSQL data + WAL, Redpanda segments, MinIO archives, images and a restore drill on one host. The re-check exists because volumes live under the data root, which providers commonly mount separately and which a pre-existing `daemon.json` may relocate |
+| Swap | `swapoff -a`, systemd `.swap`/zram units masked (both `systemd-zram-setup@*` and `zram-tools`' `zramswap.service`); `/etc/fstab` amended only with `--persist-swap-off`. Swap is disabled on **every** run, including `--allow-undersized` ones: on a memory-tight host with swap genuinely in use, `swapoff -a` must fault every swapped page back into RAM, so it either fails (aborting the run) or invokes the OOM killer. Free memory, or `swapoff` by hand, before bootstrapping such a host | **historical-source requirement** (§21.1) |
+| Free disk | at least **40 GiB** free on the filesystem that holds Docker's data root — `/var/lib/docker` when it already exists, otherwise `/var/lib` — and re-checked against `docker info --format '{{.DockerRootDir}}'` once Docker is installed | **local decision**: the historical comprehensive-design source names no figure; 40 GiB is sized for PostgreSQL data + WAL, Redpanda segments, MinIO archives, images and a restore drill on one host. The re-check exists because volumes live under the data root, which providers commonly mount separately and which a pre-existing `daemon.json` may relocate |
 | Volume byte quotas | preflight **warns** when the filesystem backing Docker's data root (same path as the row above) is not mounted with **project** quotas — `prjquota`/`pquota` only; user (`quota`, `usrquota`) and group (`grpquota`) quotas do not satisfy it, because they give a Docker `local` volume no byte ceiling | **derived requirement** for §21.4 (see §8): Docker `local` volumes cannot enforce a byte quota without `prjquota` or a per-store loopback image |
-| Evidence prerequisites | `sysstat` installed; host/run manifest emitted per run | **parent-mandated** (§21.16 records VM/kernel/storage details, image digests, configuration hashes) |
+| Evidence prerequisites | `sysstat` installed; host/run manifest emitted per run | **historical-source requirement** (§21.16 records VM/kernel/storage details, image digests, configuration hashes) |
 | PIDs and open-file limits | declared per container in the overlays; the host sets a `nofile` default-ulimit of 65536 as a floor | §21.1 mandates the per-container limits; the host default-ulimit is a **local decision** |
-| `fs.aio-max-nr = 1048576` | `/etc/sysctl.d/99-core-banking-poc.conf` | **derived requirement**: Redpanda/Seastar needs it and Ubuntu's default is 65536, so §21.7 and ACC-35 fail without it. The parent does not name the sysctl. |
+| `fs.aio-max-nr = 1048576` | `/etc/sysctl.d/99-core-banking-poc.conf` | **derived requirement**: Redpanda/Seastar needs it and Ubuntu's default is 65536, so §21.7 and ACC-35 fail without it. The historical comprehensive-design source does not name the sysctl. |
 | `fs.file-max`, `net.core.somaxconn`, `fs.inotify.max_user_instances`, `fs.inotify.max_user_watches` | same file | **local decision** (headroom for the container fleet) |
 | Docker `live-restore` | `/etc/docker/daemon.json` | **local decision** (a dockerd restart should not take the stack down mid-run) |
 | Docker apt signing key | pinned to primary fingerprint `9DC858229FC7DD38854AE2D88D81803C0EBFCD88` before it is installed into `/etc/apt/keyrings/docker.asc`; the run fails if it does not match | **local decision**: the key is fetched over TLS from `download.docker.com`, which authenticates the host but not the key. The pin is a tripwire against a substituted key on a mirror, proxy or captive portal — apt would otherwise accept anything that key signs. Docker publishes no fingerprint outside the key itself, so this is a substitution tripwire, not out-of-band trust |
 | Firewall | `ufw` default-deny inbound, allowing tcp/80, tcp/443 and the **union of `ssh.socket`'s `ListenStream` ports and the ports `sshd -T` reports** (fallback tcp/22; tokens that are not valid TCP port numbers are warned about and skipped, and tcp/22 is opened when the probe yields no usable port at all, so `ufw --force enable` can never leave the host with no SSH rule); plus a `DOCKER-USER` chain that drops new inbound traffic on the default-route interface except tcp/80 and tcp/443, installed under `iptables` and mirrored into `ip6tables` **when that chain set exists** (a warning otherwise, see §9). After installing the chain the script asserts that `FORWARD` actually jumps to `DOCKER-USER` — fatal for IPv4, a warning for IPv6 | §17.2 mandates the boundary; **the mechanism is a local decision**. The `DOCKER-USER` hook is required because Docker's published ports bypass `ufw`. The SSH port set is derived rather than hardcoded so a host hardened out of band (see the SSH row) is not locked out for new connections the moment `ufw` is enabled. The `FORWARD` assertion catches the case where dockerd installs no jump at all — `"iptables": false` in a pre-existing `daemon.json` (which the merge deliberately preserves) or a dockerd on the nftables firewall backend — in which case the chain would exist, look correct and filter nothing |
 | Unattended upgrades | `apt-daily.timer`, `apt-daily-upgrade.timer`, `apt-daily.service`, `apt-daily-upgrade.service` and `unattended-upgrades.service` disabled and masked before the first `apt-get` call; `APT::Periodic` switched off; a bounded, non-fatal `cloud-init status --wait` where cloud-init is present | **local decision** serving §21.16 (a background dockerd restart or reboot invalidates an evidence run). The `.service` units are masked as well as their timers because masking a timer only stops *future* triggers — a job already running keeps its apt locks |
 | Time synchronisation | `systemd-timesyncd` enabled; the script asserts `timedatectl` reports NTP-synchronised and fails otherwise | **local decision** serving §8.8 (bitemporal records) and §21.16 (evidence timestamps). `chrony` is an acceptable substitute. |
-| Operator identity | provisioning and Compose run as `root` | **local PoC decision**. The parent has no host user model. `apt`, `sysctl`, `swapoff` and `ufw` all require root, and adding a non-root user to the `docker` group would be root-equivalent rather than least privilege, so it is not done. Least privilege is enforced *inside* the stack: distinct service identities and database roles (§17.1), and application database roles that cannot alter journal facts, disable invariant triggers or impersonate an auditor (§17.7). |
+| Operator identity | provisioning and Compose run as `root` | **local PoC decision**. The historical comprehensive-design source has no host user model. `apt`, `sysctl`, `swapoff` and `ufw` all require root, and adding a non-root user to the `docker` group would be root-equivalent rather than least privilege, so it is not done. Least privilege is enforced *inside* the stack: distinct service identities and database roles (§17.1), and application database roles that cannot alter journal facts, disable invariant triggers or impersonate an auditor (§17.7). |
 | SSH | key-only authentication, `PermitRootLogin prohibit-password`, password authentication disabled | **local decision**; not automated by the bootstrap script — apply it in the provider image or by configuration management before exposing the host. Note that openssh-server on 24.04 is **socket-activated**: `sshd-socket-generator` normally propagates `Port`/`ListenAddress` from `sshd_config` into `ssh.socket.d`, so the two agree — but an operator who edits `ssh.socket` directly moves the listener while `sshd -T` still reports 22, which is why the firewall opens the union of both (see the Firewall row) |
 
 Firewall rules installed in `DOCKER-USER` are not persisted across reboot; re-run the bootstrap script after a reboot (it is idempotent). **A re-run is the whole pipeline, not a firewall repair**: it re-runs `apt-get install docker-ce …` with **no version pin** (so Docker Engine and the Compose plugin can move to a newer version part-way through a multi-profile campaign — each manifest self-describes, but the campaign is then no longer on one engine), it **drains and restarts the running profile** (`down --remove-orphans`, then `up -d --wait`), and it writes a new manifest and a new before/after component-set pair. It also briefly empties the `CORE-BANKING` chain while refilling it. Re-run in a maintenance window and file the result as a **new run**, not a repair.
@@ -321,7 +336,7 @@ Retention: Redpanda topic retention, retry/DLQ bytes and maximum partitions are 
 - **DNS and certificates.** The demonstration hostname resolves to the VPS; the proxy obtains a public certificate via ACME (HTTP-01 on tcp/80, which is why tcp/80 is open). Where the host has no public DNS name, the proxy uses a certificate from the local PoC CA and clients are configured to trust it. Either way, the internal PoC CA is used for mTLS, never for the public edge on a public name.
 - **SSH.** Key-only authentication, no password authentication, `PermitRootLogin prohibit-password`. Applied out of band (see §5).
 - **Data protection.** Sensitive fields are encrypted at rest with separable keys and account identifiers are masked in logs and interfaces; BVN, NIN, PAN, customer names and full account numbers never appear in metric labels, traces, event headers or Temporal search attributes (§17.4). Test data remains synthetic (§17.7).
-- **Compliance boundary.** The PoC excludes production-grade KYC/AML and high-trust regulatory commitments; the governing privacy baseline and its boundaries are stated in §17.4 and §14.3 of the parent.
+- **Compliance boundary.** The PoC excludes production-grade KYC/AML and high-trust regulatory commitments; the historical privacy boundary is labelled §17.4 and §14.3, while maintained future-state authority remains the [production-platform proposal](../proposals/README.md#production-platform).
 
 ---
 
@@ -356,7 +371,7 @@ Retention: Redpanda topic retention, retry/DLQ bytes and maximum partitions are 
 
 Grafana and Tempo are optional and are disabled in the concurrency profile; dashboards can be queried from retained Prometheus metrics after the run (§21.14).
 
-The required business and resource metrics are enumerated in §18.2 of the parent and are a precondition for the §21.16 tuning loop.
+The required business and resource metrics carry historical source labels §18.2 and §21.16 and remain governed by the [full-PoC proposal](../proposals/README.md#full-poc-platform).
 
 **Health endpoints (§18.3).**
 - `/health` — liveness: reports whether the process can execute.
@@ -384,7 +399,7 @@ Readiness does not claim that all dependencies will stay available. Services imp
 
 ## 12) Acceptance criteria for this environment
 
-The acceptance matrix is §23.1 of the parent. **It cannot all run under one profile**, and this document does not claim it does. ACC-25 is explicitly "run **each** declared profile under its exact versioned overlay and mixed-workload soak", and the supported PoC is an evidence suite executed **across** declared profiles (§21.1).
+The acceptance matrix carries historical source label §23.1 and remains governed by the [full-PoC proposal](../proposals/README.md#full-poc-platform). **It cannot all run under one profile**, and this document does not claim it does. ACC-25 is explicitly "run **each** declared profile under its exact versioned overlay and mixed-workload soak", and the supported PoC is an evidence suite executed **across** declared profiles (§21.1).
 
 | Profile | Scenarios | Why this profile |
 |---|---|---|
@@ -444,7 +459,8 @@ These manifests are not part of the single-VPS PoC evidence path. Nothing in §1
 
 ## 15) References
 
-- Parent design: @architecture/modern-core-banking-comprehensive-design-revised.md
+- Maintained authority: [Full-PoC proposal](../proposals/README.md#full-poc-platform), [production-platform proposal](../proposals/README.md#production-platform), [ADR-0008 resource envelope](../adr/0008-target-an-eight-gib-single-vm-evidence-suite.md#single-vm-resource-envelope), and [arc42 deployment view](../arc42/07-deployment-view.md)
+- Historical comprehensive-design source labels (non-authoritative, intentionally unlinked):
   - §6 system context; §7 service ownership and boundaries; §8.8 bitemporal fields; §8.14 account restrictions
   - §17.1–17.7 security, secrets, data protection, PoC identity minimum
   - §18.1–18.4 telemetry, business metrics, health endpoints, runbooks

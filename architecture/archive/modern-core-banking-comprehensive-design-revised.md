@@ -1,5 +1,7 @@
 # Modern Core Banking System
 
+Historical source document — non-authoritative; see /ARCHITECTURE.md and the migration inventory.
+
 ## Comprehensive Architecture and Single-VPS Proof-of-Concept Design
 
 **Status:** Architecture-review revision for PoC approval
