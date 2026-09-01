@@ -1376,9 +1376,15 @@ def validate_archive_review(root: Path) -> list[str]:
     return sorted(set(errors))
 
 def validate_archive_state(root: Path) -> list[str]:
-    rows, _ = _parse_migration_inventory(root / MIGRATION_INVENTORY)
-    all_rows_resolved = bool(rows) and all(row.resolution == "resolved" for row in rows)
-    source, errors = select_comprehensive_source(root, all_rows_resolved)
+    rows, errors = _parse_migration_inventory(root / MIGRATION_INVENTORY)
+    if not rows and not errors:
+        errors.append(_migration_error("migration inventory must contain at least one row for archive state"))
+    invalid_resolutions = [row for row in rows if row.resolution not in MIGRATION_RESOLUTIONS]
+    for row in invalid_resolutions:
+        errors.append(_migration_error(f"unsupported resolution {row.resolution or 'empty'} for {row.source_key}"))
+    all_rows_resolved = bool(rows) and not invalid_resolutions and all(row.resolution == "resolved" for row in rows)
+    source, source_errors = select_comprehensive_source(root, all_rows_resolved)
+    errors.extend(source_errors)
     if source == root / MIGRATION_ARCHIVE_SOURCE:
         errors.extend(validate_archive_review(root))
     return sorted(set(errors))

@@ -198,6 +198,22 @@ class ValidatorTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         return self.write_archive_migration_fixture(resolved=resolved)
 
+    def reset_root(self):
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def initialize_archive_review_fixture(self):
+        self.reset_root()
+        self.init_git()
+        self.write("README.md", "# Fixture repository\n")
+        fixture_root = self.commit_all("fixture root")
+        self.write_archive_migration_fixture(resolved=True)
+        reviewed_commit = self.commit_all("resolved migration inventory")
+        inventory_blob = self.git("rev-parse", f"{reviewed_commit}:architecture/archive/comprehensive-design-migration-inventory.md")
+        self.write_archive_review(reviewed_commit, inventory_blob)
+        return fixture_root, reviewed_commit, inventory_blob
+
     def archive_comprehensive_source(self):
         old_source = self.root / "architecture/modern-core-banking-comprehensive-design-revised.md"
         archived_source = self.root / "architecture/archive/modern-core-banking-comprehensive-design-revised.md"
@@ -1285,6 +1301,83 @@ class ValidatorTest(unittest.TestCase):
         self.git("commit", "-q", "-m", "change inventory after review")
         errors = validator.validate_archive_review(self.root)
         self.assertTrue(any("current committed inventory differs from reviewed inventory" in error for error in errors), errors)
+
+    def test_archive_state_rejects_invalid_inventory_but_allows_unresolved_pre_cutover(self):
+        inventory_error = "architecture/archive/comprehensive-design-migration-inventory.md: "
+
+        self.write(validator.MIGRATION_SOURCE, "# Source\n")
+        errors = validator.validate_archive_state(self.root)
+        self.assertIn(inventory_error + "migration inventory is required", errors)
+
+        self.reset_root()
+        self.write(validator.MIGRATION_SOURCE, "# Source\n")
+        self.write(validator.MIGRATION_INVENTORY, "# Inventory without the governed table\n")
+        errors = validator.validate_archive_state(self.root)
+        self.assertIn(inventory_error + "exact migration inventory table header is required", errors)
+
+        self.reset_root()
+        self.write(validator.MIGRATION_SOURCE, "# Source\n")
+        self.write(
+            validator.MIGRATION_INVENTORY,
+            "| Source key | Source heading | Covered blocks | Disposition | Destination map | Evidence | Rationale | Resolution |\n"
+            "|---|---|---|---|---|---|---|---|\n",
+        )
+        errors = validator.validate_archive_state(self.root)
+        self.assertIn(inventory_error + "migration inventory must contain at least one row for archive state", errors)
+
+        self.reset_archive_migration_fixture()
+        inventory = self.root / validator.MIGRATION_INVENTORY
+        inventory.write_text(inventory.read_text().replace("| unresolved |", "| pending |", 1))
+        errors = validator.validate_archive_state(self.root)
+        self.assertIn(inventory_error + "unsupported resolution pending for 27", errors)
+
+        self.reset_archive_migration_fixture()
+        self.assertEqual([], validator.validate_archive_state(self.root))
+
+    def test_archive_review_rejects_history_and_uncommitted_byte_binding_mutations(self):
+        review_error = "architecture/archive/comprehensive-design-migration-review.md: "
+
+        _, reviewed_commit, _ = self.initialize_archive_review_fixture()
+        self.write("later.txt", "later pre-review state\n")
+        self.git("add", "later.txt")
+        self.git("commit", "-q", "-m", "later pre-review state")
+        self.git("add", validator.MIGRATION_REVIEW)
+        self.git("commit", "-q", "-m", "introduce review after a later parent")
+        self.assertEqual(
+            [review_error + "Reviewed commit must equal the review evidence introduction parent"],
+            validator.validate_archive_review(self.root),
+        )
+
+        _, reviewed_commit, _ = self.initialize_archive_review_fixture()
+        review_text = (self.root / validator.MIGRATION_REVIEW).read_text()
+        self.git("add", validator.MIGRATION_REVIEW)
+        self.git("commit", "-q", "-m", "first review introduction")
+        self.git("rm", "-q", validator.MIGRATION_REVIEW)
+        self.git("commit", "-q", "-m", "remove review evidence")
+        self.write(validator.MIGRATION_REVIEW, review_text)
+        self.git("add", validator.MIGRATION_REVIEW)
+        self.git("commit", "-q", "-m", "second review introduction")
+        self.assertEqual(
+            [review_error + "review evidence must have one unique introduction commit"],
+            validator.validate_archive_review(self.root),
+        )
+
+        _, reviewed_commit, _ = self.initialize_archive_review_fixture()
+        self.git("branch", "reviewed-state", reviewed_commit)
+        self.git("checkout", "-q", "--orphan", "root-review")
+        self.commit_all("root introduction of review evidence")
+        self.assertEqual(
+            [review_error + "review evidence introduction commit must have one parent"],
+            validator.validate_archive_review(self.root),
+        )
+
+        _, reviewed_commit, _ = self.initialize_archive_review_fixture()
+        inventory = self.root / validator.MIGRATION_INVENTORY
+        inventory.write_text(inventory.read_text().replace("B01 belongs", "B01 still belongs", 1))
+        errors = validator.validate_archive_review(self.root)
+        self.assertEqual([review_error + "current filesystem inventory differs from reviewed inventory"], errors)
+        self.assertFalse(any("unresolved" in error for error in errors), errors)
+        self.assertRegex(reviewed_commit, r"^[0-9a-f]{40}$")
 
 
 class DiagramAndToolingValidatorTest(unittest.TestCase):
