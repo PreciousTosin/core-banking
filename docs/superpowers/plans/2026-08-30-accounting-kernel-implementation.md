@@ -1261,6 +1261,8 @@ git commit -m "security(funds-core): enforce ledger database roles"
 
 ---
 
+<a id="java-memory-evidence-delivery-detail"></a>
+<!-- migration-source: 21.09::03 -->
 ### Task 13: Add memory-bounded configuration and complete the accounting-kernel gate
 
 **Files:**

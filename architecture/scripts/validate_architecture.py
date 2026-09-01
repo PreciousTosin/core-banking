@@ -450,7 +450,9 @@ def _validate_source_preamble(source_text: str) -> list[str]:
     first_numbered = re.search(r"^##\s+1\.\s+", source_text, re.M)
     if not first_numbered:
         return [_migration_error("document preamble cannot be delimited because section 1 is missing")]
-    lines = [line.strip() for line in source_text[:first_numbered.start()].splitlines() if line.strip()]
+    raw_lines = source_text[:first_numbered.start()].splitlines()
+    material_lines = [(index, line.strip()) for index, line in enumerate(raw_lines) if line.strip()]
+    lines = [line for _, line in material_lines]
     expected_prefix = [
         "# Modern Core Banking System",
         "## Comprehensive Architecture and Single-VPS Proof-of-Concept Design",
@@ -458,6 +460,8 @@ def _validate_source_preamble(source_text: str) -> list[str]:
     metadata_labels = ("Status", "Version", "Date", "Base currency", "Audience")
     valid = len(lines) == 8 and lines[:2] == expected_prefix and lines[-1] == "---"
     valid = valid and all(re.match(rf"^\*\*{re.escape(label)}:\*\*\s+\S", lines[index + 2]) for index, label in enumerate(metadata_labels))
+    metadata_positions = [index for index, _ in material_lines[2:7]]
+    valid = valid and len(metadata_positions) == 5 and metadata_positions == list(range(metadata_positions[0], metadata_positions[0] + 5))
     return [] if valid else [_migration_error("document preamble must tokenize independently as exact P01, P02, and P03 material")]
 
 def _explicit_anchor_lines(text: str) -> dict[str, list[int]]:
@@ -653,6 +657,8 @@ def validate_migration_inventory(root: Path) -> list[str]:
             errors.append(_migration_error(f"unsupported disposition {row.disposition or 'empty'} for {row.source_key}"))
         if row.resolution not in MIGRATION_RESOLUTIONS:
             errors.append(_migration_error(f"unsupported resolution {row.resolution or 'empty'} for {row.source_key}"))
+        if row.resolution == "unresolved" and row.disposition not in {"decision", "proposal"}:
+            errors.append(_migration_error(f"unresolved resolution is allowed only for decision or proposal rows: {row.source_key}"))
         if not row.rationale:
             errors.append(_migration_error(f"rationale must not be empty for {row.source_key}"))
         if row.disposition == "historical-only" and not (re.search(r"archiv|histor", row.rationale, re.I) and re.search(r"no maintained[^.]*destination", row.rationale, re.I)):

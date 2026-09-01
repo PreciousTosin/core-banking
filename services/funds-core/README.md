@@ -55,9 +55,19 @@ docker run --rm --entrypoint java --memory=640m --cpus=0.60 --pids-limit=256 \
 
 The test gate contains unit, deterministic generated-property, PostgreSQL integration, failure-injection and real child-process crash tests; no accounting test is intentionally skipped. Full service startup additionally requires the separately migrated profile database and is deferred to the deployment-profile plan.
 
+<a id="memory-boundary"></a>
+<!-- migration-source: 21.09::01 -->
 ## Memory boundary
 
 The image uses `-Xms128m -Xmx384m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m -Xss512k -XX:+ExitOnOutOfMemoryError` inside the planned 640 MiB container. The remainder is deliberate headroom for JIT code cache, native libraries, TLS/socket buffers and other RSS. Heap dumps are opt-in through an approved encrypted diagnostic workflow. The JDBC pool is bounded to 2–8 connections with a five-second acquisition timeout; the Quarkus worker pool is bounded to 2–8 threads plus 32 queued tasks and rejects overflow; request bodies are capped at 128 KiB. Every posting/reversal transaction applies local one-second lock, three-second statement and five-second idle-transaction deadlines before financial work. No application cache stores financial state. See the [health contract](docs/health-contract.md) for health, saturation and failure semantics.
+
+The container budget covers heap, metaspace, JIT code cache, thread stacks,
+direct/NIO buffers, native libraries, and socket buffers. Admission rejects
+overflow before financial work, and current database reads remain bounded by
+the service's explicit query and transaction limits. The comprehensive
+design's 448 MiB concurrency-replica setting, reconciliation/export streaming,
+and bounded read-through caches remain profile work; this implemented slice
+does not claim those controls.
 
 The target VM has 8 GiB RAM, but that is an evidence-suite budget across versioned normal, concurrency and restore profiles—not permission to run every component at peak simultaneously. Later profile work must measure and cap PostgreSQL connections and per-query memory, use bounded Go queues/goroutines and `GOMEMLIMIT`, stream/paginate file and projection work, bound broker retention/batches, cap workflow history/concurrency and observability queues/label cardinality. Those other-component controls and the exact orchestration limits are planned, not implemented by this module.
 

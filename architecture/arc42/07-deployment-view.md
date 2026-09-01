@@ -14,8 +14,6 @@ code_refs:
 
 # Deployment view
 
-<a id="java-memory-envelope"></a>
-<!-- migration-source: 21.09 -->
 Current evidence is a JVM [Dockerfile](../../services/funds-core/Dockerfile.jvm)
 with bounded memory and a [production-runtime smoke script](../../services/funds-core/scripts/prod-runtime-smoke.sh).
 The smoke script exercises the image against PostgreSQL 18.6 under constrained

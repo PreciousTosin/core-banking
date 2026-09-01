@@ -108,13 +108,21 @@ class ValidatorTest(unittest.TestCase):
                     ]
                 )
                 continue
+            if section == 27:
+                self.write(
+                    "architecture/adr/README.md",
+                    '# Decisions\n<a id="deferred-27"></a>\n<!-- migration-source: 27 -->\n',
+                )
+                rows.append(
+                    "| 27 | 27. Section 27 | B01 | decision | B01=architecture/adr/README.md#deferred-27 | None | B01 requires a governed decision record. | unresolved |"
+                )
+                continue
             self.write(
                 f"architecture/destination-{section:02d}.md",
                 f'# Destination {section}\n<a id="source-{section:02d}"></a>\n<!-- migration-source: {section:02d} -->\n',
             )
-            resolution = "unresolved" if section == 27 else "resolved"
             rows.append(
-                f"| {section:02d} | {section}. Section {section} | B01 | service-detail | B01=architecture/destination-{section:02d}.md#source-{section:02d} | None | B01 belongs in detailed service documentation. | {resolution} |"
+                f"| {section:02d} | {section}. Section {section} | B01 | service-detail | B01=architecture/destination-{section:02d}.md#source-{section:02d} | None | B01 belongs in detailed service documentation. | resolved |"
             )
         self.write_inventory(rows)
         return rows
@@ -370,6 +378,12 @@ class ValidatorTest(unittest.TestCase):
                 self.write_inventory(changed)
                 self.assert_migration_error("document preamble")
 
+    def test_migration_source_preamble_requires_contiguous_metadata_lines(self):
+        self.write_complete_migration_fixture()
+        source = self.root / "architecture/modern-core-banking-comprehensive-design-revised.md"
+        source.write_text(source.read_text().replace("**Version:** 3.1\n**Date:**", "**Version:** 3.1\n\n**Date:**"))
+        self.assert_migration_error("document preamble must tokenize independently")
+
     def test_migration_inventory_rejects_duplicate_malformed_and_unsupported_fields(self):
         rows = self.write_complete_migration_fixture()
         cases = {
@@ -384,6 +398,17 @@ class ValidatorTest(unittest.TestCase):
                     self.reset_migration_fixture()
                 self.write_inventory(changed)
                 self.assert_migration_error(error)
+
+    def test_migration_inventory_allows_unresolved_only_for_decisions_and_proposals(self):
+        self.write_complete_migration_fixture()
+        for disposition in ("current", "service-detail", "plan-detail", "historical-only"):
+            with self.subTest(disposition=disposition):
+                rows = self.reset_migration_fixture()
+                replacement = rows[-1].replace("| decision |", f"| {disposition} |")
+                if disposition == "historical-only":
+                    replacement = replacement.replace("| B01=architecture/adr/README.md#deferred-27 |", "| None |")
+                self.write_inventory([*rows[:-1], replacement])
+                self.assert_migration_error("unresolved resolution is allowed only for decision or proposal rows: 27")
 
     def test_migration_inventory_requires_existing_destination_anchor_and_current_evidence(self):
         rows = self.write_complete_migration_fixture()
