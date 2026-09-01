@@ -59,6 +59,7 @@ class MigrationIT {
                 "product_definition",
                 "product_version",
                 "ledger_account",
+                "ledger_account_chart_mapping",
                 "account_identifier")));
         });
     }
@@ -91,7 +92,8 @@ class MigrationIT {
                 WHERE schemaname = 'funds'
                   AND tablename = 'journal'
                   AND indexname = 'one_reversal_per_original_idx'
-                  AND indexdef LIKE '%WHERE%transaction_type%REVERSAL%'
+                  AND indexdef LIKE '%WHERE%reversal_of_journal_id IS NOT NULL%'
+                  AND indexdef NOT LIKE '%transaction_type%'
                 """));
         });
     }
@@ -137,12 +139,15 @@ class MigrationIT {
                   AND procedure.prosecdef IS DISTINCT FROM (
                       procedure.proname IN (
                           'enforce_external_identifier_customer_scope',
-                          'enforce_journal_reference_consistency',
+                          'enforce_journal_governance',
                           'enforce_posting_reference_consistency',
                           'reject_posting_to_completed_journal',
+                          'enforce_journal_reversibility',
                           'lock_book_for_posting',
+                          'lock_book_chart_for_posting',
                           'lock_period_for_posting',
-                          'lock_account_for_posting'))
+                          'lock_account_for_posting',
+                          'lock_account_mapping_for_posting'))
                 """));
             assertEquals(0, queryInt(connection, """
                 SELECT count(*)
@@ -216,7 +221,7 @@ class MigrationIT {
                 SELECT has_function_privilege(
                     'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')
                 """));
-            assertEquals(3, queryInt(connection, """
+            assertEquals(4, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_proc procedure
                 JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
@@ -224,7 +229,7 @@ class MigrationIT {
                   AND has_function_privilege('funds_app', procedure.oid, 'EXECUTE')
                 """));
             assertEquals(
-                "lock_account_for_posting,lock_book_for_posting,lock_period_for_posting",
+                "jsonb_object_size,lock_account_mapping_for_posting,lock_book_chart_for_posting,lock_period_for_posting",
                 queryString(connection, """
                     SELECT string_agg(procedure.proname, ',' ORDER BY procedure.proname)
                     FROM pg_proc procedure
@@ -239,9 +244,9 @@ class MigrationIT {
                 JOIN pg_language language ON language.oid = procedure.prolang
                 WHERE namespace.nspname = 'funds'
                   AND procedure.proname IN (
-                      'lock_book_for_posting',
+                      'lock_book_chart_for_posting',
                       'lock_period_for_posting',
-                      'lock_account_for_posting')
+                      'lock_account_mapping_for_posting')
                   AND procedure.proisstrict
                   AND procedure.prosecdef
                   AND language.lanname = 'sql'
@@ -265,8 +270,16 @@ class MigrationIT {
                 WHERE namespace.nspname = 'funds'
                   AND has_function_privilege('funds_proof_reader', procedure.oid, 'EXECUTE')
                 """));
-            assertTrue(queryBoolean(connection,
+            assertFalse(queryBoolean(connection,
                 "SELECT has_table_privilege('funds_proof_reader', 'funds.posting', 'SELECT')"));
+            assertTrue(queryBoolean(connection, """
+                SELECT has_column_privilege(
+                    'funds_proof_reader', 'funds.posting', 'signed_minor_units', 'SELECT')
+                """));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_column_privilege(
+                    'funds_proof_reader', 'funds.journal', 'narration', 'SELECT')
+                """));
             assertFalse(queryBoolean(connection,
                 "SELECT has_table_privilege('funds_proof_reader', 'funds.posting', 'INSERT')"));
             assertFalse(queryBoolean(connection, """
@@ -800,26 +813,26 @@ class MigrationIT {
             """);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
             VALUES
                 ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001',
-                 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
             """);
         execute(connection, """
             INSERT INTO funds.product_definition
-                (product_id, product_code, product_kind, finance_principle)
+                (product_id, product_code)
             VALUES
-                ('00000000-0000-0000-0000-000000000003', 'SAVINGS-STANDARD', 'SAVINGS', 'CONVENTIONAL')
+                ('00000000-0000-0000-0000-000000000003', 'SAVINGS-STANDARD')
             """);
         execute(connection, """
             INSERT INTO funds.product_version
                 (product_version_id, product_id, version, effective_from, approval_reference,
-                 policy_hash, policy_json)
+                 policy_hash, policy_json, product_kind, finance_principle)
             VALUES
                 ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000003',
                  1, TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-2026-001',
                  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
-                 '{"interestRate":"0.01"}'::jsonb)
+                 '{"interestRate":"0.01"}'::jsonb, 'SAVINGS', 'CONVENTIONAL')
             """);
         execute(connection, ledgerInsert(
             CUSTOMER_ACCOUNT_A, BOOK_ID, CHART_VERSION_ID, "CUSTOMER-A", "CUSTOMER",
@@ -836,11 +849,11 @@ class MigrationIT {
         execute(connection, """
             INSERT INTO funds.product_version
                 (product_version_id, product_id, version, effective_from, approval_reference,
-                 policy_hash, policy_json)
+                 policy_hash, policy_json, product_kind, finance_principle)
             VALUES
                 ('%s', '00000000-0000-0000-0000-000000000003', 2,
                  TIMESTAMPTZ '2027-01-01 00:00:00+00', 'APP-2027-001',
-                 '%s', '{"interestRate":"0.02"}'::jsonb)
+                 '%s', '{"interestRate":"0.02"}'::jsonb, 'SAVINGS', 'CONVENTIONAL')
             """.formatted(SECOND_PRODUCT_VERSION_ID, EVIDENCE_HASH));
     }
 
@@ -853,17 +866,19 @@ class MigrationIT {
             """.formatted(SECOND_BOOK_ID));
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
             VALUES
-                ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00',
+                 'APP-SECOND-CHART')
             """.formatted(SECOND_CHART_VERSION_ID, SECOND_BOOK_ID));
     }
 
     private void truncateReferenceTables() throws SQLException {
         try (var connection = dataSource.getConnection()) {
             execute(connection, """
-                TRUNCATE funds.account_identifier, funds.ledger_account, funds.accounting_period,
-                    funds.chart_version, funds.book, funds.product_version, funds.product_definition CASCADE
+                TRUNCATE funds.account_identifier, funds.ledger_account_chart_mapping,
+                    funds.ledger_account, funds.accounting_period, funds.chart_version, funds.book,
+                    funds.product_version, funds.product_definition CASCADE
                 """);
         }
     }
@@ -881,15 +896,21 @@ class MigrationIT {
     ) {
         var productValue = productVersionId == null ? "NULL" : "'" + productVersionId + "'";
         return """
-            INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope, product_version_id,
-                 account_class, normal_balance, currency, control_account_code, status, created_at)
-            VALUES
-                ('%s', '%s', '%s', '%s', '%s', %s, '%s', '%s', '%s', 'CUSTOMER-DEPOSITS',
-                 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+            WITH inserted_account AS (
+                INSERT INTO funds.ledger_account
+                    (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
+                VALUES ('%s', '%s', '%s', %s, '%s', 'OPEN',
+                        TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                RETURNING account_id, book_id
+            )
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            SELECT account_id, book_id, '%s', '%s', '%s', '%s', 'CUSTOMER-DEPOSITS', '%s'
+            FROM inserted_account
             """.formatted(
-                accountId, bookId, chartVersionId, accountCode, accountScope, productValue,
-                accountClass, normalBalance, currency);
+                accountId, bookId, accountScope, productValue, currency, chartVersionId,
+                accountCode, accountClass, normalBalance, accountScope);
     }
 
     private static String identifierInsert(

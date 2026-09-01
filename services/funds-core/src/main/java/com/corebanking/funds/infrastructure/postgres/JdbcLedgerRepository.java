@@ -3,6 +3,7 @@ package com.corebanking.funds.infrastructure.postgres;
 import com.corebanking.funds.application.CanonicalJournalHasher;
 import com.corebanking.funds.application.JournalValidator;
 import com.corebanking.funds.application.PostingCommand;
+import com.corebanking.funds.application.PostingDimensions;
 import com.corebanking.funds.application.PostingResult;
 import com.corebanking.funds.application.PostingTransactionObserver;
 import com.corebanking.funds.domain.CurrencyCode;
@@ -19,8 +20,10 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Types;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -121,19 +124,30 @@ public class JdbcLedgerRepository implements LedgerRepository {
         Objects.requireNonNull(commandId, "commandId");
         Objects.requireNonNull(requestHash, "requestHash");
         try (var statement = connection.prepareStatement("""
-            SELECT journal.journal_id, journal.journal_sequence, journal.canonical_hash
+            SELECT command.request_hash, command.state,
+                   journal.journal_id, journal.journal_sequence, journal.canonical_hash
             FROM funds.idempotency_command command
-            JOIN funds.journal journal ON journal.journal_id = command.journal_id
-            WHERE command.command_id = ? AND command.request_hash = ? AND command.state = 'COMPLETED'
+            LEFT JOIN funds.journal journal ON journal.journal_id = command.journal_id
+            WHERE command.command_id = ?
             """)) {
             statement.setObject(1, commandId);
-            statement.setString(2, requestHash);
             try (var rows = statement.executeQuery()) {
                 if (!rows.next()) {
                     return Optional.empty();
                 }
+                if (!requestHash.equals(rows.getString("request_hash"))) {
+                    throw new IdempotencyConflictException(commandId);
+                }
+                if (!"COMPLETED".equals(rows.getString("state"))) {
+                    return Optional.empty();
+                }
+                UUID journalId = rows.getObject("journal_id", UUID.class);
+                if (journalId == null) {
+                    throw new InvalidJournalException(
+                        "completed command has no journal: " + commandId);
+                }
                 return Optional.of(new PostingResult(
-                    rows.getObject("journal_id", UUID.class),
+                    journalId,
                     rows.getLong("journal_sequence"),
                     rows.getString("canonical_hash")));
             }
@@ -199,13 +213,17 @@ public class JdbcLedgerRepository implements LedgerRepository {
     private static void validateBookAndPeriod(Connection connection, JournalDraft journal)
         throws SQLException {
         try (var statement = connection.prepareStatement("""
-            SELECT legal_entity_id, accounting_policy_version
-            FROM funds.lock_book_for_posting(?)
+            SELECT legal_entity_id, accounting_policy_version, timezone,
+                   chart_status, chart_activated_at
+            FROM funds.lock_book_chart_for_posting(?, ?)
             """)) {
             statement.setObject(1, journal.bookId());
+            statement.setObject(2, journal.chartVersionId());
             try (var rows = statement.executeQuery()) {
                 if (!rows.next()) {
-                    throw new InvalidJournalException("book does not exist: " + journal.bookId());
+                    throw new InvalidJournalException(
+                        "book/chart governance does not exist: "
+                            + journal.bookId() + "/" + journal.chartVersionId());
                 }
                 if (!journal.legalEntityId().equals(rows.getObject("legal_entity_id", UUID.class))) {
                     throw new InvalidJournalException("journal legal entity does not match its book");
@@ -213,9 +231,32 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 if (journal.policyVersion() != rows.getInt("accounting_policy_version")) {
                     throw new InvalidJournalException("journal policy version does not match its book");
                 }
+                if (!"ACTIVE".equals(rows.getString("chart_status"))) {
+                    throw new InvalidJournalException("journal chart is not active");
+                }
+                Instant chartActivatedAt = rows.getObject(
+                    "chart_activated_at", OffsetDateTime.class).toInstant();
+                if (chartActivatedAt.isAfter(journal.bookingTime())) {
+                    throw new InvalidJournalException(
+                        "journal chart is not effective for its booking time");
+                }
+                ZoneId timezone;
+                try {
+                    timezone = ZoneId.of(rows.getString("timezone"));
+                } catch (RuntimeException invalidTimezone) {
+                    throw new InvalidJournalException("book has an invalid timezone");
+                }
+                LocalDate localBookingDate = journal.bookingTime().atZone(timezone).toLocalDate();
+                validatePeriod(connection, journal, localBookingDate);
             }
         }
+    }
 
+    private static void validatePeriod(
+        Connection connection,
+        JournalDraft journal,
+        LocalDate localBookingDate
+    ) throws SQLException {
         try (var statement = connection.prepareStatement("""
             SELECT book_id, business_date_from, business_date_to, status
             FROM funds.lock_period_for_posting(?)
@@ -232,6 +273,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 LocalDate from = rows.getObject("business_date_from", LocalDate.class);
                 LocalDate to = rows.getObject("business_date_to", LocalDate.class);
                 if (!journal.bookId().equals(periodBookId)
+                    || localBookingDate.isBefore(from)
+                    || localBookingDate.isAfter(to)
                     || journal.valueDate().isBefore(from)
                     || journal.valueDate().isAfter(to)) {
                     throw new InvalidJournalException("explicit accounting period does not cover the journal");
@@ -286,19 +329,17 @@ public class JdbcLedgerRepository implements LedgerRepository {
         UUID accountId
     ) throws SQLException {
         try (var statement = connection.prepareStatement("""
-            SELECT book_id, currency, control_account_code, status, chart_status
-            FROM funds.lock_account_for_posting(?)
+            SELECT book_id, currency, control_account_code, status, permitted_direction
+            FROM funds.lock_account_mapping_for_posting(?, ?)
             """)) {
             statement.setObject(1, accountId);
+            statement.setObject(2, journal.chartVersionId());
             try (var rows = statement.executeQuery()) {
                 if (!rows.next()) {
                     throw new InvalidJournalException("ledger account does not exist: " + accountId);
                 }
                 if (!journal.bookId().equals(rows.getObject("book_id", UUID.class))) {
                     throw new InvalidJournalException("posting account belongs to another book: " + accountId);
-                }
-                if (!"ACTIVE".equals(rows.getString("chart_status"))) {
-                    throw new InvalidJournalException("posting account chart is not active: " + accountId);
                 }
                 if (!"OPEN".equals(rows.getString("status"))) {
                     throw new InvalidJournalException("posting account is not open: " + accountId);
@@ -307,6 +348,14 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 for (var posting : journal.postings()) {
                     if (accountId.equals(posting.accountId()) && !currency.equals(posting.currency())) {
                         throw new InvalidJournalException("posting currency does not match account: " + accountId);
+                    }
+                    if (accountId.equals(posting.accountId())) {
+                        String permitted = rows.getString("permitted_direction");
+                        if ((posting.signedMinorUnits() > 0 && "CREDIT".equals(permitted))
+                            || (posting.signedMinorUnits() < 0 && "DEBIT".equals(permitted))) {
+                            throw new InvalidJournalException(
+                                "posting direction is not permitted by chart mapping: " + accountId);
+                        }
                     }
                 }
                 return new AccountMetadata(
@@ -379,6 +428,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
             journal.businessTransactionId(),
             journal.legalEntityId(),
             journal.bookId(),
+            journal.chartVersionId(),
             journal.periodId(),
             journal.transactionType(),
             journal.narration(),
@@ -395,8 +445,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
             INSERT INTO funds.journal
                 (journal_id, command_id, correlation_id, business_transaction_id, legal_entity_id,
                  book_id, period_id, transaction_type, narration, booking_time, value_date,
-                 reversal_of_journal_id, policy_version, canonical_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 chart_version_id, reversal_of_journal_id, policy_version, canonical_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING journal_sequence
             """)) {
             statement.setObject(1, journal.journalId());
@@ -410,13 +460,14 @@ public class JdbcLedgerRepository implements LedgerRepository {
             statement.setString(9, journal.narration());
             statement.setObject(10, OffsetDateTime.ofInstant(journal.bookingTime(), ZoneOffset.UTC));
             statement.setObject(11, journal.valueDate());
+            statement.setObject(12, journal.chartVersionId());
             if (journal.reversalOfJournalId() == null) {
-                statement.setNull(12, Types.OTHER);
+                statement.setNull(13, Types.OTHER);
             } else {
-                statement.setObject(12, journal.reversalOfJournalId());
+                statement.setObject(13, journal.reversalOfJournalId());
             }
-            statement.setInt(13, journal.policyVersion());
-            statement.setString(14, canonicalHash);
+            statement.setInt(14, journal.policyVersion());
+            statement.setString(15, canonicalHash);
             try (var rows = statement.executeQuery()) {
                 rows.next();
                 return rows.getLong(1);
@@ -438,7 +489,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 statement.setString(4, posting.currency().value());
                 statement.setLong(5, posting.signedMinorUnits());
                 statement.setLong(6, posting.accountSequence());
-                statement.setString(7, jsonObject(posting.dimensions()));
+                statement.setString(7, PostingDimensions.compactJson(posting.dimensions()));
                 statement.addBatch();
             }
             statement.executeBatch();
@@ -631,19 +682,6 @@ public class JdbcLedgerRepository implements LedgerRepository {
         var overflow = new ArithmeticException(message);
         overflow.initCause(cause);
         return new MonetaryOverflowException(overflow);
-    }
-
-    private static String jsonObject(Map<String, String> values) {
-        var json = new StringBuilder("{");
-        boolean first = true;
-        for (var entry : new TreeMap<>(values).entrySet()) {
-            if (!first) {
-                json.append(',');
-            }
-            first = false;
-            json.append(jsonString(entry.getKey())).append(':').append(jsonString(entry.getValue()));
-        }
-        return json.append('}').toString();
     }
 
     private static String jsonString(String value) {

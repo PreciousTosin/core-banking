@@ -6,7 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.corebanking.funds.application.CanonicalJournalHasher;
+import com.corebanking.funds.application.CanonicalCommandHasher;
 import com.corebanking.funds.application.PostingCommand;
 import com.corebanking.funds.application.PostingResult;
 import com.corebanking.funds.application.PostingService;
@@ -208,10 +208,10 @@ class AccountingProofServiceIT {
         }
         PostingResult ngn = post(80, "NGN", null,
             line(81, PROVIDER, NGN, 10), line(82, CUSTOMER_A, NGN, -10));
-        postFor(otherBook, otherPeriod, otherEntity, 110, "USD", null, List.of(
+        postFor(otherBook, otherChart, otherPeriod, otherEntity, 110, "USD", null, List.of(
             line(111, usdDebit, usd, Long.MAX_VALUE),
             line(113, usdCredit, usd, -Long.MAX_VALUE)));
-        PostingResult huge = postFor(otherBook, otherPeriod, otherEntity, 120, "USD", null, List.of(
+        PostingResult huge = postFor(otherBook, otherChart, otherPeriod, otherEntity, 120, "USD", null, List.of(
             line(112, debitTail, usd, 10),
             line(114, creditTail, usd, -10)));
 
@@ -252,9 +252,9 @@ class AccountingProofServiceIT {
         }
         post(210, "BASE-NGN", null,
             line(211, PROVIDER, NGN, 11), line(212, CUSTOMER_A, NGN, -11));
-        postFor(otherBook, otherPeriod, otherEntity, 220, "OTHER-BOOK", null, List.of(
+        postFor(otherBook, otherChart, otherPeriod, otherEntity, 220, "OTHER-BOOK", null, List.of(
             line(221, otherDebit, NGN, 22), line(222, otherCustomer, NGN, -22)));
-        postFor(BOOK, PERIOD, LEGAL_ENTITY, 230, "BASE-USD", null, List.of(
+        postFor(BOOK, CHART, PERIOD, LEGAL_ENTITY, 230, "BASE-USD", null, List.of(
             line(231, usdDebit, usd, 33), line(232, usdCustomer, usd, -33)));
         PostingResult last = post(240, "OTHER-CONTROL", null,
             line(241, PROVIDER, NGN, 44), line(242, OTHER, NGN, -44));
@@ -276,13 +276,12 @@ class AccountingProofServiceIT {
             seedAccount(connection, maximum, BOOK, CHART, "MAXIMUM", "NGN", "MAXIMUM-CONTROL");
             seedAccount(connection, unit, BOOK, CHART, "UNIT", "NGN", "UNIT-CONTROL");
         }
-        PostingResult result = postFor(BOOK, PERIOD, LEGAL_ENTITY, 310, "EXTREME", null, List.of(
-            line(311, minimum, NGN, Long.MIN_VALUE),
-            line(312, maximum, NGN, Long.MAX_VALUE),
-            line(313, unit, NGN, 1)));
+        PostingResult result = postFor(BOOK, CHART, PERIOD, LEGAL_ENTITY, 310, "EXTREME", null, List.of(
+            line(311, minimum, NGN, Long.MIN_VALUE + 1),
+            line(312, maximum, NGN, Long.MAX_VALUE)));
 
         TrialBalanceProof proof = proofService.trialBalance(BOOK, NGN, result.journalSequence());
-        BigInteger magnitude = new BigInteger("9223372036854775808");
+        BigInteger magnitude = BigInteger.valueOf(Long.MAX_VALUE);
         assertAll(
             () -> assertEquals(magnitude, proof.totalDebits()),
             () -> assertEquals(magnitude, proof.totalCredits()),
@@ -346,18 +345,20 @@ class AccountingProofServiceIT {
     }
 
     private PostingResult post(long seed, String type, UUID reversal, PostingLine... lines) {
-        return postFor(BOOK, PERIOD, LEGAL_ENTITY, seed, type, reversal, List.of(lines));
+        return postFor(BOOK, CHART, PERIOD, LEGAL_ENTITY, seed, type, reversal, List.of(lines));
     }
 
     private PostingResult postFor(
-        UUID book, UUID period, UUID entity, long seed, String type, UUID reversal, List<PostingLine> lines
+        UUID book, UUID chart, UUID period, UUID entity, long seed, String type, UUID reversal,
+        List<PostingLine> lines
     ) {
         UUID commandId = uuid(seed);
         JournalDraft draft = new JournalDraft(
-            uuid(seed + 1_000), commandId, uuid(seed + 2_000), uuid(seed + 3_000), entity, book, period,
+            uuid(seed + 1_000), commandId, uuid(seed + 2_000), uuid(seed + 3_000), entity, book,
+            chart, period,
             type, type, Instant.parse("2026-01-15T10:00:00Z"), LocalDate.of(2026, 1, 15), reversal, 1, lines);
         return postingService.post(new PostingCommand(
-            commandId, new CanonicalJournalHasher().sha256(draft), draft));
+            commandId, new CanonicalCommandHasher().postingV1(draft), draft));
     }
 
     private static PostingLine line(long seed, UUID account, CurrencyCode currency, long amount) {
@@ -369,7 +370,8 @@ class AccountingProofServiceIT {
             execute(connection, """
                 TRUNCATE funds.outbox_event, funds.control_account_projection, funds.materialised_balance,
                     funds.posting, funds.journal, funds.idempotency_command, funds.account_identifier,
-                    funds.ledger_account, funds.accounting_period, funds.chart_version, funds.book,
+                    funds.ledger_account_chart_mapping, funds.ledger_account, funds.accounting_period,
+                    funds.chart_version, funds.book,
                     funds.product_version, funds.product_definition RESTART IDENTITY CASCADE
                 """);
         }
@@ -384,9 +386,10 @@ class AccountingProofServiceIT {
             VALUES (?, ?, ?, 'Africa/Lagos', 'NG', 1)
             """, book, entity, currency);
         execute(connection, """
-            INSERT INTO funds.chart_version (chart_version_id, book_id, version, status, activated_at)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
-            """, chart, book);
+            INSERT INTO funds.chart_version
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', ?)
+            """, chart, book, "PROOF-CHART-" + chart);
         execute(connection, """
             INSERT INTO funds.accounting_period (period_id, book_id, business_date_from, business_date_to, status)
             VALUES (?, ?, DATE '2026-01-01', DATE '2026-01-31', 'OPEN')
@@ -398,11 +401,16 @@ class AccountingProofServiceIT {
     ) throws SQLException {
         execute(connection, """
             INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope, product_version_id,
-                 account_class, normal_balance, currency, control_account_code, status, created_at)
-            VALUES (?, ?, ?, ?, 'INTERNAL', NULL, 'ASSET', 'DEBIT', ?, ?, 'OPEN',
+                (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
+            VALUES (?, ?, 'INTERNAL', NULL, ?, 'OPEN',
                     TIMESTAMPTZ '2026-01-01 00:00:00+00')
-            """, account, book, chart, code, currency, control);
+            """, account, book, currency);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            VALUES (?, ?, ?, ?, 'ASSET', 'DEBIT', ?, 'INTERNAL')
+            """, account, book, chart, code, control);
     }
 
     private static void execute(Connection connection, String sql, Object... values) throws SQLException {

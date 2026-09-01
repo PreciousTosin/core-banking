@@ -7,6 +7,7 @@ import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
+import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.infrastructure.postgres.LedgerRepository;
 import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
 import java.io.PrintWriter;
@@ -29,28 +30,30 @@ class PostingServiceTest {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
 
     @Test
-    void subMicrosecondBookingTimeFailsBeforeRetryJdbcOrRepository() {
+    void subMicrosecondBookingTimeFailsAfterIdempotencyPreflightButBeforeRetryOrPost() {
         var dependencies = new RecordingDependencies();
         PostingService service = dependencies.service();
 
         assertThrows(InvalidJournalException.class, () -> service.post(command(
             Instant.parse("2026-01-15T10:00:00.123456001Z"), 100, -100)));
 
-        assertEquals(0, dependencies.retryPolicy.executions);
-        assertEquals(0, dependencies.dataSource.connections);
+        assertEquals(1, dependencies.retryPolicy.executions);
+        assertEquals(1, dependencies.dataSource.connections);
+        assertEquals(1, dependencies.repository.preflightCalls);
         assertEquals(0, dependencies.repository.calls);
     }
 
     @Test
-    void otherInvalidJournalFailsBeforeRetryJdbcOrRepository() {
+    void otherInvalidJournalFailsAfterIdempotencyPreflightButBeforeRetryOrPost() {
         var dependencies = new RecordingDependencies();
         PostingService service = dependencies.service();
 
         assertThrows(InvalidJournalException.class, () -> service.post(command(
             Instant.parse("2026-01-15T10:00:00.123456Z"), 100, -99)));
 
-        assertEquals(0, dependencies.retryPolicy.executions);
-        assertEquals(0, dependencies.dataSource.connections);
+        assertEquals(1, dependencies.retryPolicy.executions);
+        assertEquals(1, dependencies.dataSource.connections);
+        assertEquals(1, dependencies.repository.preflightCalls);
         assertEquals(0, dependencies.repository.calls);
     }
 
@@ -65,19 +68,94 @@ class PostingServiceTest {
         assertEquals(command.journal().journalId(), result.journalId());
         assertEquals(1, dependencies.retryPolicy.executions);
         assertEquals(1, dependencies.dataSource.connections);
+        assertEquals(1, dependencies.repository.preflightCalls);
         assertEquals(1, dependencies.repository.calls);
+    }
+
+    @Test
+    void completedSameContentReplayResolvesBeforeLaterJournalValidation() {
+        var dependencies = new RecordingDependencies();
+        PostingCommand command = command(
+            Instant.parse("2026-01-15T10:00:00.123456001Z"), 100, -100);
+        var completed = new PostingResult(command.journal().journalId(), 91, "a".repeat(64));
+        dependencies.repository.completed = Optional.of(completed);
+
+        assertEquals(completed, dependencies.service().post(command));
+        assertEquals(1, dependencies.dataSource.connections);
+        assertEquals(1, dependencies.repository.preflightCalls);
+        assertEquals(0, dependencies.repository.calls);
+        assertEquals(1, dependencies.retryPolicy.executions);
+    }
+
+    @Test
+    void staleCallerHashCannotAuthorizeChangedFinancialContent() {
+        var dependencies = new RecordingDependencies();
+        PostingCommand original = command(
+            Instant.parse("2026-01-15T10:00:00.123456Z"), 100, -100);
+        JournalDraft changed = new JournalDraft(
+            original.journal().journalId(), original.commandId(), original.journal().correlationId(),
+            original.journal().businessTransactionId(), original.journal().legalEntityId(),
+            original.journal().bookId(), original.journal().chartVersionId(),
+            original.journal().periodId(), original.journal().transactionType(), "changed narration",
+            original.journal().bookingTime(), original.journal().valueDate(), null,
+            original.journal().policyVersion(), original.journal().postings());
+
+        assertThrows(IdempotencyConflictException.class,
+            () -> dependencies.service().post(new PostingCommand(
+                original.commandId(), original.requestHash(), changed)));
+        assertEquals(0, dependencies.dataSource.connections);
+        assertEquals(0, dependencies.repository.calls);
+    }
+
+    @Test
+    void genericPostingPathRejectsCallerSuppliedReversalMetadata() {
+        var dependencies = new RecordingDependencies();
+        PostingCommand original = command(
+            Instant.parse("2026-01-15T10:00:00.123456Z"), 100, -100);
+        JournalDraft disguised = new JournalDraft(
+            original.journal().journalId(), original.commandId(), original.journal().correlationId(),
+            original.journal().businessTransactionId(), original.journal().legalEntityId(),
+            original.journal().bookId(), original.journal().chartVersionId(),
+            original.journal().periodId(), "NOT_A_REVERSAL", original.journal().narration(),
+            original.journal().bookingTime(), original.journal().valueDate(), uuid(99),
+            original.journal().policyVersion(), original.journal().postings());
+        String hash = new CanonicalCommandHasher().postingV1(disguised);
+
+        assertThrows(InvalidJournalException.class,
+            () -> dependencies.service().post(new PostingCommand(original.commandId(), hash, disguised)));
+        assertEquals(0, dependencies.repository.calls);
+    }
+
+    @Test
+    void staleHashOnCallerSuppliedReversalMetadataConflictsBeforeMetadataValidation() {
+        var dependencies = new RecordingDependencies();
+        PostingCommand original = command(
+            Instant.parse("2026-01-15T10:00:00.123456Z"), 100, -100);
+        JournalDraft disguised = new JournalDraft(
+            original.journal().journalId(), original.commandId(), original.journal().correlationId(),
+            original.journal().businessTransactionId(), original.journal().legalEntityId(),
+            original.journal().bookId(), original.journal().chartVersionId(),
+            original.journal().periodId(), "REVERSAL", original.journal().narration(),
+            original.journal().bookingTime(), original.journal().valueDate(), uuid(99),
+            original.journal().policyVersion(), original.journal().postings());
+
+        assertThrows(IdempotencyConflictException.class,
+            () -> dependencies.service().post(new PostingCommand(
+                original.commandId(), original.requestHash(), disguised)));
+        assertEquals(0, dependencies.dataSource.connections);
+        assertEquals(0, dependencies.repository.calls);
     }
 
     private static PostingCommand command(Instant bookingTime, long debit, long credit) {
         UUID commandId = uuid(1);
         var journal = new JournalDraft(
-            uuid(2), commandId, uuid(3), uuid(4), uuid(5), uuid(6), uuid(7),
+            uuid(2), commandId, uuid(3), uuid(4), uuid(5), uuid(6), uuid(12), uuid(7),
             "BOUNDARY_TEST", "Posting service validation boundary", bookingTime,
             LocalDate.of(2026, 1, 15), null, 1,
             List.of(
                 new PostingLine(uuid(8), uuid(10), NGN, debit, 0, Map.of()),
                 new PostingLine(uuid(9), uuid(11), NGN, credit, 0, Map.of())));
-        return new PostingCommand(commandId, new CanonicalJournalHasher().sha256(journal), journal);
+        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV1(journal), journal);
     }
 
     private static UUID uuid(long value) {
@@ -110,6 +188,8 @@ class PostingServiceTest {
 
     private static final class RecordingRepository implements LedgerRepository {
         private int calls;
+        private int preflightCalls;
+        private Optional<PostingResult> completed = Optional.empty();
 
         @Override
         public PostingResult post(Connection connection, PostingCommand command) {
@@ -123,7 +203,8 @@ class PostingServiceTest {
             UUID commandId,
             String requestHash
         ) {
-            return Optional.empty();
+            preflightCalls++;
+            return completed;
         }
     }
 

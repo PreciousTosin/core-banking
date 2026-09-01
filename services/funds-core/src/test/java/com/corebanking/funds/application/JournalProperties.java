@@ -95,6 +95,7 @@ class JournalProperties {
             uuid(14),
             uuid(15),
             uuid(16),
+            uuid(17),
             "PROPERTY_TEST",
             "Seeded journal property",
             Instant.parse("2026-08-30T00:00:00Z"),

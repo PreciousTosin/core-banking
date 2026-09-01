@@ -16,6 +16,7 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -28,7 +29,8 @@ class JournalValidatorTest {
     private static final UUID BUSINESS_TRANSACTION_ID = uuid(4);
     private static final UUID LEGAL_ENTITY_ID = uuid(5);
     private static final UUID BOOK_ID = uuid(6);
-    private static final UUID PERIOD_ID = uuid(7);
+    private static final UUID CHART_VERSION_ID = uuid(7);
+    private static final UUID PERIOD_ID = uuid(70);
     private static final UUID ASSET_ACCOUNT = uuid(8);
     private static final UUID CUSTOMER_LIABILITY = uuid(9);
     private static final UUID USD_POSITION = uuid(10);
@@ -97,6 +99,35 @@ class JournalValidatorTest {
     }
 
     @Test
+    void rejectsAmountsThatCannotBeExactlyReversed() {
+        assertThrows(IllegalArgumentException.class,
+            () -> line(POSTING_A, ASSET_ACCOUNT, "NGN", Long.MIN_VALUE));
+    }
+
+    @Test
+    void rejectsJournalAndDimensionInputsBeyondTheReversalEnvelope() {
+        var tooManyPostings = new ArrayList<PostingLine>();
+        for (int index = 0; index <= JournalValidator.MAX_POSTINGS_PER_JOURNAL; index++) {
+            tooManyPostings.add(line(uuid(1_000 + index), ASSET_ACCOUNT, "NGN", index % 2 == 0 ? 1 : -1));
+        }
+        assertThrows(InvalidJournalException.class,
+            () -> validator.validate(fixtureJournal(tooManyPostings)));
+
+        var tooManyDimensions = new LinkedHashMap<String, String>();
+        for (int index = 0; index <= JournalValidator.MAX_DIMENSIONS_PER_POSTING; index++) {
+            tooManyDimensions.put("key-" + index, "value-" + index);
+        }
+        assertThrows(InvalidJournalException.class, () -> validator.validate(fixtureJournal(
+            line(POSTING_A, ASSET_ACCOUNT, "NGN", 100, tooManyDimensions),
+            line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100))));
+
+        var oversizedDimensions = Map.of("memo", "x".repeat(JournalValidator.MAX_DIMENSION_JSON_BYTES));
+        assertThrows(InvalidJournalException.class, () -> validator.validate(fixtureJournal(
+            line(POSTING_A, ASSET_ACCOUNT, "NGN", 100, oversizedDimensions),
+            line(POSTING_B, CUSTOMER_LIABILITY, "NGN", -100))));
+    }
+
+    @Test
     void rejectsDuplicatePostingIdentity() {
         var draft = fixtureJournal(
             line(POSTING_A, ASSET_ACCOUNT, "NGN", 100_000),
@@ -156,6 +187,10 @@ class JournalValidatorTest {
             VALUE_DATE, null, 41, postings)));
         hashes.add(hasher.sha256(journal(JOURNAL_ID, COMMAND_ID, CORRELATION_ID, BUSINESS_TRANSACTION_ID,
             LEGAL_ENTITY_ID, uuid(106), PERIOD_ID, "CUSTOMER_CREDIT", "Crédit received", BOOKING_TIME,
+            VALUE_DATE, null, 41, postings)));
+        hashes.add(hasher.sha256(new JournalDraft(
+            JOURNAL_ID, COMMAND_ID, CORRELATION_ID, BUSINESS_TRANSACTION_ID, LEGAL_ENTITY_ID,
+            BOOK_ID, uuid(1_006), PERIOD_ID, "CUSTOMER_CREDIT", "Crédit received", BOOKING_TIME,
             VALUE_DATE, null, 41, postings)));
         hashes.add(hasher.sha256(journal(JOURNAL_ID, COMMAND_ID, CORRELATION_ID, BUSINESS_TRANSACTION_ID,
             LEGAL_ENTITY_ID, BOOK_ID, uuid(107), "CUSTOMER_CREDIT", "Crédit received", BOOKING_TIME,
@@ -219,11 +254,11 @@ class JournalValidatorTest {
     }
 
     @Test
-    void hashSortsDimensionKeysAndConstructorsCopyMutableCollections() {
-        var dimensionsA = new HashMap<String, String>();
+    void hashSortsOpposingDimensionInsertionOrdersAndConstructorsCopyMutableCollections() {
+        var dimensionsA = new LinkedHashMap<String, String>();
         dimensionsA.put("region", "ng");
         dimensionsA.put("channel", "nip");
-        var dimensionsB = new HashMap<String, String>();
+        var dimensionsB = new LinkedHashMap<String, String>();
         dimensionsB.put("channel", "nip");
         dimensionsB.put("region", "ng");
         var postings = new ArrayList<PostingLine>();
@@ -241,6 +276,21 @@ class JournalValidatorTest {
         assertEquals(hasher.sha256(sameContent), hasher.sha256(draft));
         assertThrows(UnsupportedOperationException.class, () -> a.dimensions().put("x", "y"));
         assertThrows(UnsupportedOperationException.class, () -> draft.postings().clear());
+    }
+
+    @Test
+    void hashUsesPostingIdentityAsTheTieBreakForOneAccount() {
+        var first = line(uuid(301), ASSET_ACCOUNT, "NGN", 40);
+        var second = line(uuid(302), ASSET_ACCOUNT, "NGN", 60);
+        var credit = line(uuid(303), CUSTOMER_LIABILITY, "NGN", -100);
+
+        assertEquals(
+            hasher.sha256(fixtureJournal(first, second, credit)),
+            hasher.sha256(fixtureJournal(second, credit, first)));
+        assertNotEquals(
+            hasher.sha256(fixtureJournal(first, second, credit)),
+            hasher.sha256(fixtureJournal(
+                line(uuid(304), ASSET_ACCOUNT, "NGN", 40), second, credit)));
     }
 
     @Test
@@ -289,7 +339,7 @@ class JournalValidatorTest {
         List<PostingLine> postings) {
         return new JournalDraft(
             journalId, commandId, correlationId, businessTransactionId, legalEntityId, bookId,
-            periodId, transactionType, narration, bookingTime, valueDate, reversalOfJournalId,
+            CHART_VERSION_ID, periodId, transactionType, narration, bookingTime, valueDate, reversalOfJournalId,
             policyVersion, postings);
     }
 

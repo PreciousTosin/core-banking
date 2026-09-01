@@ -97,7 +97,8 @@ class PostingServiceIT {
         try (var connection = dataSource.getConnection()) {
             assertAll(
                 () -> assertEquals(JOURNAL_ID, result.journalId()),
-                () -> assertEquals(command.requestHash(), result.canonicalHash()),
+                () -> assertEquals(
+                    new CanonicalJournalHasher().sha256(command.journal()), result.canonicalHash()),
                 () -> assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.journal")),
                 () -> assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting")),
                 () -> assertEquals(100_000, balance(connection, PROVIDER_ASSET)),
@@ -116,7 +117,8 @@ class PostingServiceIT {
                     SELECT count(*) FROM funds.idempotency_command
                     WHERE command_id = '%s' AND request_hash = '%s' AND state = 'COMPLETED'
                       AND journal_id = '%s' AND result_json ->> 'canonicalHash' = '%s'
-                    """.formatted(COMMAND_ID, command.requestHash(), JOURNAL_ID, command.requestHash()))),
+                    """.formatted(COMMAND_ID, command.requestHash(), JOURNAL_ID,
+                        new CanonicalJournalHasher().sha256(command.journal())))),
                 () -> assertEquals(1, queryLong(connection, """
                     SELECT count(*) FROM funds.outbox_event
                     WHERE aggregate_id = '%s' AND aggregate_version = %d
@@ -155,11 +157,11 @@ class PostingServiceIT {
 
         try (var connection = dataSource.getConnection()) {
             assertAll(
-                () -> assertSingleRolledBackAttempt(recordingDataSource),
+                () -> assertEquals(0, recordingDataSource.connections().size()),
                 () -> assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.journal")),
                 () -> assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting")),
                 () -> assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.outbox_event")),
-                () -> assertEquals(first.canonicalHash(), queryString(connection, """
+                () -> assertEquals(command.requestHash(), queryString(connection, """
                     SELECT request_hash FROM funds.idempotency_command WHERE command_id = '%s'
                     """.formatted(COMMAND_ID))));
         }
@@ -355,7 +357,7 @@ class PostingServiceIT {
             var command = exampleACommand(COMMAND_ID, JOURNAL_ID);
 
             PostingResult posted = rolePostingService.post(command);
-            PostingResult reversed = roleReversalService.reverse(new ReversalRequest(
+            PostingResult reversed = roleReversalService.reverse(canonical(new ReversalRequest(
                 uuid(40),
                 "b".repeat(64),
                 posted.journalId(),
@@ -364,7 +366,7 @@ class PostingServiceIT {
                 PERIOD_ID,
                 Instant.parse("2026-01-16T10:00:00Z"),
                 LocalDate.of(2026, 1, 16),
-                "Least-privilege reversal"));
+                "Least-privilege reversal")));
 
             try (var connection = dataSource.getConnection()) {
                 assertAll(
@@ -497,6 +499,7 @@ class PostingServiceIT {
             original.businessTransactionId(),
             original.legalEntityId(),
             original.bookId(),
+            original.chartVersionId(),
             original.periodId(),
             original.transactionType(),
             narration,
@@ -508,7 +511,14 @@ class PostingServiceIT {
     }
 
     private static PostingCommand command(JournalDraft draft) {
-        return new PostingCommand(draft.commandId(), new CanonicalJournalHasher().sha256(draft), draft);
+        return new PostingCommand(draft.commandId(), new CanonicalCommandHasher().postingV1(draft), draft);
+    }
+
+    private static ReversalRequest canonical(ReversalRequest request) {
+        return new ReversalRequest(
+            request.commandId(), new CanonicalCommandHasher().reversalV1(request),
+            request.originalJournalId(), request.correlationId(), request.businessTransactionId(),
+            request.currentPeriodId(), request.bookingTime(), request.valueDate(), request.reason());
     }
 
     private static JournalDraft journal(
@@ -524,6 +534,7 @@ class PostingServiceIT {
             uuid(31),
             LEGAL_ENTITY_ID,
             BOOK_ID,
+            CHART_VERSION_ID,
             PERIOD_ID,
             "PROVIDER_INFLOW",
             "Example A provider inflow",
@@ -710,8 +721,8 @@ class PostingServiceIT {
             """, BOOK_ID, LEGAL_ENTITY_ID);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
             """, CHART_VERSION_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.accounting_period
@@ -720,15 +731,15 @@ class PostingServiceIT {
             """, PERIOD_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.product_definition
-                (product_id, product_code, product_kind, finance_principle)
-            VALUES (?, 'SAVINGS-STANDARD', 'SAVINGS', 'CONVENTIONAL')
+                (product_id, product_code)
+            VALUES (?, 'SAVINGS-STANDARD')
             """, PRODUCT_ID);
         execute(connection, """
             INSERT INTO funds.product_version
                 (product_version_id, product_id, version, effective_from, approval_reference,
-                 policy_hash, policy_json)
+                 policy_hash, policy_json, product_kind, finance_principle)
             VALUES (?, ?, 1, TIMESTAMPTZ '2026-01-01 00:00:00+00',
-                    'APP-2026-001', ?, '{}'::jsonb)
+                    'APP-2026-001', ?, '{}'::jsonb, 'SAVINGS', 'CONVENTIONAL')
             """, PRODUCT_VERSION_ID, PRODUCT_ID, "a".repeat(64));
         insertAccount(
             connection,
@@ -762,20 +773,27 @@ class PostingServiceIT {
     ) throws SQLException {
         execute(connection, """
             INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope,
-                 product_version_id, account_class, normal_balance, currency,
-                 control_account_code, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'NGN', ?, 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
+            VALUES (?, ?, ?, ?, 'NGN', 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+            """,
+            accountId,
+            BOOK_ID,
+            scope,
+            productVersionId);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             accountId,
             BOOK_ID,
             CHART_VERSION_ID,
             code,
-            scope,
-            productVersionId,
             accountClass,
             normalBalance,
-            controlCode);
+            controlCode,
+            scope);
     }
 
     private void execute(String sql) throws SQLException {
@@ -803,6 +821,7 @@ class PostingServiceIT {
                 funds.journal,
                 funds.idempotency_command,
                 funds.account_identifier,
+                funds.ledger_account_chart_mapping,
                 funds.ledger_account,
                 funds.accounting_period,
                 funds.chart_version,

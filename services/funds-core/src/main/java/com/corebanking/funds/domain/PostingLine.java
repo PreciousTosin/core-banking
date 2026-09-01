@@ -18,5 +18,9 @@ public record PostingLine(
         if (signedMinorUnits == 0) {
             throw new IllegalArgumentException("signedMinorUnits must be non-zero");
         }
+        if (signedMinorUnits == Long.MIN_VALUE) {
+            throw new IllegalArgumentException(
+                "signedMinorUnits must be exactly reversible and cannot equal Long.MIN_VALUE");
+        }
     }
 }

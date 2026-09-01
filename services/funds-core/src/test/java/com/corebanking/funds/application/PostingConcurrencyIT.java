@@ -435,7 +435,7 @@ class PostingConcurrencyIT {
     private static PostingCommand command(JournalDraft journal) {
         return new PostingCommand(
             journal.commandId(),
-            new CanonicalJournalHasher().sha256(journal),
+            new CanonicalCommandHasher().postingV1(journal),
             journal);
     }
 
@@ -455,6 +455,7 @@ class PostingConcurrencyIT {
             uuid(idBase + 4),
             LEGAL_ENTITY_ID,
             BOOK_ID,
+            CHART_VERSION_ID,
             PERIOD_ID,
             "CONCURRENT_TRANSFER",
             "Concurrent transfer " + idBase,
@@ -473,8 +474,8 @@ class PostingConcurrencyIT {
             """, BOOK_ID, LEGAL_ENTITY_ID);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
             """, CHART_VERSION_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.accounting_period
@@ -483,15 +484,15 @@ class PostingConcurrencyIT {
             """, PERIOD_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.product_definition
-                (product_id, product_code, product_kind, finance_principle)
-            VALUES (?, 'CONCURRENCY-SAVINGS', 'SAVINGS', 'CONVENTIONAL')
+                (product_id, product_code)
+            VALUES (?, 'CONCURRENCY-SAVINGS')
             """, PRODUCT_ID);
         execute(connection, """
             INSERT INTO funds.product_version
                 (product_version_id, product_id, version, effective_from, approval_reference,
-                 policy_hash, policy_json)
+                 policy_hash, policy_json, product_kind, finance_principle)
             VALUES (?, ?, 1, TIMESTAMPTZ '2026-01-01 00:00:00+00',
-                    'APP-CONCURRENCY-001', ?, '{}'::jsonb)
+                    'APP-CONCURRENCY-001', ?, '{}'::jsonb, 'SAVINGS', 'CONVENTIONAL')
             """, PRODUCT_VERSION_ID, PRODUCT_ID, "a".repeat(64));
         insertAccount(connection, ACCOUNT_A, "ACCOUNT-A", "INTERNAL", null, "ASSET", "DEBIT", "CONTROL-A");
         insertAccount(
@@ -517,20 +518,27 @@ class PostingConcurrencyIT {
     ) throws SQLException {
         execute(connection, """
             INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope,
-                 product_version_id, account_class, normal_balance, currency,
-                 control_account_code, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'NGN', ?, 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
+            VALUES (?, ?, ?, ?, 'NGN', 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+            """,
+            accountId,
+            BOOK_ID,
+            scope,
+            productVersionId);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             accountId,
             BOOK_ID,
             CHART_VERSION_ID,
             code,
-            scope,
-            productVersionId,
             accountClass,
             normalBalance,
-            controlCode);
+            controlCode,
+            scope);
     }
 
     private void truncateAllTables() throws SQLException {
@@ -544,6 +552,7 @@ class PostingConcurrencyIT {
                     funds.journal,
                     funds.idempotency_command,
                     funds.account_identifier,
+                    funds.ledger_account_chart_mapping,
                     funds.ledger_account,
                     funds.accounting_period,
                     funds.chart_version,

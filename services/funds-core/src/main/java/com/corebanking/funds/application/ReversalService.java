@@ -29,9 +29,9 @@ import org.postgresql.util.PSQLException;
 @ApplicationScoped
 public class ReversalService {
     // POC guardrails keep a single correction comfortably bounded on an 8 GiB VM.
-    static final int MAX_POSTINGS_PER_JOURNAL = 256;
-    static final int MAX_DIMENSIONS_PER_POSTING = 32;
-    static final int MAX_DIMENSION_JSON_BYTES = 8_192;
+    static final int MAX_POSTINGS_PER_JOURNAL = JournalValidator.MAX_POSTINGS_PER_JOURNAL;
+    static final int MAX_DIMENSIONS_PER_POSTING = JournalValidator.MAX_DIMENSIONS_PER_POSTING;
+    static final int MAX_DIMENSION_JSON_BYTES = JournalValidator.MAX_DIMENSION_JSON_BYTES;
     static final int QUERY_TIMEOUT_SECONDS = 5;
     private static final int MAX_DIMENSION_ROWS =
         MAX_POSTINGS_PER_JOURNAL * MAX_DIMENSIONS_PER_POSTING;
@@ -41,6 +41,7 @@ public class ReversalService {
     private final PostingService postingService;
     private final JournalValidator validator;
     private final CanonicalJournalHasher hasher;
+    private final CanonicalCommandHasher commandHasher;
 
     @Inject
     public ReversalService(DataSource dataSource, PostingService postingService) {
@@ -48,10 +49,14 @@ public class ReversalService {
         this.postingService = Objects.requireNonNull(postingService, "postingService");
         this.validator = new JournalValidator();
         this.hasher = new CanonicalJournalHasher();
+        this.commandHasher = new CanonicalCommandHasher();
     }
 
     public PostingResult reverse(ReversalRequest request) {
         Objects.requireNonNull(request, "request");
+        if (!request.requestHash().equals(commandHasher.reversalV1(request))) {
+            throw new IdempotencyConflictException(request.commandId());
+        }
         LoadOutcome loaded = loadCoherentFact(request);
         if (loaded.completedResult().isPresent()) {
             return loaded.completedResult().orElseThrow();
@@ -80,6 +85,7 @@ public class ReversalService {
             request.businessTransactionId(),
             original.legalEntityId(),
             original.bookId(),
+            original.currentChartVersionId(),
             request.currentPeriodId(),
             "REVERSAL",
             request.reason(),
@@ -90,7 +96,7 @@ public class ReversalService {
             reversalPostings);
         validator.validate(reversal);
         try {
-            return postingService.post(new PostingCommand(
+            return postingService.postTrustedReversal(new PostingCommand(
                 request.commandId(),
                 request.requestHash(),
                 reversal));
@@ -219,16 +225,21 @@ public class ReversalService {
             SELECT journal.journal_id, journal.command_id, journal.journal_sequence,
                    journal.correlation_id, journal.business_transaction_id,
                    journal.legal_entity_id, journal.book_id, journal.period_id,
+                   journal.chart_version_id,
                    journal.transaction_type, journal.narration, journal.booking_time,
                    journal.value_date, journal.reversal_of_journal_id,
                    journal.policy_version, journal.canonical_hash,
                    command.state AS command_state,
                    command.journal_id AS completed_journal_id,
-                   book.accounting_policy_version AS current_policy_version
+                   book.accounting_policy_version AS current_policy_version,
+                   current_chart.chart_version_id AS current_chart_version_id
             FROM funds.journal journal
             JOIN funds.idempotency_command command
               ON command.command_id = journal.command_id
             JOIN funds.book book ON book.book_id = journal.book_id
+            JOIN funds.chart_version current_chart
+              ON current_chart.book_id = book.book_id
+             AND current_chart.status = 'ACTIVE'
             WHERE journal.journal_id = ?
             """)) {
             statement.setQueryTimeout(QUERY_TIMEOUT_SECONDS);
@@ -251,6 +262,7 @@ public class ReversalService {
                     rows.getObject("business_transaction_id", UUID.class),
                     rows.getObject("legal_entity_id", UUID.class),
                     rows.getObject("book_id", UUID.class),
+                    rows.getObject("chart_version_id", UUID.class),
                     rows.getObject("period_id", UUID.class),
                     rows.getString("transaction_type"),
                     rows.getString("narration"),
@@ -259,7 +271,8 @@ public class ReversalService {
                     rows.getObject("reversal_of_journal_id", UUID.class),
                     rows.getInt("policy_version"),
                     rows.getString("canonical_hash"),
-                    rows.getInt("current_policy_version"));
+                    rows.getInt("current_policy_version"),
+                    rows.getObject("current_chart_version_id", UUID.class));
             }
         }
     }
@@ -372,6 +385,7 @@ public class ReversalService {
             header.businessTransactionId(),
             header.legalEntityId(),
             header.bookId(),
+            header.historicalChartVersionId(),
             header.periodId(),
             header.transactionType(),
             header.narration(),
@@ -391,6 +405,7 @@ public class ReversalService {
             header.legalEntityId(),
             header.bookId(),
             header.reversalOfJournalId(),
+            header.currentChartVersionId(),
             header.currentPolicyVersion(),
             postings);
     }
@@ -501,6 +516,7 @@ public class ReversalService {
         UUID businessTransactionId,
         UUID legalEntityId,
         UUID bookId,
+        UUID historicalChartVersionId,
         UUID periodId,
         String transactionType,
         String narration,
@@ -509,13 +525,15 @@ public class ReversalService {
         UUID reversalOfJournalId,
         int historicalPolicyVersion,
         String canonicalHash,
-        int currentPolicyVersion) {}
+        int currentPolicyVersion,
+        UUID currentChartVersionId) {}
 
     private record OriginalJournal(
         UUID journalId,
         UUID legalEntityId,
         UUID bookId,
         UUID reversalOfJournalId,
+        UUID currentChartVersionId,
         int currentPolicyVersion,
         List<PostingLine> postings) {}
 

@@ -14,7 +14,6 @@ import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
-import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import com.corebanking.funds.infrastructure.postgres.JdbcLedgerRepository;
 import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
 import io.quarkus.test.junit.QuarkusTest;
@@ -118,7 +117,7 @@ class ReversalServiceIT {
     void explicitReversalValueDateMustBelongToCurrentPeriod() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
         closeOriginalAndOpenNextPeriod();
-        ReversalRequest outsideCurrentPeriod = new ReversalRequest(
+        ReversalRequest outsideCurrentPeriod = canonical(new ReversalRequest(
             REVERSAL_COMMAND_ID,
             hash("outside-current-period"),
             ORIGINAL_JOURNAL_ID,
@@ -127,7 +126,7 @@ class ReversalServiceIT {
             NEXT_PERIOD_ID,
             REVERSAL_BOOKING_TIME,
             LocalDate.of(2026, 1, 31),
-            "Explicit date outside current period");
+            "Explicit date outside current period"));
 
         assertThrows(InvalidJournalException.class, () -> reversalService.reverse(outsideCurrentPeriod));
 
@@ -163,7 +162,7 @@ class ReversalServiceIT {
 
         assertThrows(
             InvalidJournalException.class,
-            () -> reversalService.reverse(new ReversalRequest(
+            () -> reversalService.reverse(canonical(new ReversalRequest(
                 TestPostingStack.uuid(220),
                 hash("reversal-chain"),
                 firstReversal.journalId(),
@@ -172,56 +171,37 @@ class ReversalServiceIT {
                 NEXT_PERIOD_ID,
                 REVERSAL_BOOKING_TIME.plusSeconds(60),
                 REVERSAL_VALUE_DATE,
-                "Attempted reversal chain")));
+                "Attempted reversal chain"))));
 
         assertEquals(before, databaseCounts());
     }
 
     @Test
-    void longMinimumNegationIsRejectedAtomically() throws SQLException {
-        UUID thirdAccount = TestPostingStack.uuid(209);
-        seedThirdAccountAndZeroProjections(thirdAccount);
-        PostingCommand extreme = extremeCommand(thirdAccount);
-        postingService.post(extreme);
-        closeOriginalAndOpenNextPeriod();
-        JournalSnapshot originalBefore = journalSnapshot(ORIGINAL_JOURNAL_ID);
+    void longMinimumAmountIsRejectedBeforeItCanBecomeAnIrreversibleFact() throws SQLException {
         DatabaseCounts countsBefore = databaseCounts();
 
         assertThrows(
-            MonetaryOverflowException.class,
-            () -> reversalService.reverse(reversalRequest(
-                REVERSAL_COMMAND_ID,
-                ORIGINAL_JOURNAL_ID,
-                hash("minimum-overflow"))));
+            IllegalArgumentException.class,
+            () -> new PostingLine(TestPostingStack.uuid(214), TestPostingStack.PROVIDER_ASSET,
+                NGN, Long.MIN_VALUE, 0, Map.of("case", "minimum")));
 
         assertAll(
-            () -> assertEquals(originalBefore, journalSnapshot(ORIGINAL_JOURNAL_ID)),
             () -> assertEquals(countsBefore, databaseCounts()),
-            () -> assertEquals(0, queryLong("""
-                SELECT count(*) FROM funds.idempotency_command WHERE command_id = ?
-                """, REVERSAL_COMMAND_ID)));
+            () -> assertEquals(0, count("funds.journal")));
     }
 
     @Test
-    void completedCommandPreflightWinsBeforeOverflowNegation() throws SQLException {
-        UUID thirdAccount = TestPostingStack.uuid(209);
-        seedThirdAccountAndZeroProjections(thirdAccount);
-        PostingCommand alreadyCompleted = exampleA(REVERSAL_COMMAND_ID, TestPostingStack.uuid(240));
-        PostingResult stored = postingService.post(alreadyCompleted);
-        postingService.post(extremeCommand(thirdAccount));
+    void completedReversalPreflightWinsBeforeLaterPeriodPolicyChanges() throws SQLException {
+        postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
         closeOriginalAndOpenNextPeriod();
+        ReversalRequest request = reversalRequest(
+            REVERSAL_COMMAND_ID, ORIGINAL_JOURNAL_ID, "completed-reversal-replay");
+        PostingResult stored = reversalService.reverse(request);
+        execute("UPDATE funds.accounting_period SET status = 'CLOSED' WHERE period_id = ?",
+            NEXT_PERIOD_ID);
         DatabaseCounts before = databaseCounts();
 
-        PostingResult replay = reversalService.reverse(reversalRequest(
-            REVERSAL_COMMAND_ID,
-            ORIGINAL_JOURNAL_ID,
-            alreadyCompleted.requestHash()));
-        assertThrows(
-            IdempotencyConflictException.class,
-            () -> reversalService.reverse(reversalRequest(
-                REVERSAL_COMMAND_ID,
-                ORIGINAL_JOURNAL_ID,
-                hash("overflowing-original-conflict"))));
+        PostingResult replay = reversalService.reverse(request);
 
         assertAll(
             () -> assertEquals(stored, replay),
@@ -253,17 +233,14 @@ class ReversalServiceIT {
     void completedCommandPreflightWinsBeforeInvalidOriginalLookup() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
         closeOriginalAndOpenNextPeriod();
-        String digest = hash("preflight-result");
-        PostingResult stored = reversalService.reverse(reversalRequest(
+        ReversalRequest completedRequest = reversalRequest(
             REVERSAL_COMMAND_ID,
             ORIGINAL_JOURNAL_ID,
-            digest));
+            "preflight-result");
+        PostingResult stored = reversalService.reverse(completedRequest);
         DatabaseCounts before = databaseCounts();
 
-        PostingResult replay = reversalService.reverse(reversalRequest(
-            REVERSAL_COMMAND_ID,
-            TestPostingStack.uuid(999_999),
-            digest));
+        PostingResult replay = reversalService.reverse(completedRequest);
         assertThrows(
             IdempotencyConflictException.class,
             () -> reversalService.reverse(reversalRequest(
@@ -319,16 +296,11 @@ class ReversalServiceIT {
                 0,
                 Map.of()));
         }
-        postingService.post(command(originalJournal(postings)));
-        closeOriginalAndOpenNextPeriod();
         DatabaseCounts before = databaseCounts();
 
         assertThrows(
             InvalidJournalException.class,
-            () -> reversalService.reverse(reversalRequest(
-                REVERSAL_COMMAND_ID,
-                ORIGINAL_JOURNAL_ID,
-                hash("posting-limit"))));
+            () -> postingService.post(command(originalJournal(postings))));
 
         assertEquals(before, databaseCounts());
     }
@@ -339,20 +311,15 @@ class ReversalServiceIT {
         for (int index = 0; index <= ReversalService.MAX_DIMENSIONS_PER_POSTING; index++) {
             dimensions.put("dimension-" + index, "value-" + index);
         }
-        postingService.post(command(originalJournal(List.of(
-            new PostingLine(TestPostingStack.uuid(204), TestPostingStack.PROVIDER_ASSET,
-                NGN, 1, 0, dimensions),
-            new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
-                NGN, -1, 0, Map.of())))));
-        closeOriginalAndOpenNextPeriod();
         DatabaseCounts before = databaseCounts();
 
         assertThrows(
             InvalidJournalException.class,
-            () -> reversalService.reverse(reversalRequest(
-                REVERSAL_COMMAND_ID,
-                ORIGINAL_JOURNAL_ID,
-                hash("dimension-limit"))));
+            () -> postingService.post(command(originalJournal(List.of(
+                new PostingLine(TestPostingStack.uuid(204), TestPostingStack.PROVIDER_ASSET,
+                    NGN, 1, 0, dimensions),
+                new PostingLine(TestPostingStack.uuid(205), TestPostingStack.CUSTOMER_LIABILITY,
+                    NGN, -1, 0, Map.of()))))));
 
         assertEquals(before, databaseCounts());
     }
@@ -362,10 +329,10 @@ class ReversalServiceIT {
         String exactBoundary = "é".repeat(256);
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
         closeOriginalAndOpenNextPeriod();
-        ReversalRequest exactRequest = new ReversalRequest(
+        ReversalRequest exactRequest = canonical(new ReversalRequest(
             REVERSAL_COMMAND_ID, hash("boundary"), ORIGINAL_JOURNAL_ID,
             TestPostingStack.uuid(212), TestPostingStack.uuid(213), NEXT_PERIOD_ID,
-            REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, exactBoundary);
+            REVERSAL_BOOKING_TIME, REVERSAL_VALUE_DATE, exactBoundary));
         PostingResult accepted = reversalService.reverse(exactRequest);
 
         assertAll(
@@ -469,11 +436,12 @@ class ReversalServiceIT {
     void matchingInProgressCommandContinuesButDifferentHashConflictsFirst() throws SQLException {
         postingService.post(exampleA(ORIGINAL_COMMAND_ID, ORIGINAL_JOURNAL_ID));
         closeOriginalAndOpenNextPeriod();
-        String digest = hash("visible-in-progress");
+        ReversalRequest request = reversalRequest(
+            REVERSAL_COMMAND_ID, ORIGINAL_JOURNAL_ID, "visible-in-progress");
         execute("""
             INSERT INTO funds.idempotency_command (command_id, request_hash, state, created_at)
             VALUES (?, ?, 'IN_PROGRESS', CURRENT_TIMESTAMP)
-            """, REVERSAL_COMMAND_ID, digest);
+            """, REVERSAL_COMMAND_ID, request.requestHash());
 
         assertThrows(
             IdempotencyConflictException.class,
@@ -481,10 +449,7 @@ class ReversalServiceIT {
                 REVERSAL_COMMAND_ID,
                 TestPostingStack.uuid(999_999),
                 hash("visible-in-progress-conflict"))));
-        PostingResult result = reversalService.reverse(reversalRequest(
-            REVERSAL_COMMAND_ID,
-            ORIGINAL_JOURNAL_ID,
-            digest));
+        PostingResult result = reversalService.reverse(request);
 
         assertAll(
             () -> assertEquals(2, count("funds.journal")),
@@ -517,7 +482,7 @@ class ReversalServiceIT {
         assertThrows(InvalidJournalException.class, () -> postingService.post(subMicrosecond));
         closeOriginalAndOpenNextPeriod();
         Instant reversalTime = Instant.parse("2026-02-15T09:30:00.654321Z");
-        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(new ReversalRequest(
+        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(canonical(new ReversalRequest(
             TestPostingStack.uuid(252),
             hash("sub-microsecond-reversal"),
             ORIGINAL_JOURNAL_ID,
@@ -526,8 +491,8 @@ class ReversalServiceIT {
             NEXT_PERIOD_ID,
             Instant.parse("2026-02-15T09:30:00.654321001Z"),
             REVERSAL_VALUE_DATE,
-            "Invalid precision")));
-        ReversalRequest request = new ReversalRequest(
+            "Invalid precision"))));
+        ReversalRequest request = canonical(new ReversalRequest(
             REVERSAL_COMMAND_ID,
             hash("microsecond-reversal"),
             ORIGINAL_JOURNAL_ID,
@@ -536,7 +501,7 @@ class ReversalServiceIT {
             NEXT_PERIOD_ID,
             reversalTime,
             REVERSAL_VALUE_DATE,
-            "Microsecond correction");
+            "Microsecond correction"));
         PostingResult reversalResult = reversalService.reverse(request);
 
         assertAll(
@@ -569,28 +534,20 @@ class ReversalServiceIT {
 
     @Test
     void rejectsOversizedDimensionValueBeforeExpansion() throws SQLException {
-        postDimensionFixture(Map.of("k", "x".repeat(8_184)));
-        closeOriginalAndOpenNextPeriod();
         DatabaseCounts before = databaseCounts();
 
-        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(reversalRequest(
-            REVERSAL_COMMAND_ID,
-            ORIGINAL_JOURNAL_ID,
-            hash("oversized-dimension-value"))));
+        assertThrows(InvalidJournalException.class,
+            () -> postDimensionFixture(Map.of("k", "x".repeat(8_184))));
 
         assertEquals(before, databaseCounts());
     }
 
     @Test
     void rejectsOversizedDimensionKeyBeforeExpansion() throws SQLException {
-        postDimensionFixture(Map.of("k".repeat(8_185), ""));
-        closeOriginalAndOpenNextPeriod();
         DatabaseCounts before = databaseCounts();
 
-        assertThrows(InvalidJournalException.class, () -> reversalService.reverse(reversalRequest(
-            REVERSAL_COMMAND_ID,
-            ORIGINAL_JOURNAL_ID,
-            hash("oversized-dimension-key"))));
+        assertThrows(InvalidJournalException.class,
+            () -> postDimensionFixture(Map.of("k".repeat(8_185), "")));
 
         assertEquals(before, databaseCounts());
     }
@@ -627,6 +584,7 @@ class ReversalServiceIT {
             TestPostingStack.uuid(283),
             TestPostingStack.LEGAL_ENTITY_ID,
             TestPostingStack.BOOK_ID,
+            TestPostingStack.CHART_VERSION_ID,
             TestPostingStack.PERIOD_ID,
             "COLLISION_FIXTURE",
             "Pre-existing unrelated posting identifier",
@@ -658,13 +616,13 @@ class ReversalServiceIT {
             new JdbcLedgerRepository(),
             new PostgresRetryPolicy((commandId, attempt) -> {})) {
             @Override
-            public PostingResult post(PostingCommand command) {
+            PostingResult postTrustedReversal(PostingCommand command) {
                 try {
                     bothCommandsComposed.await(5, TimeUnit.SECONDS);
                 } catch (Exception failure) {
                     throw new IllegalStateException("reversal race gate failed", failure);
                 }
-                return super.post(command);
+                return super.postTrustedReversal(command);
             }
         };
         ReversalService racingReversal = new ReversalService(dataSource, racingPosting);
@@ -710,6 +668,7 @@ class ReversalServiceIT {
             TestPostingStack.uuid(203),
             TestPostingStack.LEGAL_ENTITY_ID,
             TestPostingStack.BOOK_ID,
+            TestPostingStack.CHART_VERSION_ID,
             TestPostingStack.PERIOD_ID,
             "PROVIDER_INFLOW",
             "Example A provider inflow",
@@ -733,6 +692,7 @@ class ReversalServiceIT {
             source.businessTransactionId(),
             source.legalEntityId(),
             source.bookId(),
+            source.chartVersionId(),
             source.periodId(),
             source.transactionType(),
             source.narration(),
@@ -768,6 +728,7 @@ class ReversalServiceIT {
             TestPostingStack.uuid(203),
             TestPostingStack.LEGAL_ENTITY_ID,
             TestPostingStack.BOOK_ID,
+            TestPostingStack.CHART_VERSION_ID,
             TestPostingStack.PERIOD_ID,
             "LIMIT_FIXTURE",
             "POC bounded-reversal fixture",
@@ -778,48 +739,32 @@ class ReversalServiceIT {
             postings);
     }
 
-    private PostingCommand extremeCommand(UUID thirdAccount) {
-        return command(new JournalDraft(
-            ORIGINAL_JOURNAL_ID,
-            ORIGINAL_COMMAND_ID,
-            TestPostingStack.uuid(202),
-            TestPostingStack.uuid(203),
-            TestPostingStack.LEGAL_ENTITY_ID,
-            TestPostingStack.BOOK_ID,
-            TestPostingStack.PERIOD_ID,
-            "EXTREME_BALANCED",
-            "Balanced journal containing Long.MIN_VALUE",
-            Instant.parse("2026-01-20T10:00:00Z"),
-            LocalDate.of(2026, 1, 20),
-            null,
-            1,
-            List.of(
-                new PostingLine(TestPostingStack.uuid(214), TestPostingStack.PROVIDER_ASSET,
-                    NGN, Long.MIN_VALUE, 0, Map.of("case", "minimum")),
-                new PostingLine(TestPostingStack.uuid(215), TestPostingStack.CUSTOMER_LIABILITY,
-                    NGN, Long.MAX_VALUE, 0, Map.of("case", "maximum")),
-                new PostingLine(TestPostingStack.uuid(216), thirdAccount,
-                    NGN, 1, 0, Map.of("case", "unit")))));
-    }
-
     private static PostingCommand command(JournalDraft journal) {
         return new PostingCommand(
             journal.commandId(),
-            new CanonicalJournalHasher().sha256(journal),
+            new CanonicalCommandHasher().postingV1(journal),
             journal);
     }
 
-    private static ReversalRequest reversalRequest(UUID commandId, UUID originalJournalId, String requestHash) {
-        return new ReversalRequest(
+    private static ReversalRequest reversalRequest(UUID commandId, UUID originalJournalId, String hashLabel) {
+        return canonical(new ReversalRequest(
             commandId,
-            requestHash,
+            hash(hashLabel),
             originalJournalId,
             TestPostingStack.uuid(212),
             TestPostingStack.uuid(213),
             NEXT_PERIOD_ID,
             REVERSAL_BOOKING_TIME,
             REVERSAL_VALUE_DATE,
-            "Customer-requested correction");
+            "Customer-requested correction"));
+    }
+
+    private static ReversalRequest canonical(ReversalRequest request) {
+        String requestHash = new CanonicalCommandHasher().reversalV1(request);
+        return new ReversalRequest(
+            request.commandId(), requestHash, request.originalJournalId(), request.correlationId(),
+            request.businessTransactionId(), request.currentPeriodId(), request.bookingTime(),
+            request.valueDate(), request.reason());
     }
 
     private void closeOriginalAndOpenNextPeriod() throws SQLException {
@@ -835,24 +780,6 @@ class ReversalServiceIT {
         }
     }
 
-    private void seedThirdAccountAndZeroProjections(UUID accountId) throws SQLException {
-        try (var connection = dataSource.getConnection()) {
-            TestPostingStack.execute(connection, """
-                INSERT INTO funds.ledger_account
-                    (account_id, book_id, chart_version_id, account_code, account_scope,
-                     account_class, normal_balance, currency, control_account_code, status, created_at)
-                VALUES (?, ?, ?, 'ROUNDING-ASSET', 'INTERNAL', 'ASSET', 'DEBIT', 'NGN',
-                        ?, 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
-                """, accountId, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
-                TestPostingStack.PROVIDER_CONTROL);
-            TestPostingStack.execute(connection, """
-                UPDATE funds.materialised_balance
-                SET signed_posting_total = 0, latest_account_sequence = 0, version = 0
-                """);
-            TestPostingStack.execute(connection, "DELETE FROM funds.control_account_projection");
-        }
-    }
-
     private void insertIncompleteOriginal() throws SQLException {
         try (var connection = dataSource.getConnection()) {
             connection.setAutoCommit(false);
@@ -865,13 +792,14 @@ class ReversalServiceIT {
                 TestPostingStack.execute(connection, """
                     INSERT INTO funds.journal
                         (journal_id, command_id, correlation_id, business_transaction_id,
-                         legal_entity_id, book_id, period_id, transaction_type, narration,
+                         legal_entity_id, book_id, chart_version_id, period_id, transaction_type, narration,
                          booking_time, value_date, policy_version, canonical_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'INCOMPLETE_FIXTURE', 'Incomplete command fixture',
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INCOMPLETE_FIXTURE', 'Incomplete command fixture',
                             TIMESTAMPTZ '2026-01-15 10:00:00+00', DATE '2026-01-15', 1, ?)
                     """, ORIGINAL_JOURNAL_ID, ORIGINAL_COMMAND_ID, TestPostingStack.uuid(202),
                     TestPostingStack.uuid(203), TestPostingStack.LEGAL_ENTITY_ID,
-                    TestPostingStack.BOOK_ID, TestPostingStack.PERIOD_ID, hash("incomplete-journal"));
+                    TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                    TestPostingStack.PERIOD_ID, hash("incomplete-journal"));
                 TestPostingStack.execute(connection, """
                     INSERT INTO funds.posting
                         (posting_id, journal_id, account_id, currency, signed_minor_units,

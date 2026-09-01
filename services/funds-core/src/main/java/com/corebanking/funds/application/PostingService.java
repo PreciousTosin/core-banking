@@ -1,6 +1,8 @@
 package com.corebanking.funds.application;
 
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
+import com.corebanking.funds.domain.exception.IdempotencyConflictException;
+import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.infrastructure.postgres.LedgerRepository;
 import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -17,6 +19,7 @@ public class PostingService {
     private final PostgresRetryPolicy retryPolicy;
     private final PostingTransactionObserver observer;
     private final JournalValidator validator;
+    private final CanonicalCommandHasher commandHasher;
 
     public PostingService(
         DataSource dataSource,
@@ -38,17 +41,47 @@ public class PostingService {
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
         this.observer = Objects.requireNonNull(observer, "observer");
         this.validator = new JournalValidator();
+        this.commandHasher = new CanonicalCommandHasher();
     }
 
     public PostingResult post(PostingCommand command) {
+        return post(command, false);
+    }
+
+    PostingResult postTrustedReversal(PostingCommand command) {
+        return post(command, true);
+    }
+
+    private PostingResult post(PostingCommand command, boolean trustedReversal) {
         Objects.requireNonNull(command, "command");
-        validator.validate(command.journal());
+        boolean linkedReversal = command.journal().reversalOfJournalId() != null;
+        if (trustedReversal) {
+            if (!linkedReversal || !"REVERSAL".equals(command.journal().transactionType())) {
+                throw new InvalidJournalException("trusted reversal path requires linked REVERSAL journal");
+            }
+        } else {
+            if (!command.requestHash().equals(commandHasher.postingV1(command.journal()))) {
+                throw new IdempotencyConflictException(command.commandId());
+            }
+            if (linkedReversal || "REVERSAL".equals(command.journal().transactionType())) {
+                throw new InvalidJournalException(
+                    "generic posting path does not accept reversal metadata");
+            }
+        }
+
         return retryPolicy.execute(command.commandId(), () -> {
             try (Connection connection = dataSource.getConnection()) {
                 connection.setAutoCommit(false);
                 connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
                 PostingResult result;
                 try {
+                    var completed = repository.findCompleted(
+                        connection, command.commandId(), command.requestHash());
+                    if (completed.isPresent()) {
+                        connection.rollback();
+                        return completed.orElseThrow();
+                    }
+                    validator.validate(command.journal());
                     result = repository.post(connection, command);
                     observer.beforeCommit(command.commandId());
                     connection.commit();

@@ -13,6 +13,7 @@ public record JournalDraft(
     UUID businessTransactionId,
     UUID legalEntityId,
     UUID bookId,
+    UUID chartVersionId,
     UUID periodId,
     String transactionType,
     String narration,
@@ -29,6 +30,7 @@ public record JournalDraft(
         businessTransactionId = Objects.requireNonNull(businessTransactionId, "businessTransactionId");
         legalEntityId = Objects.requireNonNull(legalEntityId, "legalEntityId");
         bookId = Objects.requireNonNull(bookId, "bookId");
+        chartVersionId = Objects.requireNonNull(chartVersionId, "chartVersionId");
         periodId = Objects.requireNonNull(periodId, "periodId");
         transactionType = Objects.requireNonNull(transactionType, "transactionType");
         narration = Objects.requireNonNull(narration, "narration");

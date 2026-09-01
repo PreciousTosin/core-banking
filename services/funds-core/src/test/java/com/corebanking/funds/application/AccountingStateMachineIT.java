@@ -147,6 +147,7 @@ class AccountingStateMachineIT {
             journal.businessTransactionId(),
             journal.legalEntityId(),
             journal.bookId(),
+            journal.chartVersionId(),
             journal.periodId(),
             journal.transactionType(),
             journal.narration(),
@@ -341,6 +342,7 @@ class AccountingStateMachineIT {
             deterministicUuid(seed, operationIndex, 3),
             fixture.legalEntityId(),
             fixture.bookId(),
+            fixture.chartVersionId(),
             fixture.periodId(),
             transactionType,
             "seed=" + seed + ", operation=" + operationIndex,
@@ -368,7 +370,7 @@ class AccountingStateMachineIT {
     }
 
     private static PostingCommand command(JournalDraft draft) {
-        return new PostingCommand(draft.commandId(), new CanonicalJournalHasher().sha256(draft), draft);
+        return new PostingCommand(draft.commandId(), new CanonicalCommandHasher().postingV1(draft), draft);
     }
 
     private static UUID randomUuid(SplittableRandom random) {
@@ -408,9 +410,9 @@ class AccountingStateMachineIT {
                 """, fixture.bookId(), fixture.legalEntityId());
             execute(connection, """
                 INSERT INTO funds.chart_version
-                    (chart_version_id, book_id, version, status, activated_at)
-                VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
-                """, fixture.chartVersionId(), fixture.bookId());
+                    (chart_version_id, book_id, version, status, activated_at, approval_reference)
+                VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', ?)
+                """, fixture.chartVersionId(), fixture.bookId(), "CHART-" + seedIndex);
             execute(connection, """
                 INSERT INTO funds.accounting_period
                     (period_id, book_id, business_date_from, business_date_to, status)
@@ -418,14 +420,15 @@ class AccountingStateMachineIT {
                 """, fixture.periodId(), fixture.bookId());
             execute(connection, """
                 INSERT INTO funds.product_definition
-                    (product_id, product_code, product_kind, finance_principle)
-                VALUES (?, ?, 'SAVINGS', 'CONVENTIONAL')
+                    (product_id, product_code)
+                VALUES (?, ?)
                 """, fixture.productId(), "STATE-MACHINE-" + seedIndex);
             execute(connection, """
                 INSERT INTO funds.product_version
                     (product_version_id, product_id, version, effective_from, approval_reference,
-                     policy_hash, policy_json)
-                VALUES (?, ?, 1, TIMESTAMPTZ '2026-01-01 00:00:00+00', ?, ?, '{}'::jsonb)
+                     policy_hash, policy_json, product_kind, finance_principle)
+                VALUES (?, ?, 1, TIMESTAMPTZ '2026-01-01 00:00:00+00', ?, ?, '{}'::jsonb,
+                        'SAVINGS', 'CONVENTIONAL')
                 """,
                 fixture.productVersionId(),
                 fixture.productId(),
@@ -451,20 +454,27 @@ class AccountingStateMachineIT {
     ) throws SQLException {
         execute(connection, """
             INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope,
-                 product_version_id, account_class, normal_balance, currency,
-                 control_account_code, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'NGN', ?, 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
+            VALUES (?, ?, ?, ?, 'NGN', 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+            """,
+            accountId,
+            fixture.bookId(),
+            accountScope,
+            productVersionId);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             accountId,
             fixture.bookId(),
             fixture.chartVersionId(),
             accountCode,
-            accountScope,
-            productVersionId,
             accountClass,
             normalBalance,
-            controlCode);
+            controlCode,
+            accountScope);
     }
 
     private static void execute(Connection connection, String sql, Object... values) throws SQLException {

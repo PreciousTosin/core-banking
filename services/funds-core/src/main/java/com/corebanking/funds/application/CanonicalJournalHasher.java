@@ -29,6 +29,7 @@ public class CanonicalJournalHasher {
         encoder.field("businessTransactionId", draft.businessTransactionId());
         encoder.field("legalEntityId", draft.legalEntityId());
         encoder.field("bookId", draft.bookId());
+        encoder.field("chartVersionId", draft.chartVersionId());
         encoder.field("periodId", draft.periodId());
         encoder.field("transactionType", draft.transactionType());
         encoder.field("narration", draft.narration());

@@ -124,10 +124,10 @@ class LedgerConstraintIT {
     @Test
     void rejectsAccountControlMappingChangeAfterJournalCommit() throws Exception {
         withCommittedJournal(connection -> assertSqlState(connection, "55000", """
-            UPDATE funds.ledger_account
+            UPDATE funds.ledger_account_chart_mapping
             SET control_account_code = 'REWRITTEN-CONTROL'
-            WHERE account_id = '%s'
-            """.formatted(CUSTOMER_ACCOUNT_A)));
+            WHERE account_id = '%s' AND chart_version_id = '%s'
+            """.formatted(CUSTOMER_ACCOUNT_A, CHART_VERSION_ID)));
     }
 
     @Test
@@ -136,8 +136,9 @@ class LedgerConstraintIT {
             insertAlternateChartForMainBook(connection);
 
             assertSqlState(connection, "55000", """
-                UPDATE funds.ledger_account SET chart_version_id = '%s' WHERE account_id = '%s'
-                """.formatted(uuid(24), CUSTOMER_ACCOUNT_A));
+                UPDATE funds.ledger_account_chart_mapping SET chart_version_id = '%s'
+                WHERE account_id = '%s' AND chart_version_id = '%s'
+                """.formatted(uuid(24), CUSTOMER_ACCOUNT_A, CHART_VERSION_ID));
         });
     }
 
@@ -148,9 +149,9 @@ class LedgerConstraintIT {
 
             assertSqlState(connection, "55000", """
                 UPDATE funds.ledger_account
-                SET book_id = '%s', chart_version_id = '%s'
+                SET book_id = '%s'
                 WHERE account_id = '%s'
-                """.formatted(SECOND_BOOK_ID, SECOND_CHART_VERSION_ID, CUSTOMER_ACCOUNT_A));
+                """.formatted(SECOND_BOOK_ID, CUSTOMER_ACCOUNT_A));
         });
     }
 
@@ -281,12 +282,14 @@ class LedgerConstraintIT {
                 insertReferenceGraph(setup);
                 insertInProgressCommand(setup, COMMAND_ID, REQUEST_HASH);
                 insertJournal(setup, JOURNAL_ID, COMMAND_ID, LEGAL_ENTITY_ID, BOOK_ID, PERIOD_ID);
+                insertPosting(setup, uuid(395), JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 1, 1);
+                insertPosting(setup, uuid(396), JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -1, 1);
                 setup.commit();
             }
             try (var assembly = dataSource.getConnection()) {
                 assembly.setAutoCommit(false);
-                insertPosting(assembly, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 1);
-                insertPosting(assembly, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 1);
+                insertPosting(assembly, POSTING_A_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_A, "NGN", 100, 2);
+                insertPosting(assembly, POSTING_B_ID, JOURNAL_ID, CUSTOMER_ACCOUNT_B, "NGN", -100, 2);
 
                 var completionBackendPid = new AtomicInteger();
                 completion = executor.submit(() -> completeJournal(completionBackendPid));
@@ -301,7 +304,7 @@ class LedgerConstraintIT {
                 assertEquals("COMPLETED", queryString(connection, """
                     SELECT state FROM funds.idempotency_command WHERE command_id = '%s'
                     """.formatted(COMMAND_ID)));
-                assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting"));
+                assertEquals(4, queryLong(connection, "SELECT count(*) FROM funds.posting"));
             }
         } finally {
             if (completion != null) {
@@ -451,10 +454,11 @@ class LedgerConstraintIT {
                 assertEquals("funds_app", queryString(connection, "SELECT current_user"));
                 assertEquals(3, queryLong(connection, "SELECT count(*) FROM funds.ledger_account"));
                 assertEquals(0, queryLong(connection,
-                    "SELECT count(*) FROM funds.lock_book_for_posting(NULL)"));
+                    "SELECT count(*) FROM funds.lock_book_chart_for_posting(NULL, NULL)"));
                 assertEquals(0, queryLong(connection, """
                     SELECT count(*)
-                    FROM funds.lock_account_for_posting(
+                    FROM funds.lock_account_mapping_for_posting(
+                        'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid,
                         'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid)
                     """));
                 execute(connection, """
@@ -596,10 +600,19 @@ class LedgerConstraintIT {
                 assertEquals(0, queryLong(connection, """
                     SELECT coalesce(sum(posting.signed_minor_units::numeric), 0)
                     FROM funds.posting posting
-                    JOIN funds.ledger_account account ON account.account_id = posting.account_id
+                    JOIN funds.journal journal ON journal.journal_id = posting.journal_id
+                    JOIN funds.ledger_account_chart_mapping mapping
+                      ON mapping.account_id = posting.account_id
+                     AND mapping.book_id = journal.book_id
+                     AND mapping.chart_version_id = journal.chart_version_id
                     """));
-                assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.materialised_balance"));
-                assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.control_account_projection"));
+                assertEquals(1, queryLong(connection, """
+                    SELECT count(book_id) FROM funds.control_account_projection
+                    """));
+                assertSqlState(connection, "42501", "SELECT count(*) FROM funds.materialised_balance");
+                assertSqlState(connection, "42501", "SELECT count(*) FROM funds.account_identifier");
+                assertSqlState(connection, "42501", "SELECT count(*) FROM funds.product_version");
+                assertSqlState(connection, "42501", "SELECT payload FROM funds.outbox_event");
                 assertSqlState(connection, "42501", idempotencyInsert(
                     uuid(901), REQUEST_HASH, "IN_PROGRESS", null, null, null));
                 assertSqlState(connection, "42501", "SET ROLE funds_migrator");
@@ -779,11 +792,11 @@ class LedgerConstraintIT {
             """);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
             VALUES
                 ('00000000-0000-0000-0000-000000000002',
                  '00000000-0000-0000-0000-000000000001', 1, 'ACTIVE',
-                 TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                 TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
             """);
         execute(connection, """
             INSERT INTO funds.accounting_period
@@ -795,29 +808,30 @@ class LedgerConstraintIT {
             """);
         execute(connection, """
             INSERT INTO funds.product_definition
-                (product_id, product_code, product_kind, finance_principle)
+                (product_id, product_code)
             VALUES
                 ('00000000-0000-0000-0000-000000000003',
-                 'SAVINGS-STANDARD', 'SAVINGS', 'CONVENTIONAL')
+                 'SAVINGS-STANDARD')
             """);
         execute(connection, """
             INSERT INTO funds.product_version
                 (product_version_id, product_id, version, effective_from, approval_reference,
-                 policy_hash, policy_json)
+                 policy_hash, policy_json, product_kind, finance_principle)
             VALUES
                 ('00000000-0000-0000-0000-000000000004',
                  '00000000-0000-0000-0000-000000000003', 1,
-                 TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-2026-001', '%s', '{}'::jsonb)
+                 TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-2026-001', '%s', '{}'::jsonb,
+                 'SAVINGS', 'CONVENTIONAL')
             """.formatted(REQUEST_HASH));
-        execute(connection, ledgerAccountInsert(
+        insertLedgerAccount(connection,
             CUSTOMER_ACCOUNT_A, BOOK_ID, CHART_VERSION_ID, "CUSTOMER-A", "CUSTOMER",
-            PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN", "CUSTOMER-DEPOSITS"));
-        execute(connection, ledgerAccountInsert(
+            PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN", "CUSTOMER-DEPOSITS");
+        insertLedgerAccount(connection,
             CUSTOMER_ACCOUNT_B, BOOK_ID, CHART_VERSION_ID, "CUSTOMER-B", "CUSTOMER",
-            PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN", "CUSTOMER-DEPOSITS"));
-        execute(connection, ledgerAccountInsert(
+            PRODUCT_VERSION_ID, "LIABILITY", "CREDIT", "NGN", "CUSTOMER-DEPOSITS");
+        insertLedgerAccount(connection,
             USD_ACCOUNT, BOOK_ID, CHART_VERSION_ID, "USD-INTERNAL", "INTERNAL",
-            null, "ASSET", "DEBIT", "USD", "FX-CONTROL"));
+            null, "ASSET", "DEBIT", "USD", "FX-CONTROL");
     }
 
     private static void insertSecondBookAccount(Connection connection) throws SQLException {
@@ -830,19 +844,20 @@ class LedgerConstraintIT {
             """.formatted(SECOND_BOOK_ID));
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
-            VALUES ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+            VALUES ('%s', '%s', 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00',
+                    'APP-SECOND-CHART')
             """.formatted(SECOND_CHART_VERSION_ID, SECOND_BOOK_ID));
-        execute(connection, ledgerAccountInsert(
+        insertLedgerAccount(connection,
             SECOND_ACCOUNT_ID, SECOND_BOOK_ID, SECOND_CHART_VERSION_ID, "SECOND-BOOK", "INTERNAL",
-            null, "ASSET", "DEBIT", "NGN", "SECOND-CONTROL"));
+            null, "ASSET", "DEBIT", "NGN", "SECOND-CONTROL");
     }
 
     private static void insertAlternateChartForMainBook(Connection connection) throws SQLException {
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
-            VALUES ('%s', '%s', 2, 'ACTIVE', TIMESTAMPTZ '2026-02-01 00:00:00+00')
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+            VALUES ('%s', '%s', 2, 'DRAFT', NULL, 'APP-ALTERNATE-CHART')
             """.formatted(uuid(24), BOOK_ID));
     }
 
@@ -905,14 +920,15 @@ class LedgerConstraintIT {
         return """
             INSERT INTO funds.journal
                 (journal_id, command_id, correlation_id, business_transaction_id, legal_entity_id,
-                 book_id, period_id, transaction_type, narration, booking_time, value_date,
+                 book_id, chart_version_id, period_id, transaction_type, narration, booking_time, value_date,
                  policy_version, canonical_hash)
             VALUES
                 ('%s', '%s', '00000000-0000-0000-0000-000000000035',
-                 '00000000-0000-0000-0000-000000000036', '%s', '%s', '%s',
+                 '00000000-0000-0000-0000-000000000036', '%s', '%s', '%s', '%s',
                  'TRANSFER', 'Task 5 integration fixture',
                  TIMESTAMPTZ '2026-01-15 10:00:00+00', DATE '2026-01-15', 1, '%s')
-            """.formatted(journalId, commandId, legalEntityId, bookId, periodId, REQUEST_HASH);
+            """.formatted(journalId, commandId, legalEntityId, bookId, CHART_VERSION_ID,
+                periodId, REQUEST_HASH);
     }
 
     private static String postingInsert(
@@ -932,7 +948,8 @@ class LedgerConstraintIT {
                 postingId, journalId, accountId, currency, signedMinorUnits, accountSequence);
     }
 
-    private static String ledgerAccountInsert(
+    private static void insertLedgerAccount(
+        Connection connection,
         UUID accountId,
         UUID bookId,
         UUID chartVersionId,
@@ -943,19 +960,23 @@ class LedgerConstraintIT {
         String normalBalance,
         String currency,
         String controlAccountCode
-    ) {
+    ) throws SQLException {
         var productValue = productVersionId == null ? "NULL" : "'" + productVersionId + "'";
-        return """
+        execute(connection, """
             INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope,
-                 product_version_id, account_class, normal_balance, currency,
-                 control_account_code, status, created_at)
+                (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
             VALUES
-                ('%s', '%s', '%s', '%s', '%s', %s, '%s', '%s', '%s', '%s',
+                ('%s', '%s', '%s', %s, '%s',
                  'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
             """.formatted(
-                accountId, bookId, chartVersionId, accountCode, accountScope, productValue,
-                accountClass, normalBalance, currency, controlAccountCode);
+                accountId, bookId, accountScope, productValue, currency));
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+            """.formatted(accountId, bookId, chartVersionId, accountCode, accountClass,
+                normalBalance, controlAccountCode, accountScope));
     }
 
     private void truncateAllTables() throws SQLException {
@@ -969,6 +990,7 @@ class LedgerConstraintIT {
                     funds.journal,
                     funds.idempotency_command,
                     funds.account_identifier,
+                    funds.ledger_account_chart_mapping,
                     funds.ledger_account,
                     funds.accounting_period,
                     funds.chart_version,

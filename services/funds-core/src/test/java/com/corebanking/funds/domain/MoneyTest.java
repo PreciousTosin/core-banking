@@ -1,6 +1,5 @@
 package com.corebanking.funds.domain;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.*;
 import java.time.ZoneId;
 import java.util.UUID;
@@ -14,6 +13,11 @@ class MoneyTest {
         assertEquals(Money.of(NGN, 150), Money.of(NGN, 100).add(Money.of(NGN, 50)));
         assertThrows(IllegalArgumentException.class,
             () -> Money.of(NGN, 100).add(Money.of(CurrencyCode.of("USD"), 50)));
+    }
+
+    @Test void rejectsMissingCurrencyAtConstructionBoundary() {
+        assertThrows(NullPointerException.class, () -> Money.of(null, 100));
+        assertThrows(NullPointerException.class, () -> new Money(null, 100));
     }
 
     @Test void rejectsOverflowInsteadOfWrapping() {

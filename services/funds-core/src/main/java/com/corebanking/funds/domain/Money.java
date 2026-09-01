@@ -1,8 +1,13 @@
 package com.corebanking.funds.domain;
 
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
+import java.util.Objects;
 
 public record Money(CurrencyCode currency, long minorUnits) {
+    public Money {
+        currency = Objects.requireNonNull(currency, "currency");
+    }
+
     public static Money of(CurrencyCode currency, long minorUnits) {
         return new Money(currency, minorUnits);
     }

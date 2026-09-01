@@ -42,6 +42,7 @@ public final class CrashPostingWorker {
             TestPostingStack.uuid(31),
             TestPostingStack.LEGAL_ENTITY_ID,
             TestPostingStack.BOOK_ID,
+            TestPostingStack.CHART_VERSION_ID,
             TestPostingStack.PERIOD_ID,
             "PROVIDER_INFLOW",
             "Crash-recovery provider inflow",
@@ -64,7 +65,7 @@ public final class CrashPostingWorker {
                     -POSTING_AMOUNT,
                     0,
                     Map.of("customer", "crash-recovery"))));
-        return new PostingCommand(commandId, new CanonicalJournalHasher().sha256(journal), journal);
+        return new PostingCommand(commandId, new CanonicalCommandHasher().postingV1(journal), journal);
     }
 
     private static String requiredEnvironment(String name) {

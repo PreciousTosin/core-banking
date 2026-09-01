@@ -70,6 +70,7 @@ final class TestPostingStack {
                     funds.journal,
                     funds.idempotency_command,
                     funds.account_identifier,
+                    funds.ledger_account_chart_mapping,
                     funds.ledger_account,
                     funds.accounting_period,
                     funds.chart_version,
@@ -90,8 +91,8 @@ final class TestPostingStack {
             """, BOOK_ID, LEGAL_ENTITY_ID);
         execute(connection, """
             INSERT INTO funds.chart_version
-                (chart_version_id, book_id, version, status, activated_at)
-            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (chart_version_id, book_id, version, status, activated_at, approval_reference)
+            VALUES (?, ?, 1, 'ACTIVE', TIMESTAMPTZ '2026-01-01 00:00:00+00', 'APP-CHART-001')
             """, CHART_VERSION_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.accounting_period
@@ -100,15 +101,15 @@ final class TestPostingStack {
             """, PERIOD_ID, BOOK_ID);
         execute(connection, """
             INSERT INTO funds.product_definition
-                (product_id, product_code, product_kind, finance_principle)
-            VALUES (?, 'CRASH-RECOVERY-SAVINGS', 'SAVINGS', 'CONVENTIONAL')
+                (product_id, product_code)
+            VALUES (?, 'CRASH-RECOVERY-SAVINGS')
             """, PRODUCT_ID);
         execute(connection, """
             INSERT INTO funds.product_version
                 (product_version_id, product_id, version, effective_from, approval_reference,
-                 policy_hash, policy_json)
+                 policy_hash, policy_json, product_kind, finance_principle)
             VALUES (?, ?, 1, TIMESTAMPTZ '2026-01-01 00:00:00+00',
-                    'APP-CRASH-RECOVERY-001', ?, '{}'::jsonb)
+                    'APP-CRASH-RECOVERY-001', ?, '{}'::jsonb, 'SAVINGS', 'CONVENTIONAL')
             """, PRODUCT_VERSION_ID, PRODUCT_ID, "a".repeat(64));
         insertAccount(
             connection,
@@ -142,20 +143,27 @@ final class TestPostingStack {
     ) throws SQLException {
         execute(connection, """
             INSERT INTO funds.ledger_account
-                (account_id, book_id, chart_version_id, account_code, account_scope,
-                 product_version_id, account_class, normal_balance, currency,
-                 control_account_code, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'NGN', ?, 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                (account_id, book_id, account_scope, product_version_id, currency, status, created_at)
+            VALUES (?, ?, ?, ?, 'NGN', 'OPEN', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+            """,
+            accountId,
+            BOOK_ID,
+            accountScope,
+            productVersionId);
+        execute(connection, """
+            INSERT INTO funds.ledger_account_chart_mapping
+                (account_id, book_id, chart_version_id, account_code, account_class,
+                 normal_balance, control_account_code, account_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             accountId,
             BOOK_ID,
             CHART_VERSION_ID,
             accountCode,
-            accountScope,
-            productVersionId,
             accountClass,
             normalBalance,
-            controlCode);
+            controlCode,
+            accountScope);
     }
 
     private static void insertProjectionFixtures(Connection connection) throws SQLException {
