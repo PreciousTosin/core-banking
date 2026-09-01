@@ -171,8 +171,8 @@ def _mask(text: str) -> str:
         i += 1
     return "".join(chars)
 
-def parse_front_matter(path: Path) -> dict[str, str | list[str]]:
-    lines = path.read_text().splitlines()
+def _parse_front_matter_text(text: str) -> dict[str, str | list[str]]:
+    lines = text.splitlines()
     if not lines or lines[0].strip() != "---": return {}
     try: end = lines.index("---", 1)
     except ValueError: return {}
@@ -188,6 +188,9 @@ def parse_front_matter(path: Path) -> dict[str, str | list[str]]:
             if not isinstance(result.get(current), list): result[current] = []
             result[current].append(re.sub(r"^\s+-\s+", "", line).strip())
     return result
+
+def parse_front_matter(path: Path) -> dict[str, str | list[str]]:
+    return _parse_front_matter_text(path.read_text())
 
 def _definitions(masked: str):
     defs = {}; dupes = []
@@ -364,7 +367,7 @@ def _proposal_registry_target(root: Path, identity: str, errors: list[str] | Non
     pointer = _proposal_registry_pointer(root, identity)
     if pointer is None:
         if errors is not None:
-            errors.append(f"{prefix}: proposal registry pointer must occur exactly once immediately after the anchor")
+            errors.append(f"{prefix}: exactly one proposal record pointer must occur immediately after the anchor marker block")
         return None
     local = _local_destination(pointer)
     if local is None or local[1]:
@@ -390,6 +393,52 @@ def _proposal_registry_target(root: Path, identity: str, errors: list[str] | Non
             errors.append(f"{prefix}: proposal registry pointer target does not exist: {destination}")
         return None
     return target
+
+def _registry_section_bounds(text: str) -> tuple[list[str], int, int] | None:
+    lines = _mask_markdown_code(text).splitlines()
+    headings = [index for index, line in enumerate(lines) if re.fullmatch(r"## Governed proposal registry\s*", line)]
+    if len(headings) != 1:
+        return None
+    start = headings[0]
+    end = next((index for index in range(start + 1, len(lines)) if re.match(r"^##\s+", lines[index])), len(lines))
+    return lines, start, end
+
+def _registry_owned_block_end(lines: list[str], anchor_line: int, section_end: int) -> int:
+    anchor_re = re.compile(r'^\s*<a\s+id=["\'][^"\']+["\']\s*>\s*</a>\s*$', re.I)
+    return next((index for index in range(anchor_line + 1, section_end) if anchor_re.match(lines[index])), section_end)
+
+def _standalone_link_destination(line: str) -> str | None:
+    match = re.fullmatch(r"\s*\[[^]]+\]\((?:<([^>]+)>|([^\s)]+))\)\s*", line)
+    return (match.group(1) or match.group(2)) if match else None
+
+def _is_proposal_record_pointer(root: Path, destination: str) -> bool:
+    local = _local_destination(destination)
+    if local is None or local[1]:
+        return False
+    target = ((root / "architecture/proposals") / local[0]).resolve()
+    allowed_parents = {
+        (root / "architecture/proposals").resolve(),
+        (root / "architecture/archive/proposals").resolve(),
+    }
+    return target.parent in allowed_parents and target.suffix == ".md" and target.name != "README.md"
+
+def _unexpected_registry_identities(root: Path) -> list[str]:
+    registry = root / "architecture/proposals/README.md"
+    if not registry.is_file():
+        return []
+    text = registry.read_text()
+    section = _registry_section_bounds(text)
+    if section is None:
+        return []
+    _, start, end = section
+    anchors = _explicit_anchor_lines(text)
+    errors = []
+    for identity, positions in anchors.items():
+        for anchor_line in positions:
+            if not start < anchor_line < end or identity in PROPOSAL_IDENTITIES:
+                continue
+            errors.append(f"architecture/proposals/README.md#{identity}: unexpected governed proposal registry identity")
+    return errors
 
 def _proposal_locations(root: Path, identity: str) -> tuple[Path, Path, list[Path]]:
     active = root / "architecture/proposals" / f"{identity}.md"
@@ -537,6 +586,7 @@ def validate_metadata(root: Path) -> list[str]:
 
     governed_paths = set()
     if (root / "architecture/proposals/README.md").is_file():
+        errors.extend(_unexpected_registry_identities(root))
         for identity in PROPOSAL_IDENTITIES:
             active, archive, locations = _proposal_locations(root, identity)
             governed_paths.update(path.resolve() for path in locations)
@@ -553,6 +603,8 @@ def validate_metadata(root: Path) -> list[str]:
         for path in sorted(directory.rglob("*.md")):
             if path.name == "README.md" or path.resolve() in governed_paths:
                 continue
+            errors.append(_metadata_error(path, root, "unexpected governed proposal record; exactly six same-basename records are allowed"))
+            errors.extend(_validate_proposal_document(path, path.stem, archived, root))
             status = parse_front_matter(path).get("status")
             if archived and status not in TERMINAL_PROPOSAL_STATUSES:
                 errors.append(_metadata_error(path, root, f"status {status or 'missing'} is not terminal"))
@@ -940,16 +992,31 @@ def _proposal_registry_pointer(root: Path, anchor: str) -> str | None:
     anchor_lines = _explicit_anchor_lines(registry.read_text()).get(anchor, [])
     if len(anchor_lines) != 1:
         return None
-    index = anchor_lines[0] + 1
+    anchor_line = anchor_lines[0]
+    section = _registry_section_bounds(registry.read_text())
+    if section is None:
+        section_start, section_end = -1, len(lines)
+    else:
+        _, section_start, section_end = section
+        if not section_start < anchor_line < section_end:
+            return None
+    block_end = _registry_owned_block_end(lines, anchor_line, section_end)
+    index = anchor_line + 1
     marker_re = re.compile(r"^\s*<!--\s*migration-source:\s*[^\s]+\s*-->\s*$")
     while index < len(lines) and marker_re.match(lines[index]):
         index += 1
-    if index >= len(lines):
+    if index >= block_end:
         return None
     pointer = re.fullmatch(r"\s*\[[^]]+\]\((?:<([^>]+)>|([^\s)]+))\)\s*", lines[index])
     if not pointer:
         return None
-    if index + 1 < len(lines) and re.fullmatch(r"\s*\[[^]]+\]\((?:<([^>]+)>|([^\s)]+))\)\s*", lines[index + 1]):
+    proposal_pointers = [
+        destination
+        for line in lines[anchor_line + 1:block_end]
+        for destination in [_standalone_link_destination(line)]
+        if destination and _is_proposal_record_pointer(root, destination)
+    ]
+    if len(proposal_pointers) != 1:
         return None
     return pointer.group(1) or pointer.group(2)
 
@@ -1818,6 +1885,99 @@ def validate_proposal_bootstrap(root: Path) -> list[str]:
             errors.append(f"architecture/proposals/README.md#{identity}: bootstrap pointer must resolve to the active record")
     return sorted(errors)
 
+@dataclass(frozen=True)
+class ProposalSnapshot:
+    identity: str
+    path: str
+    status: str
+    related_plans: tuple[str, ...]
+
+def _proposal_snapshot(identity: str, path: str, text: str) -> ProposalSnapshot:
+    metadata = _parse_front_matter_text(text)
+    plans = _proposal_values(metadata, "related_plans")
+    return ProposalSnapshot(identity, path, str(metadata.get("status", "")), tuple(plans or ()))
+
+def _proposal_snapshots_commit(root: Path, commit: str) -> tuple[dict[str, ProposalSnapshot], list[str]]:
+    snapshots = {}
+    errors = []
+    for identity in PROPOSAL_IDENTITIES:
+        paths = (
+            f"architecture/proposals/{identity}.md",
+            f"architecture/archive/proposals/{identity}.md",
+        )
+        found = []
+        for path in paths:
+            result = _run_git(root, "show", f"{commit}:{path}")
+            if result.returncode == 0:
+                found.append(_proposal_snapshot(identity, path, result.stdout))
+        if len(found) != 1:
+            errors.append(f"{commit}: proposal {identity} must have exactly one active or archive record")
+        else:
+            snapshots[identity] = found[0]
+    return snapshots, errors
+
+def _proposal_snapshots_filesystem(root: Path) -> tuple[dict[str, ProposalSnapshot], list[str]]:
+    snapshots = {}
+    errors = []
+    for identity in PROPOSAL_IDENTITIES:
+        _, _, locations = _proposal_locations(root, identity)
+        if len(locations) != 1:
+            errors.append(f"filesystem: proposal {identity} must have exactly one active or archive record")
+        else:
+            path = locations[0]
+            rel = path.relative_to(root).as_posix()
+            snapshots[identity] = _proposal_snapshot(identity, rel, path.read_text())
+    return snapshots, errors
+
+def _validate_proposal_edge(root: Path, parent_commit: str, child_commit: str | None) -> list[str]:
+    parent, errors = _proposal_snapshots_commit(root, parent_commit)
+    if child_commit is None:
+        child, child_errors = _proposal_snapshots_filesystem(root)
+        child_label = "filesystem"
+    else:
+        child, child_errors = _proposal_snapshots_commit(root, child_commit)
+        child_label = child_commit
+    errors.extend(child_errors)
+    for identity in PROPOSAL_IDENTITIES:
+        before = parent.get(identity)
+        after = child.get(identity)
+        if before is None or after is None:
+            continue
+        if not _is_prefix(before.related_plans, after.related_plans):
+            errors.append(
+                f"{parent_commit} -> {child_label}: proposal {identity} related_plans history cannot be erased or reordered"
+            )
+    return sorted(set(errors))
+
+def validate_proposal_history(root: Path, base_ref: str, head_ref: str | None = None) -> list[str]:
+    base_commit, error = _resolve_commit(root, base_ref)
+    if error:
+        return [error]
+    head_commit = None
+    if head_ref is not None:
+        head_commit, error = _resolve_commit(root, head_ref)
+        if error:
+            return [error]
+    return _validate_proposal_edge(root, base_commit, head_commit)
+
+def validate_proposal_edge_range(root: Path, range_base: str, range_head: str) -> list[str]:
+    base_commit, base_error = _resolve_commit(root, range_base)
+    head_commit, head_error = _resolve_commit(root, range_head)
+    errors = [error for error in (base_error, head_error) if error]
+    if errors:
+        return errors
+    if _run_git(root, "merge-base", "--is-ancestor", base_commit, head_commit).returncode:
+        return [f"proposal edge range base is not an ancestor of head: {base_commit}..{head_commit}"]
+    history = _run_git(root, "rev-list", "--reverse", "--topo-order", "--parents", f"{base_commit}..{head_commit}")
+    if history.returncode:
+        return [f"unable to enumerate proposal edge range {base_commit}..{head_commit}"]
+    for line in history.stdout.splitlines():
+        parts = line.split()
+        child, parents = parts[0], parts[1:]
+        for parent in parents:
+            errors.extend(_validate_proposal_edge(root, parent, child))
+    return sorted(set(errors))
+
 def _path_destinations(path: Path, root: Path) -> set[Path]:
     if not path.is_file():
         return set()
@@ -1906,6 +2066,129 @@ def _adr_field_has_link(path: Path, field: str, target: Path, fragment: str = ""
 def _adr_path(root: Path, adr_id: str) -> Path | None:
     matches = sorted((root / "architecture/adr").glob(f"{adr_id[4:]}-*.md"))
     return matches[0] if len(matches) == 1 else None
+
+def _label_bodies(path: Path, label: str) -> list[str]:
+    if not path.is_file():
+        return []
+    pattern = re.compile(rf"^\*\*{re.escape(label)}:\*\*\s*(.*)$")
+    return [match.group(1) for line in _mask_markdown_code(path.read_text()).splitlines() for match in [pattern.match(line)] if match]
+
+def _resolved_link_pairs(path: Path, text: str) -> list[tuple[Path, str]]:
+    result = []
+    for destination in extract_markdown_destinations(text):
+        local = _local_destination(destination)
+        if local is None:
+            continue
+        name, fragment = local
+        result.append((path.resolve() if not name else (path.parent / name).resolve(), fragment))
+    return result
+
+def _document_link_pairs(path: Path) -> list[tuple[Path, str]]:
+    return _resolved_link_pairs(path, path.read_text()) if path.is_file() else []
+
+def _exact_label_links(path: Path, label: str, expected: list[tuple[Path, str]], errors: list[str], message: str) -> None:
+    bodies = _label_bodies(path, label)
+    rel = path.as_posix()
+    if len(bodies) != 1:
+        errors.append(f"{rel}: exactly one {label} header is required")
+        return
+    destinations = extract_markdown_destinations(bodies[0])
+    if len(destinations) != len(expected) or Counter(_resolved_link_pairs(path, bodies[0])) != Counter(expected):
+        errors.append(f"{rel}: {message}")
+
+def _validate_exact_plan_contracts(root: Path) -> list[str]:
+    errors = []
+    registry = (root / "architecture/proposals/README.md").resolve()
+    adr_dir = (root / "architecture/adr").resolve()
+    for identity, plan_name in PROPOSAL_PLANS.items():
+        plan = root / plan_name
+        if not plan.is_file():
+            errors.append(f"{plan_name}: governed implementation plan is required")
+            continue
+        expected_adrs = [(_adr_path(root, adr_id).resolve(), "") for adr_id in PROPOSAL_ADRS[identity] if _adr_path(root, adr_id)]
+        _exact_label_links(plan, "Proposal", [(registry, identity)], errors, "Proposal mapping must be exact")
+        _exact_label_links(plan, "Related ADRs", expected_adrs, errors, "Related ADRs mapping must be exact")
+        all_pairs = _document_link_pairs(plan)
+        direct_adrs = [pair for pair in all_pairs if pair[0].parent == adr_dir]
+        if Counter(direct_adrs) != Counter(expected_adrs):
+            errors.append(f"{plan_name}: direct ADR mapping must be exact")
+        stable_links = [pair for pair in all_pairs if pair[0] == registry]
+        if Counter(stable_links) != Counter([(registry, identity)]):
+            errors.append(f"{plan_name}: extra stable proposal link or missing governed proposal link")
+
+    accounting = root / ACCOUNTING_PLAN
+    if accounting.is_file():
+        expected_current = [
+            ((root / f"architecture/arc42/{name}").resolve(), "")
+            for name in ("05-building-block-view.md", "06-runtime-view.md", "08-crosscutting-concepts.md")
+        ]
+        expected_adrs = [(_adr_path(root, f"ADR-{number:04d}").resolve(), "") for number in range(2, 7) if _adr_path(root, f"ADR-{number:04d}")]
+        _exact_label_links(accounting, "Current architecture", expected_current, errors, "Current architecture mapping must be exact")
+        _exact_label_links(accounting, "Retrospective ADRs", expected_adrs, errors, "Retrospective ADRs mapping must be exact")
+        all_pairs = _document_link_pairs(accounting)
+        direct_adrs = [pair for pair in all_pairs if pair[0].parent == adr_dir]
+        if Counter(direct_adrs) != Counter(expected_adrs):
+            errors.append(f"{ACCOUNTING_PLAN}: direct retrospective ADR mapping must be exact")
+        if any(pair[0] == registry for pair in all_pairs):
+            errors.append(f"{ACCOUNTING_PLAN}: implemented accounting-kernel plan must not link a stable Proposal identity")
+        if _label_bodies(accounting, "Proposal"):
+            errors.append(f"{ACCOUNTING_PLAN}: implemented accounting-kernel plan must not have a Proposal backlink")
+    return errors
+
+def _validate_reverse_proposal_edges(root: Path) -> list[str]:
+    errors = []
+    registry = (root / "architecture/proposals/README.md").resolve()
+    for adr in sorted((root / "architecture/adr").glob("[0-9][0-9][0-9][0-9]-*.md")):
+        adr_id = f"ADR-{adr.name[:4]}"
+        lines = [line for line in _mask_markdown_code(adr.read_text()).splitlines() if line.startswith("- Related proposals:")]
+        for line in lines:
+            value = line.split(":", 1)[1].strip()
+            if value == "None":
+                continue
+            for destination in extract_markdown_destinations(value):
+                local = _local_destination(destination)
+                if local is None:
+                    errors.append(f"{adr.relative_to(root).as_posix()}: Related proposals must use a stable governed proposal identity")
+                    continue
+                name, identity = local
+                target = adr.resolve() if not name else (adr.parent / name).resolve()
+                if target != registry or identity not in PROPOSAL_IDENTITIES:
+                    errors.append(f"{adr.relative_to(root).as_posix()}: Related proposals names an unknown governed proposal identity: {destination}")
+                    continue
+                record = _proposal_registry_target(root, identity, errors)
+                if record is None:
+                    continue
+                if adr_id not in (_proposal_values(parse_front_matter(record), "related_adrs") or []):
+                    errors.append(f"{adr.relative_to(root).as_posix()}: proposal {identity} metadata does not name {adr_id}")
+
+    plans_dir = root / "docs/superpowers/plans"
+    for plan in sorted(plans_dir.glob("*.md")) if plans_dir.is_dir() else []:
+        bodies = _label_bodies(plan, "Proposal")
+        if not bodies:
+            continue
+        rel = plan.relative_to(root).as_posix()
+        if len(bodies) != 1:
+            errors.append(f"{rel}: exactly one Proposal header is required")
+            continue
+        destinations = extract_markdown_destinations(bodies[0])
+        if len(destinations) != 1:
+            errors.append(f"{rel}: Proposal header must contain exactly one stable governed proposal identity")
+            continue
+        local = _local_destination(destinations[0])
+        if local is None:
+            errors.append(f"{rel}: Proposal header names an unknown governed proposal identity")
+            continue
+        name, identity = local
+        target = plan.resolve() if not name else (plan.parent / name).resolve()
+        if target != registry or identity not in PROPOSAL_IDENTITIES:
+            errors.append(f"{rel}: Proposal header names an unknown governed proposal identity")
+            continue
+        record = _proposal_registry_target(root, identity, errors)
+        if record is None:
+            continue
+        if rel not in (_proposal_values(parse_front_matter(record), "related_plans") or []):
+            errors.append(f"{rel}: proposal {identity} metadata does not name this plan")
+    return errors
 
 def _validate_infrastructure_traceability(root: Path) -> list[str]:
     rel = "architecture/infrastructure/infra-ubuntu24.04-poc.md"
@@ -1997,6 +2280,8 @@ def validate_traceability(root: Path) -> list[str]:
         if re.search(r"^\*\*Proposal:\*\*", _mask_markdown_code(accounting.read_text()), re.M):
             errors.append(f"{ACCOUNTING_PLAN}: implemented accounting-kernel plan must not have a Proposal backlink")
 
+    errors.extend(_validate_reverse_proposal_edges(root))
+    errors.extend(_validate_exact_plan_contracts(root))
     errors.extend(_validate_infrastructure_traceability(root))
     return sorted(set(errors))
 
@@ -2023,11 +2308,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, default=Path(".")); parser.add_argument("--checks")
     parser.add_argument("--adr-base-ref"); parser.add_argument("--adr-head-ref")
     parser.add_argument("--adr-edge-base-ref"); parser.add_argument("--adr-edge-head-ref")
+    parser.add_argument("--proposal-base-ref"); parser.add_argument("--proposal-head-ref")
+    parser.add_argument("--proposal-edge-base-ref"); parser.add_argument("--proposal-edge-head-ref")
     args = parser.parse_args(argv)
     if bool(args.adr_edge_base_ref) != bool(args.adr_edge_head_ref):
         print("--adr-edge-base-ref and --adr-edge-head-ref must be provided together", file=sys.stderr); return 2
     if args.adr_head_ref and not args.adr_base_ref:
         print("--adr-head-ref requires --adr-base-ref", file=sys.stderr); return 2
+    if bool(args.proposal_edge_base_ref) != bool(args.proposal_edge_head_ref):
+        print("--proposal-edge-base-ref and --proposal-edge-head-ref must be provided together", file=sys.stderr); return 2
+    if args.proposal_head_ref and not args.proposal_base_ref:
+        print("--proposal-head-ref requires --proposal-base-ref", file=sys.stderr); return 2
     checks = frozenset(args.checks.split(",")) if args.checks else CHECKS
     unknown = sorted(checks - CHECKS)
     if unknown:
@@ -2037,6 +2328,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         errors.extend(validate_accepted_adr_immutability(args.root, args.adr_base_ref, args.adr_head_ref))
     if args.adr_edge_base_ref:
         errors.extend(validate_accepted_adr_edge_range(args.root, args.adr_edge_base_ref, args.adr_edge_head_ref))
+    if args.proposal_base_ref:
+        errors.extend(validate_proposal_history(args.root, args.proposal_base_ref, args.proposal_head_ref))
+    if args.proposal_edge_base_ref:
+        errors.extend(validate_proposal_edge_range(args.root, args.proposal_edge_base_ref, args.proposal_edge_head_ref))
     if errors:
         print("\n".join(errors), file=sys.stderr); return 1
     print("architecture validation passed"); return 0

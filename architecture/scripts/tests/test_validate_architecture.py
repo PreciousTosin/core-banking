@@ -39,6 +39,26 @@ class ValidatorTest(unittest.TestCase):
         path.write_text(text)
         return path
 
+    def git(self, *args, check=True):
+        result = subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            check=check,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout.strip()
+
+    def init_git(self):
+        self.git("init", "-q")
+        self.git("config", "user.email", "architecture@example.invalid")
+        self.git("config", "user.name", "Architecture Tests")
+
+    def commit_all(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
     def write_arc42(self, name, *, status="current", owners="  - architecture", last_verified="2026-09-01", code_refs="  - services/funds-core/", replacement=None):
         replacement_line = "" if replacement is None else f"replacement: {replacement}\n"
         return self.write(
@@ -358,6 +378,50 @@ class ValidatorTest(unittest.TestCase):
                 errors = validator.validate_metadata(self.root)
                 self.assertTrue(any(fragment in error for error in errors), errors)
 
+    def test_metadata_rejects_a_seventh_proposal_record_or_registry_identity(self):
+        self.write_proposal_fixture()
+        extra = self.proposal_record("full-poc-platform").replace("title: full-poc-platform", "title: seventh proposal")
+        self.write("architecture/proposals/seventh-proposal.md", extra)
+        errors = validator.validate_metadata(self.root)
+        self.assertTrue(any("unexpected governed proposal record" in error for error in errors), errors)
+
+        (self.root / "architecture/proposals/seventh-proposal.md").unlink()
+        registry = self.root / "architecture/proposals/README.md"
+        registry.write_text(
+            registry.read_text()
+            + '\n<a id="seventh-proposal"></a>\nExplanatory prose must not turn this into a seventh identity.\n'
+        )
+        errors = validator.validate_metadata(self.root)
+        self.assertTrue(any("unexpected governed proposal registry identity" in error for error in errors), errors)
+
+    def test_metadata_fully_validates_every_extra_active_or_archive_record(self):
+        self.write_proposal_fixture()
+        for relative in (
+            "architecture/proposals/seventh-proposal.md",
+            "architecture/archive/proposals/seventh-proposal.md",
+        ):
+            with self.subTest(relative=relative):
+                path = self.write(relative, "---\nstatus: proposed\n---\n")
+                errors = validator.validate_metadata(self.root)
+                self.assertTrue(any("unexpected governed proposal record" in error for error in errors), errors)
+                self.assertTrue(any(f"{relative}: title is required" in error for error in errors), errors)
+                path.unlink()
+
+    def test_metadata_rejects_a_second_pointer_later_in_an_anchor_owned_block(self):
+        self.write_proposal_fixture()
+        registry = self.root / "architecture/proposals/README.md"
+        text = registry.read_text()
+        first = "[account-identifiers-and-nip-inbound](account-identifiers-and-nip-inbound.md)\n\n"
+        registry.write_text(
+            text.replace(
+                first,
+                first + "Explanatory prose remains allowed.\n\n[Duplicate pointer](./account-identifiers-and-nip-inbound.md)\n\n",
+                1,
+            )
+        )
+        errors = validator.validate_metadata(self.root)
+        self.assertTrue(any("exactly one proposal record pointer" in error for error in errors), errors)
+
     def test_metadata_enforces_proposal_required_fields_status_and_delivery_plan(self):
         self.write_proposal_fixture()
         identity = "full-poc-platform"
@@ -421,6 +485,39 @@ class ValidatorTest(unittest.TestCase):
         adr.write_text(adr.read_text().replace(f"[Proposal](../proposals/README.md#{identity}), ", ""))
         self.assertTrue(any("Related proposals" in error for error in self.traceability_errors()))
 
+    def test_traceability_rejects_reverse_adr_proposal_edges_with_wrong_or_unknown_identity(self):
+        self.write_proposal_fixture()
+        adr = self.root / "architecture/adr/0002-test.md"
+        adr.write_text(
+            adr.read_text().replace(
+                "- Related proposals: ",
+                "- Related proposals: [Wrong](../proposals/README.md#production-platform), ",
+                1,
+            )
+        )
+        errors = self.traceability_errors()
+        self.assertTrue(any("does not name ADR-0002" in error for error in errors), errors)
+
+        self.write_proposal_fixture()
+        adr = self.root / "architecture/adr/0002-test.md"
+        adr.write_text(adr.read_text().replace("#account-identifiers-and-nip-inbound", "#unknown-proposal", 1))
+        errors = self.traceability_errors()
+        self.assertTrue(any("unknown governed proposal identity" in error for error in errors), errors)
+
+    def test_traceability_rejects_reverse_plan_proposal_edges_with_wrong_or_extra_identity(self):
+        self.write_proposal_fixture()
+        plan_name = self.PROPOSAL_PLANS["account-identifiers-and-nip-inbound"]
+        plan = self.root / plan_name
+        plan.write_text(plan.read_text().replace("#account-identifiers-and-nip-inbound", "#full-poc-platform", 1))
+        errors = self.traceability_errors()
+        self.assertTrue(any("does not name this plan" in error for error in errors), errors)
+
+        self.write_proposal_fixture()
+        plan = self.root / plan_name
+        plan.write_text(plan.read_text() + "\n[Extra stable proposal](../../../architecture/proposals/README.md#full-poc-platform)\n")
+        errors = self.traceability_errors()
+        self.assertTrue(any("extra stable proposal link" in error for error in errors), errors)
+
     def test_traceability_enforces_direct_plan_adr_reciprocity_both_directions(self):
         self.write_proposal_fixture()
         plan = self.root / self.PROPOSAL_PLANS["conventional-deposit-products-and-accrual"]
@@ -443,6 +540,111 @@ class ValidatorTest(unittest.TestCase):
         self.write_proposal_fixture(); accounting = self.root / "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md"
         accounting.write_text(accounting.read_text() + "\n**Proposal:** [Wrong](../../../architecture/proposals/README.md#full-poc-platform)\n")
         self.assertTrue(any("must not have a Proposal backlink" in error for error in self.traceability_errors()))
+
+    def test_traceability_requires_exact_unimplemented_plan_headers_and_mappings(self):
+        plan_name = self.PROPOSAL_PLANS["account-identifiers-and-nip-inbound"]
+        cases = {
+            "renamed-related-adrs": (lambda text: text.replace("**Related ADRs:**", "**Decisions:**", 1), "exactly one Related ADRs header"),
+            "duplicate-related-adrs": (lambda text: text + "\n**Related ADRs:** [ADR-0002](../../../architecture/adr/0002-test.md)\n", "exactly one Related ADRs header"),
+            "missing-adr": (lambda text: text.replace("[x](../../../architecture/adr/0004-test.md), ", "", 1), "Related ADRs mapping must be exact"),
+            "extra-adr": (lambda text: text.replace("**Related ADRs:** ", "**Related ADRs:** [extra](../../../architecture/adr/0003-test.md), ", 1), "Related ADRs mapping must be exact"),
+            "wrong-proposal": (lambda text: text.replace("#account-identifiers-and-nip-inbound", "#full-poc-platform", 1), "Proposal mapping must be exact"),
+            "duplicate-proposal-header": (lambda text: text + "\n**Proposal:** [Proposal](../../../architecture/proposals/README.md#account-identifiers-and-nip-inbound)\n", "exactly one Proposal header"),
+        }
+        for name, (mutate, fragment) in cases.items():
+            with self.subTest(name=name):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.write_proposal_fixture()
+                plan = self.root / plan_name
+                plan.write_text(mutate(plan.read_text()))
+                errors = self.traceability_errors()
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_traceability_rejects_non_adr_or_extra_links_in_accounting_headers(self):
+        cases = {
+            "renamed-current": (lambda text: text.replace("**Current architecture:**", "**Architecture:**", 1), "exactly one Current architecture header"),
+            "duplicate-retrospective": (lambda text: text + "\n**Retrospective ADRs:** [2](../../../architecture/adr/0002-test.md)\n", "exactly one Retrospective ADRs header"),
+            "extra-adr": (lambda text: text.replace("**Retrospective ADRs:** ", "**Retrospective ADRs:** [7](../../../architecture/adr/0007-test.md), ", 1), "Retrospective ADRs mapping must be exact"),
+            "non-adr": (lambda text: text.replace("**Retrospective ADRs:** ", "**Retrospective ADRs:** [Not ADR](../../../architecture/arc42/05-building-block-view.md), ", 1), "Retrospective ADRs mapping must be exact"),
+            "extra-proposal": (lambda text: text + "\n[Proposal](../../../architecture/proposals/README.md#full-poc-platform)\n", "must not link a stable Proposal identity"),
+        }
+        for name, (mutate, fragment) in cases.items():
+            with self.subTest(name=name):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.write_proposal_fixture()
+                accounting = self.root / "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md"
+                accounting.write_text(mutate(accounting.read_text()))
+                errors = self.traceability_errors()
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def _archive_production_fixture(self, status="rejected"):
+        identity = "production-platform"
+        active = self.root / f"architecture/proposals/{identity}.md"
+        active.unlink()
+        replacement = "None" if status == "rejected" else "[Next](../../proposals/full-poc-platform.md)"
+        self.write(
+            f"architecture/archive/proposals/{identity}.md",
+            self.proposal_record(
+                identity,
+                status=status,
+                related_plans="None",
+                implementation_status="Not applicable",
+                replacement=replacement,
+                implementation_evidence="architecture/proposals/README.md",
+            ),
+        )
+        pointers = {name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}
+        pointers[identity] = f"../archive/proposals/{identity}.md"
+        self.write_proposal_registry(pointers)
+
+    def test_proposal_history_rejects_erasing_plan_history_after_implementing(self):
+        self.write_proposal_fixture()
+        self.init_git()
+        self.commit_all("initial proposals")
+        identity = "production-platform"
+        active = self.root / f"architecture/proposals/{identity}.md"
+        active.write_text(
+            self.proposal_record(
+                identity,
+                status="implementing",
+                related_plans=self.PROPOSAL_PLANS["account-identifiers-and-nip-inbound"],
+            )
+        )
+        implementing = self.commit_all("start production planning")
+        self._archive_production_fixture()
+        terminal = self.commit_all("reject production proposal")
+        self.assertTrue(hasattr(validator, "validate_proposal_history"), "validate_proposal_history must be implemented")
+        errors = validator.validate_proposal_history(self.root, implementing, terminal)
+        self.assertTrue(any("related_plans history cannot be erased" in error for error in errors), errors)
+
+    def test_proposal_history_accepts_never_planned_terminal_none(self):
+        self.write_proposal_fixture()
+        self.init_git()
+        initial = self.commit_all("initial proposals")
+        self._archive_production_fixture()
+        terminal = self.commit_all("reject never-planned proposal")
+        self.assertTrue(hasattr(validator, "validate_proposal_history"), "validate_proposal_history must be implemented")
+        self.assertEqual([], validator.validate_proposal_history(self.root, initial, terminal))
+
+    def test_proposal_edge_range_detects_intermediate_plan_history_erasure(self):
+        self.write_proposal_fixture()
+        self.init_git()
+        initial = self.commit_all("initial proposals")
+        identity = "production-platform"
+        active = self.root / f"architecture/proposals/{identity}.md"
+        active.write_text(
+            self.proposal_record(
+                identity,
+                status="implementing",
+                related_plans=self.PROPOSAL_PLANS["account-identifiers-and-nip-inbound"],
+            )
+        )
+        self.commit_all("start production planning")
+        self._archive_production_fixture()
+        terminal = self.commit_all("reject production proposal")
+        self.assertTrue(hasattr(validator, "validate_proposal_edge_range"), "validate_proposal_edge_range must be implemented")
+        errors = validator.validate_proposal_edge_range(self.root, initial, terminal)
+        self.assertTrue(any("related_plans history cannot be erased" in error for error in errors), errors)
 
     def test_infrastructure_governance_contract_is_exact_and_reciprocal(self):
         self.write_proposal_fixture()
