@@ -232,9 +232,10 @@ class PostingConcurrencyIT {
         }
     }
 
-    // Sequence: 50 pairs, each an A->B journal and a B->A journal released together from a start
-    // latch. ObservedDataSource records every lock_account_mapping_for_posting call and every
-    // materialised_balance FOR UPDATE per connection; each committed trace must have locked
+    // Sequence: 50 pairs, each with one journal listing account A's line first and one listing
+    // account B's line first, released together from a start latch. ObservedDataSource records
+    // every lock_account_mapping_for_posting call and every materialised_balance FOR UPDATE per
+    // connection; each committed trace must have locked
     // exactly [A, B] in canonical order. Amounts 1..100 give the 5_050 totals, and the
     // materialised balance must equal the replayed posting sum for both accounts.
     @Test
@@ -413,8 +414,8 @@ class PostingConcurrencyIT {
 
     /**
      * Runs two commands with the same command id on two threads and returns both outcomes.
-     * Sequence: both workers wait on a start latch; the left command is parked by
-     * FirstWriterGate after acquiring the idempotency row; the test confirms the two workers
+     * Sequence: both workers wait on a start latch; whichever reaches FirstWriterGate first
+     * after acquiring the idempotency row is parked there; the test confirms the two workers
      * hold distinct backends and that one of them is in a PostgreSQL lock wait; only then is the
      * winner released. This proves the loser blocks on the row rather than racing past it.
      */

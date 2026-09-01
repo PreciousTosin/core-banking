@@ -80,8 +80,8 @@ class AccountingStateMachineIT {
         assertDatabaseCounts(totals, "complete deterministic run");
     }
 
-    // Goes through postTrustedReversal with a hand-altered line so the Java-side negation check in
-    // ReversalService is skipped; the reversal_exact_negation trigger must still reject a line
+    // Calls postTrustedReversal directly with a hand-altered line, bypassing ReversalService's own
+    // negate-and-copy construction; the reversal_exact_negation trigger must still reject a line
     // whose dimensions differ from the original, and the ledger must remain fully consistent.
     @Test
     void databaseReversalComparisonRejectsDimensionMismatch() throws SQLException {
@@ -406,7 +406,7 @@ class AccountingStateMachineIT {
     }
 
     // Every fixture, header and line ID is a pure function of (seed, operation, salt), so a
-    // replayed prefix reproduces the same IDs and IDs from different seeds cannot collide.
+    // replayed prefix reproduces the same IDs.
     private static UUID deterministicUuid(long seed, int operationIndex, int salt) {
         long streamSeed = seed * 0x9E3779B97F4A7C15L
             + (long) operationIndex * 0xD1B54A32D192ED03L
@@ -747,8 +747,8 @@ class AccountingStateMachineIT {
         PostingService service,
         PostingCommand command
     ) {
-        // Generic post() rejects reversal metadata by design; generated reversals must take the
-        // trusted path ReversalService would use, with the hash that path expects.
+        // Generic post() rejects reversal metadata by design; generated reversals must go through
+        // postTrustedReversal, the package-private path ReversalService itself uses.
         if (command.journal().reversalOfJournalId() != null) {
             return service.postTrustedReversal(command);
         }
