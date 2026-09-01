@@ -209,7 +209,7 @@ CanaryProbe.java:4:1: Javadoc comment is placed in the wrong location. [InvalidJ
 CanaryProbe.java:7:5: Missing a Javadoc comment for 'Inner'. [MissingJavadocType]
 ```
 
-If the build passes here, the gate is not wired: check that `configLocation` resolved (a wrong path silently falls back to `sun_checks.xml`, which produces hundreds of unrelated violations instead — a pass means the file was not scanned at all).
+If the build *passes* here, the probe was not scanned: check `sourceDirectories` and that the file really is under `src/main/java`. A wrong `configLocation` cannot cause this — the plugin throws `Unable to find configuration file at location: ...` and fails the build loudly (`DefaultCheckstyleExecutor.getConfigFile`); `sun_checks.xml` is only the default when the parameter is omitted entirely, not a fallback for a bad value.
 
 - [ ] **Step 7: Replace the canary to prove the summary rule**
 
@@ -379,7 +379,9 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
-Expected: `BUILD SUCCESS`. The log lists the audited resource count; if it does not grow by 8 relative to Task 1, `resourceIncludes` is not matching — the pattern is relative to `src/main/resources`, not to the module root.
+Expected: `BUILD SUCCESS`.
+
+This step alone proves nothing — a `resourceIncludes` pattern that matches no file also produces `BUILD SUCCESS`, and the run prints no file count to distinguish the two (the plugin logs the resource count at debug level only). Step 5 is what settles it: if the header-less canary does not fail the build, the pattern is not matching. The pattern is relative to `src/main/resources`, not to the module root.
 
 - [ ] **Step 4: Plant a header-less migration canary**
 
@@ -435,7 +437,14 @@ Expected: `BUILD FAILURE` with `V999__canary.sql:2: Work items belong in the tra
 
 - [ ] **Step 8: Prove the work-item rule also covers Java**
 
-Create `services/funds-core/src/main/java/com/corebanking/funds/CanaryProbe.java`:
+Delete the migration canary first, so this run has exactly one violation to attribute:
+
+```bash
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
+rm src/main/resources/db/migration/V999__canary.sql
+```
+
+Then create `services/funds-core/src/main/java/com/corebanking/funds/CanaryProbe.java`:
 
 ```java
 package com.corebanking.funds;
@@ -453,16 +462,18 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
-Expected: `BUILD FAILURE` with `CanaryProbe.java:6: Work items belong in the tracker, not in source. [RegexpSingleline]`.
+Expected: `BUILD FAILURE` with exactly one violation, `CanaryProbe.java:6: Work items belong in the tracker, not in source. [RegexpSingleline]`. A second violation here means the migration canary was not deleted.
 
-- [ ] **Step 9: Delete both canaries and confirm a clean run**
+- [ ] **Step 9: Delete the last canary and confirm a clean run**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-rm src/main/resources/db/migration/V999__canary.sql
 rm src/main/java/com/corebanking/funds/CanaryProbe.java
+ls src/main/resources/db/migration/
 ./mvnw checkstyle:check
 ```
+
+The `ls` must show exactly the eight `V001`-`V006` files and no `V999`.
 
 Expected: `BUILD SUCCESS`.
 
@@ -704,7 +715,7 @@ To remove it permanently, revert in reverse order the three commits that touch `
 | maven-checkstyle-plugin 3.6.0 + Checkstyle 14.1.0 is untested in this build (the standalone CLI was used for the baseline) | Task 1 Step 4 catches it in seconds. If they are incompatible, fall back to Checkstyle 13.11.0, which was separately confirmed to parse the same sources. Do not fall back below 13 — the syntax support is the point |
 | First build needs the network for ~15 MB of plugin dependencies | One-time; no offline build exists today. Nothing in the plan requires network at run time |
 | Quarkus adds generated source roots that Checkstyle would scan | `sourceDirectories` is pinned to `src/main/java` (Task 1 Step 3) |
-| `configLocation` silently falling back to `sun_checks.xml` | Task 1 Step 6 would show hundreds of unrelated violations instead of exactly three; the canary distinguishes the two failure modes |
+| The gate is wired but scans nothing (wrong `sourceDirectories`, config not applied) | Task 1 Step 6 catches it: a green build with the canary in place means nothing was scanned. A bad `configLocation` is not part of this risk — it fails the build loudly with `Unable to find configuration file at location: ...` |
 | A future rule change makes the baseline dirty | Every rule in this plan was measured at 0 violations before being added; keep that discipline — measure, then enable |
 
 ## Out of Scope
