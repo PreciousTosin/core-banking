@@ -47,19 +47,25 @@ the parameter's meaning is genuinely non-obvious; prose is preferred.
 
 ```java
 /**
- * Transactional entry point for posting a journal. Owns the SERIALIZABLE
- * transaction, idempotency replay, and rollback; the repository owns the SQL.
+ * Transactional entry point for posting a journal. Owns the SERIALIZABLE transaction, the
+ * transaction-local deadlines, idempotency replay, retry and rollback; JdbcLedgerRepository
+ * owns the SQL. Two entry points share one choreography: the public generic path and the
+ * package-private trusted-reversal path reserved for ReversalService.
  */
 @ApplicationScoped
 public class PostingService {
 
     /**
-     * Posts a generic journal. Rejects reversal metadata on this path so that
-     * only ReversalService can create linked reversals.
+     * Posts a generic journal. Proves the TYPED_V2 request hash is postingV2 of the journal and
+     * rejects reversal metadata; linked reversals enter only through the trusted path.
      */
     public PostingResult post(PostingCommand command) { ... }
 }
 ```
+
+Note the second sentence is verifiable: the hash check and the rejection are
+both visible in the method body, and "only through the trusted path" is a
+claim about this class's two entry points, not about who may call them.
 
 ### Example — inline why
 
@@ -101,14 +107,23 @@ read the test that guards a file before commenting it.
 ### Example
 
 ```sql
--- V006: governed chart rotation. Adds the owner-only rotate_chart_version
--- routine and moves posting guards onto the same chart-before-book lock
--- protocol so governance and posting can never deadlock each other.
+-- V006: governed chart rotation. Adds the owner-only funds.rotate_chart_version
+-- operation and moves the posting lock routine, the journal governance trigger
+-- and the mapping-mutation trigger onto one canonical lock order: chart rows
+-- in UUID order, then the stable book row. V005 introduced chart governance
+-- but left rotation as two lifecycle UPDATEs and took posting locks through a
+-- single join, so governance and posting could not be proven deadlock-free.
+-- Nothing here rewrites stored facts.
 
--- Posting participates in the same lock protocol as chart governance:
--- chart row first, then the stable book row.
-CREATE OR REPLACE FUNCTION funds.lock_book_chart_for_posting(...)
+-- Posting and direct-journal guards participate in the same lock protocol as
+-- chart governance: chart row first, then the stable book row. A join with
+-- FOR SHARE on both relations does not promise executor row-lock order.
+CREATE OR REPLACE FUNCTION funds.lock_book_chart_for_posting(
 ```
+
+The header says what changed relative to V005 and why; the routine comment
+records the non-obvious fact (a join does not promise lock order) that
+justifies the routine's existence.
 
 ## Tests
 
