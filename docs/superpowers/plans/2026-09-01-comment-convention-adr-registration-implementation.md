@@ -10,19 +10,18 @@
 
 **Governing documents:** `architecture/adr/README.md` (lifecycle, statuses, evidence forms) and `architecture/adr/template.md` (record shape). The machine authority is `architecture/scripts/validate_architecture.py`; where prose and validator disagree, the validator wins and this plan follows it.
 
-**Base commit:** `aa7f055`, the merge of local `master` (`dfc7521`, which landed the ADR framework) into `worktree-comment-convention-enforcement-plan`.
+**Base commit:** `dac49a4`, the merge that placed the completed comment-convention enforcement work, this registration plan, and all eight evidence commits on local `master`.
 
 ## Global Constraints
 
-- Every command runs inside the checkout the executor was given — main checkout or worktree. Anchor each block with `cd "$(git rev-parse --show-toplevel)"`; never a literal absolute path. **The one exception is "Merging: the strategy is load-bearing", which must run in the main checkout** because that is where `master` is checked out; the reason and the commands are in that section.
+- Every command runs inside the checkout the executor was given — main checkout or worktree. Anchor each block with `cd "$(git rev-parse --show-toplevel)"`; never a literal absolute path.
 - **The ADR, the decisions-index edit and the plan backlink are one commit.** Every split produces an intermediate tree that fails: the ADR alone fails both reciprocity checks, the backlink alone fails link resolution, the index alone fails nothing but proves nothing. There is no valid multi-commit ordering.
 - **If validation fails after the ADR is committed, fix it with `git commit --amend`, never a follow-up commit.** The record is `Accepted` from birth, so from its very next commit edge the validator freezes, byte-for-byte:
   - the sections `Context`, `Decision drivers`, `Considered options`, `Decision` and `Consequences`, plus any heading you added beyond the required ten;
   - **every metadata field except `Status`, `Implementation status`, and the seven relationship fields.** `Scope`, `Deciders`, `Decision date` and `Retrospective` are frozen — editing `Scope` in a follow-up commit fails with `accepted ADR field changed: Scope`. This matters because D4 rests on the exact wording of `Scope`: get it right before committing, because afterwards the only cures are rewriting history or a superseding ADR.
 
   `Compliance and verification` and `Implementation evidence`, like the relationship fields, are append-only rather than frozen: a later commit may add lines but never alter or remove existing ones.
-- **This branch must land on `master` with a true merge commit (`git merge --no-ff`). Never squash, never rebase-merge.** Five of the eight evidence hashes — `b4cf2aa2`, `655ed137`, `dfb8cebf`, `9f56d06b`, `f70e1961` — exist only on this branch; only `24d2b4b4`, `912f4e9f` and `c49c3aaf` are already ancestors of `master`. A merge commit makes all eight reachable from `master` forever. A squash or a rebase rewrites them into new hashes, after which `_validate_evidence` — which runs on **every** plain validation, not only the edge checks — reports `evidence hash does not resolve to a commit` on `master` from then on. That failure is unfixable within the framework's own rules: an `Accepted` record cannot be deleted or renamed, and `Implementation evidence` is append-only, so the broken lines can never be removed. The plan's own checks would not catch it, because they run against this branch, where the commits still exist.
-- **If a squash or rebase merge is ever unavoidable, the evidence must be changed before the ADR is committed**, not after — cite only the three commits already on `master`, or use PR-URL evidence, which survives any merge strategy because it is a URL rather than a hash. Once the record is committed as `Accepted`, that choice is frozen.
+- All eight evidence commits are ancestors of base commit `dac49a4` and therefore predate the future ADR introduction on any branch created from this base. The registration commit may be merged, rebased, or squashed without invalidating those hashes. Before integrating, Task 2 must still prove the actual introduction edge and Task 3 must prove the three-file commit boundary.
 - Evidence hashes are **40 lowercase hex characters**. Uppercase fails the regex.
 - Relationship fields are separated by exactly `"; "` — one semicolon, one space. `;` alone or `;  ` fails.
 - Items in `Related architecture sections` and `Related implementation plans` must be **only** a Markdown link, with no other text in the item.
@@ -33,7 +32,7 @@
 
 ## Verified inputs
 
-Everything below was measured against the tree at `aa7f055` before this plan was written, so the executor is not copying unchecked strings.
+Everything below was rechecked against the tree at `dac49a4`, after the enforcement branch was merged to local `master`, so the executor is not copying stale branch-topology assumptions.
 
 | Input | Verified |
 |---|---|
@@ -41,8 +40,8 @@ Everything below was measured against the tree at `aa7f055` before this plan was
 | Filename vs title | `validate_architecture._kebab_title("Adopt an enforced code comment convention")` returns `adopt-an-enforced-code-comment-convention`, matching `0009-adopt-an-enforced-code-comment-convention.md` exactly |
 | All 8 evidence lines | Pass the validator's grammar; every commit resolves; every path exists in that commit's tree; every `changed:` path is genuinely in that commit's diff against its parents |
 | Evidence predates the record | All 8 commits are ancestors of `HEAD`, so each is a strict ancestor of the future ADR commit — the condition `_qualified_historical_introduction` requires |
-| Repository baseline | `python3 architecture/scripts/validate_architecture.py --root .` prints `architecture validation passed` at `aa7f055` |
-| funds-core gate | `mise exec java@25 -- ./mvnw checkstyle:check` is green at `aa7f055`, unaffected by the master merge |
+| Repository baseline | `python3 architecture/scripts/validate_architecture.py --root .` prints `architecture validation passed` at `dac49a4` |
+| funds-core gate | `mise exec java@25 -- ./mvnw checkstyle:check` is green in the merged enforcement state inherited by `dac49a4` |
 | `origin` | `git@github.com:PreciousTosin/core-banking.git` — a GitHub origin, so PR-URL evidence *would* be accepted; this plan uses local hash evidence anyway, because no PR exists yet |
 
 ## Decisions
@@ -317,15 +316,15 @@ Expected: `architecture validation passed`.
 
 A failure naming the introduction rule means the record did not qualify as a historical introduction. The qualification is all of: `Retrospective: Yes`; no malformed evidence line anywhere in the section; the whole evidence block valid; and at least one evidence commit that is a **strict ancestor** of the commit that introduced the record. An evidence commit equal to the introducing commit is explicitly skipped, so evidence must predate the record — all eight lines in Task 1 do.
 
-- [ ] **Step 2: Walk every edge on the branch**
+- [ ] **Step 2: Walk the ADR introduction edge**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 python3 architecture/scripts/validate_architecture.py --root . \
-  --adr-edge-base-ref "$(git merge-base master HEAD)" --adr-edge-head-ref HEAD
+  --adr-edge-base-ref HEAD~1 --adr-edge-head-ref HEAD
 ```
 
-Expected: `architecture validation passed`. This walks each commit edge from the merge base to `HEAD`, which is what CI does; the endpoint check in Step 1 alone would miss a violation introduced and then papered over mid-branch.
+Expected: `architecture validation passed`. The ADR, index registration and backlink are required to be the sole commit created by this plan, so `HEAD~1..HEAD` is the complete implementation range. Unlike `git merge-base master HEAD`, this remains non-empty if the plan is executed directly on `master`.
 
 - [ ] **Step 3: If either check failed, amend — do not add a commit**
 
@@ -368,11 +367,19 @@ Expected: `architecture validation passed` three times. The third may print `WAR
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-git diff dfc7521..HEAD --stat -- services/ docs/conventions/ AGENTS.md
-git status --porcelain
+git diff-tree --no-commit-id --name-only -r HEAD | sort
+git status --porcelain --untracked-files=no
 ```
 
-Expected: the `services/` and convention diffs contain only what the enforcement branch already landed before this plan started — this plan adds nothing there — and a status that is clean apart from the untracked `architecture/scripts/**/__pycache__/` directories the validator leaves behind.
+Expected: exactly these three paths, followed by no tracked working-tree entries:
+
+```text
+architecture/adr/0009-adopt-an-enforced-code-comment-convention.md
+architecture/arc42/09-decisions.md
+docs/superpowers/plans/2026-09-01-comment-convention-enforcement-implementation.md
+```
+
+This checks the implementation commit itself instead of comparing with the old architecture-framework commit, which would include unrelated enforcement history. Untracked `architecture/scripts/**/__pycache__/` directories from Step 1 are deliberately excluded from the second command.
 
 - [ ] **Step 4: The funds-core gate is untouched**
 
@@ -385,9 +392,16 @@ Expected: `BUILD SUCCESS`, `You have 0 Checkstyle violations.` This plan changes
 
 ---
 
-### What the first push actually carries
+### What a push actually carries
 
-Worth knowing before pushing: `origin/master` is **45 commits behind** local `master`. Merging this branch and pushing does not publish three files — it publishes the entire architecture-documentation framework, the funds-core comment pass, the Checkstyle enforcement, and this record, and runs the repository's CI across all of it for the first time.
+Before pushing, measure the unpublished history rather than trusting a count captured when this plan was written:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+git rev-list --count origin/master..master
+```
+
+The result is the number of commits on local `master` that are absent from its remote-tracking branch. If it is non-zero when this plan is executed, a later push publishes those commits as well as the integrated ADR work; inspect that history before pushing. If it is zero, the push carries only work integrated after the measurement. Do not encode the measured count back into this plan because the remote-tracking ref can change independently of the document.
 
 The `Compliance and verification` numbers in the ADR cannot be re-checked by that CI, or by any agent without Docker and a Java 25 toolchain: no job runs the funds-core build, and this plan's Task 3 Step 4 runs `checkstyle:check` only, never the 254-test `clean verify` the record cites. Those numbers come from the enforcement work's own executed run; treat them as a record of what was verified then, not as something the ADR commit re-proves.
 
@@ -401,50 +415,34 @@ The repository validates the PR body itself on `pull_request` events. The descri
 - `Diagrams changed:` None
 - `Verification evidence:` the three validator commands from Task 3 Step 2 and the edge checks from Task 2
 
-## Merging: the strategy is load-bearing
+## Integration
 
-**This section runs in the main checkout, not in the worktree, and it is the maintainer's step.** It is the one part of this plan whose working directory is not the one every other command uses. `master` is checked out in the main checkout while this work sits in a linked worktree, and git refuses to check out a branch that another worktree already holds — `git checkout master` from the worktree fails with `fatal: 'master' is already used by worktree at ...`. An agent confined to the worktree cannot run this section at all, and should hand it over rather than work around it.
+No merge strategy is load-bearing now: all eight evidence commits are already ancestors of the base on `master`, and none of the evidence lines names the future registration commit. After Task 3 passes, use `superpowers:finishing-a-development-branch` to choose the repository's normal integration path. A merge commit, rebase, or squash is valid provided the ADR, decisions-index registration and enforcement-plan backlink appear atomically in the commit that first introduces ADR-0009.
 
-Because the main checkout already has `master` checked out, no `checkout` is needed — merge into it directly:
-
-```bash
-MAIN=$(git worktree list --porcelain | head -1 | cut -d' ' -f2)
-git -C "$MAIN" branch --show-current      # expect: master
-git -C "$MAIN" status --porcelain         # expect: empty
-git -C "$MAIN" merge --no-ff worktree-comment-convention-enforcement-plan
-python3 "$MAIN/architecture/scripts/validate_architecture.py" --root "$MAIN"
-```
-
-Expected: `architecture validation passed`.
-
-If `branch --show-current` is not `master`, stop: you are not in the checkout that holds it. If `status --porcelain` is not empty, deal with that first — merging into a dirty tree is how unrelated work ends up inside this commit.
-
-If it instead reports `evidence hash does not resolve to a commit`, the merge did not preserve the branch's commits — the merge was squashed or rebased. **Do not push.** Reset `master` back and redo the merge with `--no-ff`; every evidence hash must resolve from `master` before this reaches CI, because after that the failure is permanent.
-
-### The pre-merge reachability check — run this in the worktree, before merging
-
-This one block runs **in the worktree**, not the main checkout, because it reads the ADR file, which does not exist on `master` until the merge lands. Run it there and it fails loudly; run it in the main checkout beforehand and `grep` finds no file, `comm` compares against an empty list, and the silence looks exactly like success.
+After integration, run these checks in the checkout that holds the target branch:
 
 ```bash
-cd "$(git rev-parse --show-toplevel)"   # the worktree: the ADR file must exist here
-grep -oE '^- [0-9a-f]{40}' architecture/adr/0009-adopt-an-enforced-code-comment-convention.md \
-  | cut -d' ' -f2 | sort > /tmp/adr-evidence
-test "$(wc -l < /tmp/adr-evidence)" -eq 8 \
-  || { echo "FAIL: expected 8 evidence hashes, read $(wc -l < /tmp/adr-evidence) — wrong path or wrong file"; }
-git log --format=%H master | sort > /tmp/master-commits
-comm -23 /tmp/adr-evidence /tmp/master-commits
+cd "$(git rev-parse --show-toplevel)"
+python3 architecture/scripts/validate_architecture.py --root .
+ADR=architecture/adr/0009-adopt-an-enforced-code-comment-convention.md
+test -f "$ADR" || {
+  echo "FAIL: integrated HEAD does not contain ADR-0009"
+  exit 1
+}
+mapfile -t EVIDENCE < <(grep -oE '^- [0-9a-f]{40}' "$ADR" | cut -d' ' -f2)
+test "${#EVIDENCE[@]}" -eq 8 || {
+  echo "FAIL: expected 8 ADR evidence hashes, found ${#EVIDENCE[@]}"
+  exit 1
+}
+for evidence in "${EVIDENCE[@]}"; do
+  git merge-base --is-ancestor "$evidence" HEAD || {
+    echo "FAIL: ADR evidence is not reachable from the integrated HEAD: $evidence"
+    exit 1
+  }
+done
 ```
 
-Expected **before** the merge: the count assertion passes, and `comm` prints exactly the five branch-only hashes `655ed137…`, `9f56d06b…`, `b4cf2aa2…`, `dfb8cebf…`, `f70e1961…`. That is the normal, healthy state — it is what the `--no-ff` merge is about to fix. Never treat empty output here as success: without the count assertion, empty means the file was not read.
-
-Re-run the same block from the main checkout **after** the merge, where the ADR file now exists. Then the count assertion still passes and `comm` prints nothing, because every evidence commit has become an ancestor of `master`. That transition — five hashes before, none after, with the count assertion passing both times — is the actual proof.
-
-Both outcomes were simulated on 2026-09-01 in disposable clones, taking a fresh `--single-branch --branch master` checkout afterwards to imitate what CI checks out:
-
-| Merge strategy | Unreachable evidence hashes | Validator on a fresh master-only checkout |
-|---|---|---|
-| `git merge --no-ff` | none | `architecture validation passed` |
-| `git merge --squash` | the five branch-only hashes | five × `evidence hash does not resolve to a commit` |
+Expected: `architecture validation passed`, no `FAIL` line, and exit 0. The assertions require the ADR and exactly eight evidence hashes before the loop proves every hash is reachable from the integrated history; the check does not rely on a fixed branch name or a stale expectation about how many hashes were once branch-only.
 
 ## Rollback
 
@@ -467,7 +465,7 @@ Removing the enforcement itself is a separate matter from the record, and is cov
 | A naive structural-only run gives false confidence | Task 2 exists precisely because `validate_architecture.py --root .` alone cannot see the introduction rule |
 | Committing the ADR without one of its two reciprocal registrations | D1 and Task 1 Step 6 keep all three files in one commit; Step 5 catches either mismatch, by name, before any commit exists |
 | Evidence that looks right but is not | All eight lines were checked against the validator's own grammar and against each commit's real diff before this plan was written |
-| A squash or rebase merge silently destroys five of the eight evidence hashes, breaking `master` permanently | The merge-strategy constraint, the `--no-ff` merge and the post-merge validation in "Merging: the strategy is load-bearing", plus the `comm` check that lists unreachable hashes before the merge |
+| Integration onto a base that does not contain the historical evidence makes a direct `Accepted` introduction invalid | The base records all eight hashes as ancestors of `dac49a4`; Task 2 checks the real introduction edge, and the post-integration loop fails unless every hash is reachable from the integrated `HEAD` |
 | An extra heading added for readability | Global Constraints forbid it: extra headings fall outside the mutable-section allowlist and freeze forever |
 
 ## Out of Scope
