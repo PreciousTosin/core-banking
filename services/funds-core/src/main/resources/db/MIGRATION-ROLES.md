@@ -18,6 +18,18 @@ Login roles and passwords are deployment-owned. Provision application and
 proof-reader logins outside Flyway and grant each login exactly the capability
 role it needs. Do not grant either login `funds_migrator`.
 
+`funds_proof_reader` is an external, read-only proof-job capability, not the
+service's default datasource role. The in-process posting and proof APIs use the
+`funds_app` datasource; an independently scheduled proof job receives its own
+deployment-managed login granted only `funds_proof_reader`. V005 grants that
+role only the journal sequence/book/chart columns, posting account/currency/
+amount columns, immutable chart-mapping control code, and control-projection
+columns needed by the proof queries. It cannot read account identifiers,
+product policy JSON, idempotency results, materialised balances, or outbox
+payloads. Control-account projection proof is deliberately current-cutoff-only;
+historical cutoffs remain supported by the immutable-posting trial-balance
+proof, but require projection history before they can be claimed for controls.
+
 `funds_app` has `USAGE` on the journal sequence because PostgreSQL requires it
 for `nextval` during journal insertion. This also permits session-local
 `currval`, which reveals only the value allocated by that same database

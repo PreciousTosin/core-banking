@@ -1,10 +1,10 @@
 package com.corebanking.funds.application;
 
-import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.infrastructure.postgres.LedgerRepository;
 import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
+import com.corebanking.funds.infrastructure.postgres.SqlState;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.sql.Connection;
@@ -20,13 +20,28 @@ public class PostingService {
     private final PostingTransactionObserver observer;
     private final JournalValidator validator;
     private final CanonicalCommandHasher commandHasher;
+    private final PostingTransactionTimeouts transactionTimeouts;
 
     public PostingService(
         DataSource dataSource,
         LedgerRepository repository,
         PostgresRetryPolicy retryPolicy
     ) {
-        this(dataSource, repository, retryPolicy, PostingTransactionObserver.noop());
+        this(
+            dataSource,
+            repository,
+            retryPolicy,
+            PostingTransactionObserver.noop(),
+            PostingTransactionTimeouts.defaults());
+    }
+
+    public PostingService(
+        DataSource dataSource,
+        LedgerRepository repository,
+        PostgresRetryPolicy retryPolicy,
+        PostingTransactionObserver observer
+    ) {
+        this(dataSource, repository, retryPolicy, observer, PostingTransactionTimeouts.defaults());
     }
 
     @Inject
@@ -34,7 +49,8 @@ public class PostingService {
         DataSource dataSource,
         LedgerRepository repository,
         PostgresRetryPolicy retryPolicy,
-        PostingTransactionObserver observer
+        PostingTransactionObserver observer,
+        PostingTransactionTimeouts transactionTimeouts
     ) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.repository = Objects.requireNonNull(repository, "repository");
@@ -42,6 +58,7 @@ public class PostingService {
         this.observer = Objects.requireNonNull(observer, "observer");
         this.validator = new JournalValidator();
         this.commandHasher = new CanonicalCommandHasher();
+        this.transactionTimeouts = Objects.requireNonNull(transactionTimeouts, "transactionTimeouts");
     }
 
     public PostingResult post(PostingCommand command) {
@@ -75,6 +92,7 @@ public class PostingService {
                 connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
                 PostingResult result;
                 try {
+                    transactionTimeouts.apply(connection);
                     var completed = repository.findCompleted(
                         connection, command.commandId(), command.requestHash());
                     if (completed.isPresent()) {
@@ -87,7 +105,7 @@ public class PostingService {
                     connection.commit();
                 } catch (SQLException failure) {
                     rollback(connection, failure);
-                    throw new LedgerPersistenceException(failure);
+                    throw SqlState.persistenceFailure(failure);
                 } catch (RuntimeException failure) {
                     rollback(connection, failure);
                     throw failure;
@@ -95,7 +113,7 @@ public class PostingService {
                 observer.afterCommitBeforeReturn(command.commandId());
                 return result;
             } catch (SQLException connectionFailure) {
-                throw new LedgerPersistenceException(connectionFailure);
+                throw SqlState.persistenceFailure(connectionFailure);
             }
         });
     }

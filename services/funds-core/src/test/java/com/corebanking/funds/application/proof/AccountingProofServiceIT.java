@@ -74,9 +74,9 @@ class AccountingProofServiceIT {
             line(31, CUSTOMER_A, NGN, 25_000), line(32, CUSTOMER_B, NGN, -25_000));
         assertProof(transfer.journalSequence(), 125_000, 125_000, -100_000);
 
-        PostingResult reversal = reversalService.reverse(new ReversalRequest(
+        PostingResult reversal = reversalService.reverse(canonical(new ReversalRequest(
             uuid(40), "b".repeat(64), inflow.journalId(), uuid(2_040), uuid(3_040), PERIOD,
-            Instant.parse("2026-01-16T10:00:00Z"), LocalDate.of(2026, 1, 16), "Proof reversal"));
+            Instant.parse("2026-01-16T10:00:00Z"), LocalDate.of(2026, 1, 16), "Proof reversal")));
         assertProof(reversal.journalSequence(), 225_000, 225_000, 0);
     }
 
@@ -186,6 +186,24 @@ class AccountingProofServiceIT {
 
         assertThrows(IllegalStateException.class,
             () -> proofService.controlAccount(BOOK, "CUSTOMER-DEPOSITS", NGN, transfer.journalSequence()));
+    }
+
+    @Test
+    void controlProjectionProofRejectsHistoricalCutoffAfterLaterMappedActivity() {
+        PostingResult first = post(81, "INFLOW", null,
+            line(82, PROVIDER, NGN, 50), line(83, CUSTOMER_A, NGN, -50));
+        PostingResult current = post(84, "TRANSFER", null,
+            line(85, CUSTOMER_A, NGN, 20), line(86, CUSTOMER_B, NGN, -20));
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+            () -> proofService.controlAccount(
+                BOOK, "CUSTOMER-DEPOSITS", NGN, first.journalSequence()));
+
+        assertAll(
+            () -> assertTrue(failure.getMessage().contains("current cutoff")),
+            () -> assertTrue(proofService.trialBalance(BOOK, NGN, first.journalSequence()).balanced()),
+            () -> assertEquals(BigInteger.valueOf(-50), proofService.controlAccount(
+                BOOK, "CUSTOMER-DEPOSITS", NGN, current.journalSequence()).sourceTotal()));
     }
 
     @Test
@@ -363,6 +381,13 @@ class AccountingProofServiceIT {
 
     private static PostingLine line(long seed, UUID account, CurrencyCode currency, long amount) {
         return new PostingLine(uuid(seed), account, currency, amount, 0, Map.of());
+    }
+
+    private static ReversalRequest canonical(ReversalRequest request) {
+        return new ReversalRequest(
+            request.commandId(), new CanonicalCommandHasher().reversalV1(request),
+            request.originalJournalId(), request.correlationId(), request.businessTransactionId(),
+            request.currentPeriodId(), request.bookingTime(), request.valueDate(), request.reason());
     }
 
     private void reset() throws SQLException {

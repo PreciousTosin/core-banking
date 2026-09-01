@@ -12,7 +12,6 @@ import com.corebanking.funds.domain.PostingLine;
 import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
-import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -107,10 +106,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
             completeIdempotencyCommand(connection, command.commandId(), result);
             return result;
         } catch (SQLException failure) {
-            if (SqlState.occursIn(failure, SqlState.NUMERIC_VALUE_OUT_OF_RANGE)) {
-                throw monetaryOverflow("PostgreSQL rejected a monetary projection outside bigint range", failure);
-            }
-            throw new LedgerPersistenceException(failure);
+            throw SqlState.persistenceFailure(failure);
         }
     }
 
@@ -152,7 +148,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
                     rows.getString("canonical_hash")));
             }
         } catch (SQLException failure) {
-            throw new LedgerPersistenceException(failure);
+            throw SqlState.persistenceFailure(failure);
         }
     }
 

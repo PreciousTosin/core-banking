@@ -13,6 +13,7 @@ import com.corebanking.funds.infrastructure.postgres.PostgresRetryPolicy;
 import java.io.PrintWriter;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.time.Instant;
@@ -218,7 +219,21 @@ class PostingServiceTest {
                 Connection.class.getClassLoader(),
                 new Class<?>[] {Connection.class},
                 (proxy, method, arguments) -> switch (method.getName()) {
+                    case "prepareStatement" -> preparedStatement();
                     case "getAutoCommit" -> false;
+                    case "isClosed" -> false;
+                    case "isWrapperFor" -> false;
+                    case "unwrap" -> throw new SQLException("not a wrapper");
+                    default -> null;
+                });
+        }
+
+        private static PreparedStatement preparedStatement() {
+            return (PreparedStatement) Proxy.newProxyInstance(
+                PreparedStatement.class.getClassLoader(),
+                new Class<?>[] {PreparedStatement.class},
+                (proxy, method, arguments) -> switch (method.getName()) {
+                    case "execute" -> true;
                     case "isClosed" -> false;
                     case "isWrapperFor" -> false;
                     case "unwrap" -> throw new SQLException("not a wrapper");

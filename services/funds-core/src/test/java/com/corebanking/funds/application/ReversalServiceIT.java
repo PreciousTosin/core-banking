@@ -961,11 +961,15 @@ class ReversalServiceIT {
                 if (!connectionMethod.getName().equals("prepareStatement")) {
                     return invoke(connection, connectionMethod, connectionArgs);
                 }
-                prepared.incrementAndGet();
+                String sql = (String) connectionArgs[0];
                 PreparedStatement statement = (PreparedStatement) invoke(
                     connection,
                     connectionMethod,
                     connectionArgs);
+                if (sql.contains("set_config('lock_timeout'")) {
+                    return statement;
+                }
+                prepared.incrementAndGet();
                 var timeoutSet = new AtomicBoolean();
                 return proxy(PreparedStatement.class, statement, (statementMethod, statementArgs) -> {
                     if (statementMethod.getName().equals("setQueryTimeout")) {

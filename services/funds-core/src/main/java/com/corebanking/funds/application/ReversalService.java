@@ -8,6 +8,7 @@ import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
+import com.corebanking.funds.infrastructure.postgres.SqlState;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.nio.charset.StandardCharsets;
@@ -42,14 +43,24 @@ public class ReversalService {
     private final JournalValidator validator;
     private final CanonicalJournalHasher hasher;
     private final CanonicalCommandHasher commandHasher;
+    private final PostingTransactionTimeouts transactionTimeouts;
+
+    public ReversalService(DataSource dataSource, PostingService postingService) {
+        this(dataSource, postingService, PostingTransactionTimeouts.defaults());
+    }
 
     @Inject
-    public ReversalService(DataSource dataSource, PostingService postingService) {
+    public ReversalService(
+        DataSource dataSource,
+        PostingService postingService,
+        PostingTransactionTimeouts transactionTimeouts
+    ) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.postingService = Objects.requireNonNull(postingService, "postingService");
         this.validator = new JournalValidator();
         this.hasher = new CanonicalJournalHasher();
         this.commandHasher = new CanonicalCommandHasher();
+        this.transactionTimeouts = Objects.requireNonNull(transactionTimeouts, "transactionTimeouts");
     }
 
     public PostingResult reverse(ReversalRequest request) {
@@ -117,6 +128,7 @@ public class ReversalService {
                 connection.setAutoCommit(false);
                 connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
                 connection.setReadOnly(true);
+                transactionTimeouts.apply(connection);
 
                 Optional<PostingResult> completed = preflightCompleted(connection, request);
                 if (completed.isPresent()) {
@@ -135,7 +147,7 @@ public class ReversalService {
                 connection.commit();
                 return new LoadOutcome(Optional.empty(), original);
             } catch (SQLException failure) {
-                var mapped = new LedgerPersistenceException(failure);
+                var mapped = SqlState.persistenceFailure(failure);
                 primary = mapped;
                 rollback(connection, mapped);
                 throw mapped;
@@ -147,7 +159,7 @@ public class ReversalService {
                 restore(connection, settings, primary);
             }
         } catch (SQLException failure) {
-            throw new LedgerPersistenceException(failure);
+            throw SqlState.persistenceFailure(failure);
         }
     }
 
@@ -450,7 +462,7 @@ public class ReversalService {
             if (primary != null) {
                 primary.addSuppressed(restorationFailure);
             } else {
-                throw new LedgerPersistenceException(restorationFailure);
+                throw SqlState.persistenceFailure(restorationFailure);
             }
         }
     }

@@ -610,8 +610,11 @@ class LedgerConstraintIT {
                     SELECT count(book_id) FROM funds.control_account_projection
                     """));
                 assertSqlState(connection, "42501", "SELECT count(*) FROM funds.materialised_balance");
-                assertSqlState(connection, "42501", "SELECT count(*) FROM funds.account_identifier");
-                assertSqlState(connection, "42501", "SELECT count(*) FROM funds.product_version");
+                assertSqlState(connection, "42501",
+                    "SELECT normalised_value FROM funds.account_identifier");
+                assertSqlState(connection, "42501", "SELECT policy_json FROM funds.product_version");
+                assertSqlState(connection, "42501",
+                    "SELECT result_json FROM funds.idempotency_command");
                 assertSqlState(connection, "42501", "SELECT payload FROM funds.outbox_event");
                 assertSqlState(connection, "42501", idempotencyInsert(
                     uuid(901), REQUEST_HASH, "IN_PROGRESS", null, null, null));
