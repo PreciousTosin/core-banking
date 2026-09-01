@@ -93,6 +93,10 @@
                     <sourceDirectories>
                         <sourceDirectory>${project.basedir}/src/main/java</sourceDirectory>
                     </sourceDirectories>
+                    <includeTestSourceDirectory>true</includeTestSourceDirectory>
+                    <testSourceDirectories>
+                        <testSourceDirectory>${project.basedir}/src/test/java</testSourceDirectory>
+                    </testSourceDirectories>
                     <includeResources>true</includeResources>
                     <!-- Default is **/*.properties; migrations are the only resources with a
                          comment convention. -->
