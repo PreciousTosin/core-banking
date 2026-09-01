@@ -745,6 +745,35 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
                 self.assertTrue(errors, errors)
                 script.write_text(text)
 
+    def assert_single_invocation_root(self, records, *, temp_parent, repository, test_home):
+        values = [
+            Path(record[key])
+            for record in records
+            for key in ("cache", "puppeteer", "xdg_cache", "xdg_config", "xdg_data")
+        ]
+        roots = {value.parent for value in values}
+        self.assertEqual(1, len(roots), roots)
+        temp_root = roots.pop()
+        self.assertTrue(temp_root.is_relative_to(temp_parent), temp_root)
+        self.assertFalse(temp_root.is_relative_to(repository), (temp_root, repository))
+        self.assertFalse(temp_root.is_relative_to(test_home), (temp_root, test_home))
+        for value in values:
+            self.assertTrue(value.is_relative_to(temp_root), (value, temp_root))
+            self.assertFalse(value.is_relative_to(repository), (value, repository))
+            self.assertFalse(value.is_relative_to(test_home), (value, test_home))
+        self.assertFalse(temp_root.exists(), temp_root)
+
+    def test_fake_render_single_root_assertion_rejects_split_cache_roots(self):
+        temp_parent = Path(self.render_tmp.name)
+        repository = self.root
+        test_home = self.root / "home"
+        root = temp_parent / "invocation"
+        sibling = temp_parent / "sibling"
+        first = {"cache": str(root / "npm-cache"), "puppeteer": str(root / "puppeteer-cache"), "xdg_cache": str(root / "xdg-cache"), "xdg_config": str(root / "xdg-config"), "xdg_data": str(root / "xdg-data")}
+        split = first | {"puppeteer": str(sibling / "puppeteer-cache")}
+        with self.assertRaises(AssertionError):
+            self.assert_single_invocation_root([first, split], temp_parent=temp_parent, repository=repository, test_home=test_home)
+
     def test_render_script_fake_tools_keep_state_under_removed_owned_root(self):
         script = self.write_complete_diagram_fixture()
         self.write("architecture/tooling/package.json", "{}\n")
@@ -772,13 +801,12 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
                 self.assertEqual(71 if failure else 0, result.returncode, result.stderr)
                 records = [json.loads(line) for line in log.read_text().splitlines()]
                 self.assertGreaterEqual(len(records), 2)
-                for record in records:
-                    for key in ("cache", "puppeteer", "xdg_cache", "xdg_config", "xdg_data"):
-                        value = Path(record[key])
-                        self.assertTrue(value.is_relative_to(temp_parent), (key, value))
-                        self.assertFalse(value.is_relative_to(self.root), (key, value, self.root))
-                        self.assertFalse(value.is_relative_to(test_home), (key, value, test_home))
-                    self.assertFalse(Path(record["cache"]).parent.exists())
+                self.assert_single_invocation_root(
+                    records,
+                    temp_parent=temp_parent,
+                    repository=self.root,
+                    test_home=test_home,
+                )
                 self.assertTrue(caller_output.is_dir())
 
     def write_valid_tooling(self):
