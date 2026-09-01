@@ -76,6 +76,40 @@
                     </systemPropertyVariables>
                 </configuration>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId><artifactId>maven-checkstyle-plugin</artifactId><version>3.6.0</version>
+                <!-- The plugin bundles Checkstyle 9.3, which cannot parse Java 25 sources. -->
+                <dependencies>
+                    <dependency>
+                        <groupId>com.puppycrawl.tools</groupId><artifactId>checkstyle</artifactId><version>14.1.0</version>
+                    </dependency>
+                </dependencies>
+                <!-- Plugin-level rather than execution-level so that `mvnw checkstyle:check` on
+                     the command line behaves exactly like the bound execution. -->
+                <configuration>
+                    <configLocation>${project.basedir}/config/checkstyle/checkstyle.xml</configLocation>
+                    <!-- Pinned: the default is the project's compile source roots, which Quarkus
+                         extends with generated code that no convention applies to. -->
+                    <sourceDirectories>
+                        <sourceDirectory>${project.basedir}/src/main/java</sourceDirectory>
+                    </sourceDirectories>
+                    <includeResources>false</includeResources>
+                    <includeTestResources>false</includeTestResources>
+                    <!-- The goal already lists violations in its own format; this adds
+                         Checkstyle's native 'file:line:col: message [Rule]' lines, which is the
+                         format the canary steps in the plan quote. -->
+                    <consoleOutput>true</consoleOutput>
+                    <violationSeverity>error</violationSeverity>
+                    <failOnViolation>true</failOnViolation>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>check-comment-conventions</id>
+                        <phase>validate</phase>
+                        <goals><goal>check</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 </project>
