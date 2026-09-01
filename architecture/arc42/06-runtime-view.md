@@ -36,3 +36,6 @@ uses the trusted reversal path, and preserves additive history.
 [AccountingProofService](../../services/funds-core/src/main/java/com/corebanking/funds/application/proof/AccountingProofService.java)
 independently aggregates immutable source postings and compares materialised
 balance and control projections.
+
+The [current posting sequence diagram](../diagrams/posting-sequence.mmd)
+records the atomic success and rollback flow.

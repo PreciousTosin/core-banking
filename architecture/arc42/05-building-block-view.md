@@ -33,3 +33,6 @@ are the authoritative persistence boundary. They own durable accounting facts,
 balances, control projections, idempotency, outbox persistence, chart
 governance, and database-role boundaries. The runtime package supplies the
 production datasource startup guard.
+
+The [current funds-core component diagram](../diagrams/funds-core-components.mmd)
+shows the permitted dependency direction between these implemented layers.

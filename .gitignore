@@ -6,3 +6,7 @@
 
 # Maven build output for the funds-core module.
 /services/funds-core/target/
+
+# Mermaid tooling is installed only in an invocation-owned temporary root.
+/architecture/tooling/node_modules/
+/architecture/diagrams/generated/

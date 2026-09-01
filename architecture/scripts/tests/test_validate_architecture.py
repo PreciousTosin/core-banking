@@ -3,6 +3,7 @@ import subprocess
 import unittest
 import os
 import re
+import json
 from unittest import mock
 from pathlib import Path
 
@@ -596,6 +597,193 @@ class ValidatorTest(unittest.TestCase):
         self.write_inventory(rows)
         errors = validator.validate_migration_inventory(self.root)
         self.assertFalse(any("missing migration row for source heading 13.08" in error for error in errors), errors)
+
+
+class DiagramAndToolingValidatorTest(unittest.TestCase):
+    DIAGRAMS = {
+        "context.mmd": ("CURRENT", "system-context", "architecture/arc42/03-context-and-scope.md", "ADR-0004"),
+        "containers.mmd": ("PROPOSED", "container", "architecture/arc42/03-context-and-scope.md", "ADR-0001"),
+        "funds-core-components.mmd": ("CURRENT", "component", "architecture/arc42/05-building-block-view.md", "ADR-0002"),
+        "posting-sequence.mmd": ("CURRENT", "runtime-sequence", "architecture/arc42/06-runtime-view.md", "ADR-0006"),
+        "single-vm-deployment.mmd": ("PROPOSED", "deployment", "architecture/arc42/07-deployment-view.md", "ADR-0008"),
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel, text):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def write_diagram(self, name, *, state=None, abstraction=None, question="What does this show?", title_state=None, arc42=None, adrs=None):
+        expected_state, expected_abstraction, expected_arc42, expected_adrs = self.DIAGRAMS[name]
+        state = expected_state if state is None else state
+        abstraction = expected_abstraction if abstraction is None else abstraction
+        title_state = state if title_state is None else title_state
+        arc42 = expected_arc42 if arc42 is None else arc42
+        adrs = expected_adrs if adrs is None else adrs
+        return self.write(
+            f"architecture/diagrams/{name}",
+            f"---\ntitle: {title_state} — {name}\n---\n"
+            f"%% state: {state}\n%% abstraction: {abstraction}\n%% question: {question}\n"
+            f"%% owner: architecture\n%% arc42: {arc42}\n%% adrs: {adrs}\n%% last_verified: 2026-09-01\n"
+            "flowchart LR\n  A --> B\n",
+        )
+
+    def write_valid_render_script(self):
+        path = self.write(
+            "architecture/scripts/render-diagrams.sh",
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "script_dir=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd -P)\"\n"
+            "repository_root=\"$(cd \"$script_dir/../..\" && pwd -P)\"\n"
+            "tooling_dir=\"$repository_root/architecture/tooling\"\n"
+            "temp_root=\"$(mktemp -d)\"\ninstall_dir=\"$temp_root/install\"\noutput_dir=\"\"\n"
+            "cleanup() {\n  rm -rf -- \"$temp_root\"\n}\ntrap cleanup EXIT\n"
+            "if [[ $# -gt 1 ]]; then exit 2; fi\n"
+            "if [[ $# -eq 1 ]]; then output_dir=\"$1\"; mkdir -p -- \"$output_dir\"; else output_dir=\"$temp_root/output\"; fi\n"
+            "mkdir -p -- \"$install_dir\" \"$output_dir\" \"$temp_root/npm-cache\" \"$temp_root/puppeteer-cache\" \"$temp_root/xdg-cache\" \"$temp_root/xdg-config\" \"$temp_root/xdg-data\"\n"
+            "cp -- \"$tooling_dir/package.json\" \"$tooling_dir/package-lock.json\" \"$install_dir/\"\n"
+            "owned_env=(\"npm_config_cache=$temp_root/npm-cache\" \"PUPPETEER_CACHE_DIR=$temp_root/puppeteer-cache\" \"XDG_CACHE_HOME=$temp_root/xdg-cache\" \"XDG_CONFIG_HOME=$temp_root/xdg-config\" \"XDG_DATA_HOME=$temp_root/xdg-data\")\n"
+            "env \"${owned_env[@]}\" npm ci --prefix \"$install_dir\"\n"
+            "mmdc=\"$install_dir/node_modules/.bin/mmdc\"\ntest -x \"$mmdc\"\n"
+            "mapfile -t sources < <(find \"$repository_root/architecture/diagrams\" -maxdepth 1 -type f -name '*.mmd' -print | LC_ALL=C sort)\n"
+            "test \"${#sources[@]}\" -gt 0\nfor source in \"${sources[@]}\"; do output=\"$output_dir/$(basename \"${source%.mmd}\").svg\"; env \"${owned_env[@]}\" \"$mmdc\" -i \"$source\" -o \"$output\"; done\n",
+        )
+        path.chmod(0o755)
+        return path
+
+    def write_complete_diagram_fixture(self):
+        links = {}
+        for name, (_, _, arc42, _) in self.DIAGRAMS.items():
+            self.write_diagram(name)
+            links.setdefault(arc42, []).append(f"[Diagram](../diagrams/{name})")
+        for arc42, diagram_links in links.items():
+            self.write(arc42, "# Arc42\n\n" + "\n".join(diagram_links) + "\n")
+        for identifier in {adr for _, (_, _, _, adr) in self.DIAGRAMS.items()} | {"ADR-0002", "ADR-0004", "ADR-0006"}:
+            self.write(f"architecture/adr/{identifier[4:]}-fixture.md", "# ADR\n")
+        return self.write_valid_render_script()
+
+    def test_diagrams_registry_and_valid_fixture(self):
+        self.write_complete_diagram_fixture()
+        self.assertIn("diagrams", validator.CHECKS)
+        self.assertIn("diagrams", validator.VALIDATORS)
+        self.assertEqual([], validator.validate_diagrams(self.root))
+
+    def test_diagrams_reject_required_metadata_and_title_state_failures(self):
+        cases = {
+            "missing-abstraction": {"abstraction": ""},
+            "missing-question": {"question": ""},
+            "missing-title-state": {"title_state": ""},
+            "mismatched-title-state": {"state": "CURRENT", "title_state": "PROPOSED"},
+        }
+        for case, kwargs in cases.items():
+            with self.subTest(case=case):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+                self.write_complete_diagram_fixture()
+                self.write_diagram("context.mmd", **kwargs)
+                errors = validator.validate_diagrams(self.root)
+                self.assertTrue(errors, errors)
+
+    def test_diagrams_reject_non_executable_render_script_and_missing_reciprocal_link(self):
+        script = self.write_complete_diagram_fixture()
+        script.chmod(0o644)
+        errors = validator.validate_diagrams(self.root)
+        self.assertTrue(any("must be executable" in error for error in errors), errors)
+        script.chmod(0o755)
+        self.write("architecture/arc42/03-context-and-scope.md", "# Arc42\n")
+        errors = validator.validate_diagrams(self.root)
+        self.assertTrue(any("must link back to architecture/diagrams/context.mmd" in error for error in errors), errors)
+
+    def test_render_script_contract_rejects_non_owned_state_and_external_cleanup(self):
+        self.write_complete_diagram_fixture()
+        script = self.root / "architecture/scripts/render-diagrams.sh"
+        text = script.read_text()
+        for case, bad in {
+            "repository-node-modules": text + "\narchitecture/tooling/node_modules\n",
+            "missing-puppeteer-binding": text.replace('env "${owned_env[@]}" "$mmdc"', '"$mmdc"'),
+            "unsafe-cleanup": text.replace('rm -rf -- "$temp_root"', 'rm -rf -- "$output_dir"'),
+            "home-cache": text.replace('$temp_root/npm-cache', '~/.npm'),
+        }.items():
+            with self.subTest(case=case):
+                script.write_text(bad)
+                errors = validator.validate_render_script_contract(self.root)
+                self.assertTrue(errors, errors)
+                script.write_text(text)
+
+    def test_render_script_fake_tools_keep_state_under_removed_owned_root(self):
+        script = self.write_complete_diagram_fixture()
+        self.write("architecture/tooling/package.json", "{}\n")
+        self.write("architecture/tooling/package-lock.json", "{}\n")
+        fake_bin = self.root / "fake-bin"; fake_bin.mkdir()
+        log = self.root / "tool-log.jsonl"
+        npm = fake_bin / "npm"
+        npm.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "printf '%s\\n' \"{\\\"tool\\\":\\\"npm\\\",\\\"cache\\\":\\\"$npm_config_cache\\\",\\\"puppeteer\\\":\\\"$PUPPETEER_CACHE_DIR\\\",\\\"xdg_cache\\\":\\\"$XDG_CACHE_HOME\\\",\\\"xdg_config\\\":\\\"$XDG_CONFIG_HOME\\\",\\\"xdg_data\\\":\\\"$XDG_DATA_HOME\\\"}\" >> \"$TOOL_LOG\"\n"
+            "prefix=\"\"; while [[ $# -gt 0 ]]; do if [[ $1 == --prefix ]]; then prefix=$2; shift 2; else shift; fi; done\n"
+            "mkdir -p \"$prefix/node_modules/.bin\"\n"
+            "cat > \"$prefix/node_modules/.bin/mmdc\" <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"{\\\"tool\\\":\\\"mmdc\\\",\\\"cache\\\":\\\"$npm_config_cache\\\",\\\"puppeteer\\\":\\\"$PUPPETEER_CACHE_DIR\\\",\\\"xdg_cache\\\":\\\"$XDG_CACHE_HOME\\\",\\\"xdg_config\\\":\\\"$XDG_CONFIG_HOME\\\",\\\"xdg_data\\\":\\\"$XDG_DATA_HOME\\\"}\" >> \"$TOOL_LOG\"\nif [[ ${FAIL_RENDER:-0} == 1 ]]; then exit 71; fi\nwhile [[ $# -gt 0 ]]; do if [[ $1 == -o ]]; then mkdir -p \"$(dirname \"$2\")\"; printf '<svg/>\\n' > \"$2\"; exit 0; fi; shift; done\nEOF\nchmod +x \"$prefix/node_modules/.bin/mmdc\"\n"
+        )
+        npm.chmod(0o755)
+        caller_output = self.root / "caller-output"
+        environment = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}", "TOOL_LOG": str(log), "TMPDIR": str(self.root / "tmp"), "HOME": str(self.root / "home")}
+        (self.root / "tmp").mkdir(); (self.root / "home").mkdir()
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                log.unlink(missing_ok=True)
+                result = subprocess.run([str(script), str(caller_output)], cwd=self.root, env=environment | ({"FAIL_RENDER": "1"} if failure else {}), text=True, capture_output=True)
+                self.assertEqual(71 if failure else 0, result.returncode, result.stderr)
+                records = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertGreaterEqual(len(records), 2)
+                for record in records:
+                    for key in ("cache", "puppeteer", "xdg_cache", "xdg_config", "xdg_data"):
+                        value = Path(record[key])
+                        self.assertTrue(value.is_relative_to(self.root / "tmp"), (key, value))
+                        self.assertFalse(value.is_relative_to(self.root)) if not value.is_relative_to(self.root / "tmp") else None
+                    self.assertFalse(Path(record["cache"]).parent.exists())
+                self.assertTrue(caller_output.is_dir())
+
+    def write_valid_tooling(self):
+        self.write("architecture/tooling/package.json", json.dumps({"name": "core-banking-architecture-tooling", "private": True, "version": "1.0.0", "engines": {"node": ">=20"}, "devDependencies": {"@mermaid-js/mermaid-cli": "11.16.0"}}))
+        self.write("architecture/tooling/package-lock.json", json.dumps({"name": "core-banking-architecture-tooling", "version": "1.0.0", "lockfileVersion": 3, "requires": True, "packages": {"": {"name": "core-banking-architecture-tooling", "version": "1.0.0", "devDependencies": {"@mermaid-js/mermaid-cli": "11.16.0"}}, "node_modules/@mermaid-js/mermaid-cli": {"version": "11.16.0"}}}))
+
+    def init_git(self):
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+
+    def test_tooling_requires_exact_json_manifest_and_lock_resolution(self):
+        self.write_valid_tooling()
+        self.assertEqual([], validator.validate_tooling(self.root))
+        for rel, mutate in {
+            "range": lambda: self.write("architecture/tooling/package.json", '{"devDependencies":{"@mermaid-js/mermaid-cli":"^11.16.0"}}'),
+            "extra": lambda: self.write("architecture/tooling/package.json", '{"devDependencies":{"@mermaid-js/mermaid-cli":"11.16.0","other":"1"}}'),
+            "lock-root": lambda: self.write("architecture/tooling/package-lock.json", '{"packages":{"":{"devDependencies":{"@mermaid-js/mermaid-cli":"1.0.0"}},"node_modules/@mermaid-js/mermaid-cli":{"version":"11.16.0"}}}'),
+            "lock-resolved": lambda: self.write("architecture/tooling/package-lock.json", '{"packages":{"":{"devDependencies":{"@mermaid-js/mermaid-cli":"11.16.0"}},"node_modules/@mermaid-js/mermaid-cli":{"version":"1.0.0"}}}'),
+        }.items():
+            with self.subTest(rel=rel):
+                self.write_valid_tooling(); mutate()
+                self.assertTrue(validator.validate_tooling(self.root))
+
+    def test_tooling_rejects_tracked_output_and_enforces_classified_architecture_svg(self):
+        self.write_valid_tooling(); self.init_git()
+        for rel in ("architecture/tooling/node_modules/any.file", "architecture/diagrams/generated/any.file"):
+            self.write(rel, "x")
+            subprocess.run(["git", "add", rel], cwd=self.root, check=True)
+        errors = validator.validate_tooling(self.root)
+        self.assertTrue(any("tracked generated or dependency path" in error for error in errors), errors)
+        subprocess.run(["git", "rm", "--cached", "-qr", "architecture/tooling/node_modules", "architecture/diagrams/generated"], cwd=self.root, check=True)
+        self.write("architecture/diagrams/source.mmd", "flowchart LR\n")
+        self.write("architecture/derived.svg", "<svg/>")
+        self.write("architecture/README.md", "<!-- approved-architecture-derivative: architecture/derived.svg source=architecture/diagrams/source.mmd -->\n[Derivative](derived.svg)\n")
+        subprocess.run(["git", "add", "architecture/diagrams/source.mmd", "architecture/derived.svg", "architecture/README.md"], cwd=self.root, check=True)
+        self.assertEqual([], validator.validate_tooling(self.root))
+        self.write("architecture/README.md", "[Derivative](derived.svg)\n")
+        self.assertTrue(any("unclassified tracked SVG" in error for error in validator.validate_tooling(self.root)))
 
 
 class AdrValidatorTest(unittest.TestCase):

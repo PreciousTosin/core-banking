@@ -1,0 +1,21 @@
+---
+title: CURRENT — Funds-core component dependencies
+---
+%% state: CURRENT
+%% abstraction: component
+%% question: Which implemented funds-core layers own financial rules and persistence responsibilities?
+%% owner: funds-core maintainers
+%% arc42: architecture/arc42/05-building-block-view.md
+%% adrs: ADR-0002, ADR-0004, ADR-0006
+%% last_verified: 2026-09-01
+flowchart TB
+  runtime[Runtime guard]
+  application[Application services: posting, reversal, proof]
+  domain[Domain: records and invariants]
+  postgres[PostgreSQL infrastructure: JDBC, migrations, roles]
+  database[(PostgreSQL)]
+  runtime --> application
+  application --> domain
+  application --> postgres
+  postgres --> database
+  domain -. no infrastructure dependency .-> application

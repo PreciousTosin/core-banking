@@ -24,3 +24,6 @@ not a deployed environment claim.
 [Kubernetes](../../infrastructure/kubernetes/infra-modern-core-banking-poc/namespace.yaml) and
 [Helm](../../infrastructure/helm/modern-core-banking-poc/Chart.yaml) files exist but do not establish a deployed
 full platform.
+
+The [proposed single-VM deployment diagram](../diagrams/single-vm-deployment.mmd)
+is a resource-envelope target, not a deployment claim.

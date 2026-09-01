@@ -25,3 +25,7 @@ outbox rows.
 The Java/Quarkus module processes typed application commands. Customer
 channels, providers, NIBSS/NIP, Go services, brokers, and workflow engines are
 not current interfaces or topology claims.
+
+The version-controlled [current context diagram](../diagrams/context.mmd) and
+[proposed container diagram](../diagrams/containers.mmd) make the distinction
+between implemented boundaries and future containers reviewable.

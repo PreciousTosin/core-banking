@@ -2,6 +2,7 @@
 import argparse
 from collections import Counter, defaultdict
 import html
+import json
 import re
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"adrs", "links", "metadata", "migration", "structure"})
+CHECKS = frozenset({"adrs", "diagrams", "links", "metadata", "migration", "structure", "tooling"})
 
 MIGRATION_SOURCE = "architecture/modern-core-banking-comprehensive-design-revised.md"
 MIGRATION_INVENTORY = "architecture/archive/comprehensive-design-migration-inventory.md"
@@ -55,6 +56,17 @@ ARC42_FILENAMES = frozenset({
 ARC42_REQUIRED_FIELDS = ("title", "status", "owners", "last_verified", "related_adrs", "code_refs")
 ARC42_STATUSES = frozenset({"current", "deprecated"})
 TERMINAL_PROPOSAL_STATUSES = frozenset({"implemented", "rejected", "superseded"})
+DIAGRAM_FILENAMES = frozenset({
+    "containers.mmd",
+    "context.mmd",
+    "funds-core-components.mmd",
+    "posting-sequence.mmd",
+    "single-vm-deployment.mmd",
+})
+DIAGRAM_STATES = frozenset({"CURRENT", "PROPOSED"})
+DIAGRAM_METADATA_KEYS = ("state", "abstraction", "question", "owner", "arc42", "adrs", "last_verified")
+MERMAID_CLI_PACKAGE = "@mermaid-js/mermaid-cli"
+MERMAID_CLI_VERSION = "11.16.0"
 
 REQUIRED_GOVERNANCE_FILES = (
     "ARCHITECTURE.md",
@@ -321,6 +333,174 @@ def validate_metadata(root: Path) -> list[str]:
             elif not archived and status in TERMINAL_PROPOSAL_STATUSES:
                 errors.append(_metadata_error(path, root, f"terminal status {status} belongs in architecture/archive/proposals/"))
     return sorted(errors)
+
+def _diagram_error(path: Path, root: Path, message: str) -> str:
+    return f"{path.relative_to(root).as_posix()}: {message}"
+
+def _diagram_metadata(path: Path, root: Path) -> tuple[dict[str, str], list[str]]:
+    lines = path.read_text().splitlines()
+    errors = []
+    if len(lines) < 10 or lines[0].strip() != "---" or lines[2].strip() != "---":
+        return {}, [_diagram_error(path, root, "first ten lines must begin with Mermaid YAML front matter and seven metadata comments")]
+    title = re.fullmatch(r"title:\s*(.+)", lines[1].strip())
+    if not title:
+        errors.append(_diagram_error(path, root, "front matter title is required"))
+    values = {"title": title.group(1) if title else ""}
+    for offset, key in enumerate(DIAGRAM_METADATA_KEYS, 3):
+        match = re.fullmatch(rf"%%\s+{re.escape(key)}:\s*(.*)", lines[offset])
+        if not match:
+            errors.append(_diagram_error(path, root, f"metadata comment {key} is required in the first ten lines"))
+        else:
+            values[key] = match.group(1).strip()
+    return values, errors
+
+def _adr_ids(root: Path) -> set[str]:
+    directory = root / "architecture/adr"
+    if not directory.is_dir():
+        return set()
+    return {f"ADR-{path.name[:4]}" for path in directory.glob("[0-9][0-9][0-9][0-9]-*.md")}
+
+def validate_render_script_contract(root: Path) -> list[str]:
+    path = root / "architecture/scripts/render-diagrams.sh"
+    if not path.is_file():
+        return ["architecture/scripts/render-diagrams.sh is required"]
+    text = path.read_text()
+    errors = []
+    required = (
+        "#!/usr/bin/env bash\nset -euo pipefail",
+        'temp_root="$(mktemp -d)"',
+        'install_dir="$temp_root/install"',
+        '"$temp_root/npm-cache"',
+        '"$temp_root/puppeteer-cache"',
+        '"$temp_root/xdg-cache"',
+        '"$temp_root/xdg-config"',
+        '"$temp_root/xdg-data"',
+        'cp -- "$tooling_dir/package.json" "$tooling_dir/package-lock.json" "$install_dir/"',
+        'env "${owned_env[@]}" npm ci --prefix "$install_dir"',
+        'env "${owned_env[@]}" "$mmdc"',
+        'rm -rf -- "$temp_root"',
+    )
+    for required_text in required:
+        if required_text not in text:
+            errors.append(f"architecture/scripts/render-diagrams.sh: isolated render contract is missing {required_text}")
+    for variable in ("npm_config_cache", "PUPPETEER_CACHE_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        if text.count(f'"{variable}=$temp_root/') != 1:
+            errors.append(f"architecture/scripts/render-diagrams.sh: {variable} must be bound exactly once below temp_root")
+    if text.count("trap cleanup EXIT") != 1:
+        errors.append("architecture/scripts/render-diagrams.sh: exactly one cleanup trap is required")
+    if re.search(r"architecture/tooling/node_modules|--prefix\s+architecture/tooling|~/(?:\.npm|\.cache)|\$HOME/(?:\.npm|\.cache)", text):
+        errors.append("architecture/scripts/render-diagrams.sh: must not use repository-local dependencies or user caches")
+    cleanup_match = re.search(r"cleanup\s*\(\)\s*\{(?P<body>.*?)\n\}", text, re.S)
+    if not cleanup_match or re.sub(r"\s+", " ", cleanup_match.group("body")).strip() != 'rm -rf -- "$temp_root"':
+        errors.append("architecture/scripts/render-diagrams.sh: cleanup may remove only the invocation-owned temp_root")
+    return sorted(errors)
+
+def validate_diagrams(root: Path) -> list[str]:
+    errors = []
+    directory = root / "architecture/diagrams"
+    found = {path.name for path in directory.glob("*.mmd")} if directory.is_dir() else set()
+    for name in sorted(DIAGRAM_FILENAMES - found):
+        errors.append(f"architecture/diagrams/{name} is required")
+    for name in sorted(found - DIAGRAM_FILENAMES):
+        errors.append(f"unexpected diagram source: architecture/diagrams/{name}")
+    existing_adrs = _adr_ids(root)
+    for name in sorted(found & DIAGRAM_FILENAMES):
+        path = directory / name
+        metadata, metadata_errors = _diagram_metadata(path, root)
+        errors.extend(metadata_errors)
+        state = metadata.get("state", "")
+        if state not in DIAGRAM_STATES:
+            errors.append(_diagram_error(path, root, "state must be CURRENT or PROPOSED"))
+        for key in ("abstraction", "question", "owner", "arc42", "adrs"):
+            if not metadata.get(key, ""):
+                errors.append(_diagram_error(path, root, f"{key} must not be empty"))
+        verified = metadata.get("last_verified", "")
+        try:
+            valid_date = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", verified)) and date.fromisoformat(verified)
+        except ValueError:
+            valid_date = False
+        if not valid_date:
+            errors.append(_diagram_error(path, root, "last_verified must use ISO YYYY-MM-DD"))
+        if state and state not in metadata.get("title", ""):
+            errors.append(_diagram_error(path, root, "front matter title must contain the metadata state"))
+        arc42_name = metadata.get("arc42", "")
+        arc42_path = root / arc42_name
+        if not arc42_name or not arc42_path.is_file():
+            errors.append(_diagram_error(path, root, f"arc42 path does not exist: {arc42_name or 'missing'}"))
+        else:
+            destinations = extract_markdown_destinations(arc42_path.read_text())
+            targets = {(arc42_path.parent / _local_destination(destination)[0]).resolve() for destination in destinations if _local_destination(destination) is not None}
+            if path.resolve() not in targets:
+                errors.append(_diagram_error(path, root, f"declared arc42 section must link back to {path.relative_to(root).as_posix()}"))
+        ids = [value.strip() for value in metadata.get("adrs", "").split(",") if value.strip()]
+        if not ids or any(identifier not in existing_adrs for identifier in ids):
+            errors.append(_diagram_error(path, root, "adrs must name existing ADR IDs"))
+    script = root / "architecture/scripts/render-diagrams.sh"
+    if not script.is_file():
+        errors.append("architecture/scripts/render-diagrams.sh is required")
+    elif not script.stat().st_mode & 0o111:
+        errors.append("architecture/scripts/render-diagrams.sh must be executable")
+    errors.extend(validate_render_script_contract(root))
+    return sorted(set(errors))
+
+def _load_json(path: Path, label: str, errors: list[str]) -> object | None:
+    if not path.is_file():
+        errors.append(f"{label} is required")
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        errors.append(f"{label} must contain valid JSON")
+        return None
+
+def _tracked_paths(root: Path) -> list[str]:
+    result = subprocess.run(["git", "ls-files", "-z"], cwd=root, text=False, capture_output=True)
+    return result.stdout.decode().split("\0")[:-1] if result.returncode == 0 else []
+
+def validate_tooling(root: Path) -> list[str]:
+    errors = []
+    package = _load_json(root / "architecture/tooling/package.json", "architecture/tooling/package.json", errors)
+    lock = _load_json(root / "architecture/tooling/package-lock.json", "architecture/tooling/package-lock.json", errors)
+    expected_package = {
+        "name": "core-banking-architecture-tooling", "private": True, "version": "1.0.0",
+        "engines": {"node": ">=20"}, "devDependencies": {MERMAID_CLI_PACKAGE: MERMAID_CLI_VERSION},
+    }
+    if package is not None and package != expected_package:
+        errors.append("architecture/tooling/package.json must contain only the exact Mermaid CLI development pin")
+    if isinstance(lock, dict):
+        packages = lock.get("packages")
+        root_package = packages.get("") if isinstance(packages, dict) else None
+        resolved = packages.get(f"node_modules/{MERMAID_CLI_PACKAGE}") if isinstance(packages, dict) else None
+        if not isinstance(root_package, dict) or root_package.get("devDependencies") != {MERMAID_CLI_PACKAGE: MERMAID_CLI_VERSION}:
+            errors.append("architecture/tooling/package-lock.json root metadata must declare the exact Mermaid CLI pin")
+        if not isinstance(resolved, dict) or resolved.get("version") != MERMAID_CLI_VERSION:
+            errors.append("architecture/tooling/package-lock.json must resolve Mermaid CLI exactly 11.16.0")
+    elif lock is not None:
+        errors.append("architecture/tooling/package-lock.json must be an object")
+    tracked = _tracked_paths(root)
+    for path in tracked:
+        if path.startswith("architecture/tooling/node_modules/") or path.startswith("architecture/diagrams/generated/"):
+            errors.append(f"tracked generated or dependency path: {path}")
+    for svg in (path for path in tracked if path.startswith("architecture/") and path.endswith(".svg") and not path.startswith("architecture/diagrams/generated/")):
+        marked = False
+        for markdown in iter_governed_markdown(root):
+            rel = markdown.relative_to(root).as_posix()
+            text = markdown.read_text()
+            marker = f"<!-- approved-architecture-derivative: {svg} source="
+            for line in text.splitlines():
+                match = re.fullmatch(r"<!-- approved-architecture-derivative: (\S+\.svg) source=(\S+\.mmd) -->", line)
+                if not match or match.group(1) != svg:
+                    continue
+                source = root / match.group(2)
+                links = extract_markdown_destinations(text)
+                targets = {(markdown.parent / _local_destination(destination)[0]).resolve() for destination in links if _local_destination(destination) is not None}
+                if source.is_file() and (root / svg).is_file() and (root / svg).resolve() in targets:
+                    marked = True
+                else:
+                    errors.append(f"invalid approved architecture derivative: {svg} in {rel}")
+        if not marked:
+            errors.append(f"unclassified tracked SVG: {svg}")
+    return sorted(set(errors))
 
 def _migration_error(message: str) -> str:
     return f"{MIGRATION_INVENTORY}: {message}"
@@ -1386,7 +1566,15 @@ def validate_accepted_adr_edge_range(root: Path, range_base: str, range_head: st
     return sorted(set(errors))
 
 Validator = Callable[[Path], list[str]]
-VALIDATORS: dict[str, Validator] = {"adrs": validate_adrs, "links": validate_links, "metadata": validate_metadata, "migration": validate_migration_inventory, "structure": validate_structure}
+VALIDATORS: dict[str, Validator] = {
+    "adrs": validate_adrs,
+    "diagrams": validate_diagrams,
+    "links": validate_links,
+    "metadata": validate_metadata,
+    "migration": validate_migration_inventory,
+    "structure": validate_structure,
+    "tooling": validate_tooling,
+}
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
     errors = []
