@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+  "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!--
+  The machine-checkable subset of docs/conventions/code-comments.md. Rules that a tool
+  cannot judge - whether a comment restates its code, whether a claim is true - stay in
+  human review; this file is deliberately not a style guide for the module.
+-->
+<module name="Checker">
+  <property name="severity" value="error"/>
+
+  <!-- Convention: work items live in the tracker or the plan documents, never in source. -->
+  <module name="RegexpSingleline">
+    <property name="format" value="\b(TODO|FIXME|XXX)\b"/>
+    <property name="fileExtensions" value="java,sql"/>
+    <property name="message" value="Work items belong in the tracker, not in source."/>
+  </module>
+
+  <!-- Convention: every migration opens with a SQL line-comment header block, whose first line
+       is 'Vxxx:' plus what the migration changes and why, relative to the previous version.
+       Two lines is the floor, not the target. -->
+  <module name="RegexpHeader">
+    <property name="fileExtensions" value="sql"/>
+    <property name="header" value="^-- V[0-9_]+.*$\n^--.*$"/>
+  </module>
+
+  <module name="TreeWalker">
+    <property name="fileExtensions" value="java"/>
+
+    <!-- Convention: every type carries a one-block purpose comment. Scope 'package' rather
+         than 'public' because the convention's Tests table asks every test class for one and
+         21 of this module's 25 test classes are package-private; 'public' would check none of
+         them. Nested types count; they are the ones authors forget. -->
+    <module name="MissingJavadocType">
+      <property name="scope" value="package"/>
+    </module>
+
+    <!-- A Javadoc block between an annotation and its declaration documents nothing: the
+         compiler and the IDE both drop it. -->
+    <module name="InvalidJavadocPosition"/>
+
+    <!-- Convention: the first sentence is a real summary and ends with a period. These four
+         replace JavadocStyle, which the convention document named but which was removed in
+         Checkstyle 13. -->
+    <module name="SummaryJavadoc"/>
+    <module name="JavadocContentLocation"/>
+    <module name="JavadocMissingWhitespaceAfterAsterisk"/>
+    <module name="NonEmptyAtclauseDescription"/>
+
+    <!-- MissingJavadocMethod is deliberately absent: requiring Javadoc on every method
+         produces comments that restate the signature, which the convention forbids. -->
+  </module>
+</module>
