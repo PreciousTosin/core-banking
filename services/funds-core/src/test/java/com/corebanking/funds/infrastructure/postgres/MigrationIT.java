@@ -24,13 +24,14 @@ import org.junit.jupiter.api.Test;
 /**
  * Proves the migrated schema on the Quarkus test datasource (a fresh Testcontainers PostgreSQL
  * migrated by Flyway under the test profile): reference-table shape, the V003.2 finality trigger
- * and single-reversal index, the ACC-24 role model, and the ACC-38/ACC-40/ACC-42 reference
+ * and single-reversal index, the ACC-24 role model, the ACC-38/ACC-40/ACC-42 reference
  * constraints (NUBAN check digits, identifier cardinality and immutability, product-version
- * binding, period exclusion). Role tests read the catalog ACLs and then switch the session with
- * {@code SET ROLE funds_app} / {@code SET ROLE funds_proof_reader} to observe real 42501 denials.
- * Every test runs inside one rolled-back transaction except the lock test, which needs two
- * connections. Catches a migration that widens a grant, moves ownership or drops a constraint the
- * kernel relies on.
+ * binding) and accounting-period exclusion. Role tests read the catalog ACLs and then switch the
+ * session with {@code SET ROLE funds_app} / {@code SET ROLE funds_proof_reader} to observe real
+ * 42501 denials. Every database test runs inside one rolled-back transaction except the lock
+ * test, which needs two connections and truncates the reference tables around itself; the V004
+ * text test only reads the migration file. Catches a migration that widens a grant, moves
+ * ownership or drops a constraint the kernel relies on.
  */
 @QuarkusTest
 class MigrationIT {
@@ -97,8 +98,8 @@ class MigrationIT {
                   AND trigger.tgname = 'posting_requires_in_progress_command'
                   AND NOT trigger.tgisinternal
                 """));
-            // V005 re-keys the index on the link alone: a second linked journal must not escape
-            // uniqueness by carrying a transaction_type other than REVERSAL.
+            // V005 re-keyed the index on the link alone because its linkage CHECK guarantees a
+            // link implies REVERSAL; the predicate assertion pins that widened definition.
             assertEquals(1, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_indexes
@@ -153,8 +154,8 @@ class MigrationIT {
                 ) owned_object
                 WHERE owned_object.owner <> 'funds_migrator'::regrole
                 """));
-            // SECURITY DEFINER is permitted on exactly the trigger and lock functions; on any
-            // other function it would be an escalation path for funds_app.
+            // SECURITY DEFINER is permitted on exactly the functions listed here; on any other
+            // function it would be an escalation path for funds_app.
             assertEquals(0, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_proc procedure
@@ -437,9 +438,10 @@ class MigrationIT {
     }
 
     /**
-     * The two queries are the exact per-book trial-balance and control-projection proof shapes;
-     * they touch only the columns V005 grants to {@code funds_proof_reader}, so a proof job needs
-     * nothing more, and the denials show it can get nothing more.
+     * The two queries follow the per-book trial-balance and control-projection proof shapes of
+     * {@code JdbcAccountingProofRepository} and touch only the columns V005 grants to
+     * {@code funds_proof_reader}, so a proof job needs nothing more, and the denials show it can
+     * get nothing more.
      */
     @Test
     void proofReaderCanRunExactProofsButCannotReadOperationalOrPolicyPayloads()
@@ -668,8 +670,8 @@ class MigrationIT {
         });
     }
 
-    // 000011/0000014579 is the published check-digit worked example; 000000/0000000017 is the
-    // deterministic SIMULATOR_ONLY fixture named in the README and is not production-routable.
+    // 000011/0000014579 is the CBN algorithm worked example NubanTest also uses; 000000/0000000017
+    // is the deterministic SIMULATOR_ONLY fixture named in the README, not production-routable.
     @Test
     void sqlNubanValidatorAcceptsPublishedAndSyntheticFixtures() throws Exception {
         inTransaction(connection -> {
@@ -848,9 +850,9 @@ class MigrationIT {
 
     /**
      * Two sessions: the first inserts an external identifier and keeps its transaction open, so
-     * the scope trigger's lock on the ledger-account row is still held; the second, under a
-     * 250 ms lock_timeout, must fail (55P03) to update that account rather than race the scope
-     * check.
+     * the scope trigger's {@code FOR SHARE} lock on the ledger-account row is still held; the
+     * second, under a 250 ms lock_timeout, is rejected (55P03) when it updates that account
+     * rather than racing the scope check.
      */
     @Test
     void externalIdentifierInsertLocksLedgerRowAgainstConcurrentUpdate() throws Exception {

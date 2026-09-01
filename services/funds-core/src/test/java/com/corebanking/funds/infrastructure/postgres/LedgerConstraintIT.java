@@ -27,17 +27,19 @@ import org.junit.jupiter.api.Test;
  * Proves the ledger's database-level invariants directly with SQL on the migrated Quarkus test
  * datasource, bypassing {@code PostingService} and {@code JdbcLedgerRepository}, so a regressed
  * trigger or CHECK is caught even when the Java path still behaves. Covers ACC-01 (per-currency
- * balance and reference consistency at commit), ACC-20 (journal, posting and completed-command
- * immutability) and ACC-24 (a {@code funds_app} session cannot mutate, disable triggers, redefine
- * functions or escalate; an actual {@code funds_proof_reader} session reads only proof columns).
+ * balance and reference consistency at commit) and ACC-24 (a {@code funds_app} session cannot
+ * mutate, disable triggers, redefine functions or escalate; an actual {@code funds_proof_reader}
+ * session reads only proof columns), plus journal, posting and completed-command immutability.
  * Grouped by mechanism:
  * <ul>
  *   <li>{@code journal_balance_deferred} / {@code posting_balance_deferred} (V003): balance is
  *       checked per currency at COMMIT, mirroring {@code JournalValidator};</li>
- *   <li>{@code posting_reference_consistency}, {@code journal_reference_consistency} (V002):
- *       23514 at row insert for currency, book or legal-entity mismatch;</li>
+ *   <li>{@code posting_reference_consistency} (V002) and {@code journal_governance} (V005/V006,
+ *       which replaced V002's {@code journal_reference_consistency}): 23514 at row insert for
+ *       currency, book or legal-entity mismatch;</li>
  *   <li>{@code book_identity_immutable} (V003.1), {@code ledger_account_identity_immutable}
- *       (V005) and {@code ledger_account_chart_mapping_frozen} (V005/V006): 55000 for any
+ *       (V003.1, narrowed by V005) and {@code ledger_account_chart_mapping_frozen} (V005/V006):
+ *       55000 for any
  *       identity or classification change, while operational status changes stay allowed;</li>
  *   <li>{@code journal_immutable} / {@code posting_immutable} ({@code reject_ledger_mutation},
  *       V003) and {@code posting_requires_in_progress_command} (V003.2): no update, delete or
@@ -574,8 +576,9 @@ class LedgerConstraintIT {
                     WHERE command_id = '%s' AND state = 'IN_PROGRESS'
                     """.formatted(
                         JOURNAL_ID, JOURNAL_ID, JOURNAL_ID, REQUEST_HASH, COMMAND_ID));
-                // The deferred balance and result-consistency triggers would otherwise run only
-                // at a commit this rolled-back test never performs.
+                // The deferred balance and reversibility constraint triggers and the deferred
+                // command-journal link FK would otherwise run only at a commit this rolled-back
+                // test never performs.
                 execute(connection, "SET CONSTRAINTS ALL IMMEDIATE");
 
                 long allocatedSequence = queryLong(connection,

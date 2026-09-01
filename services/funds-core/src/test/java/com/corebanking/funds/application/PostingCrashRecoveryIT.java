@@ -96,16 +96,18 @@ import org.postgresql.ds.PGSimpleDataSource;
  * {@code awaitCommittedJournal} polls until the journal is visible, then the identical replay must
  * return the stored journal id and sequence with an unchanged snapshot.
  *
- * <p>Bounding. Every database call and child wait runs through {@code runBounded} /
+ * <p>Bounding. Every database call and output-file read runs through {@code runBounded} /
  * {@code runJdbcBounded}: a virtual-thread task under a {@code Deadline}, with statement cancel
- * and connection abort on timeout and a check that no JDBC resource is left live. The remaining
- * tests are self-tests of that harness using deterministic clock, process and filesystem doubles.
+ * and connection abort on timeout and a check that no JDBC resource is left live; the child's
+ * exit wait is a {@code Process.waitFor} under the same deadline. The remaining tests are
+ * self-tests of that harness, some against the real database and some with deterministic clock,
+ * process, executor and filesystem doubles.
  */
 @QuarkusTest
 class PostingCrashRecoveryIT {
     private static final UUID BEFORE_COMMIT_COMMAND_ID = TestPostingStack.uuid(40);
     private static final UUID AFTER_COMMIT_COMMAND_ID = TestPostingStack.uuid(50);
-    // Overall bound for every child wait and every probe; nothing in this class may block longer.
+    // Bound for each child wait and each probe; no single operation in this class may block longer.
     private static final Duration PROCESS_TIMEOUT = Duration.ofSeconds(10);
 
     @Inject
@@ -402,9 +404,9 @@ class PostingCrashRecoveryIT {
             () -> assertTrue(throwableTreeContains(failure, "live resource diagnostic")));
     }
 
-    // The first statement of the first connection raises SQLSTATE 40001, so PostgresRetryPolicy
-    // must run a second attempt on a second connection; both physical connections must end closed
-    // and the ledger must show exactly one effect.
+    // The first prepared statement executed on the first connection raises SQLSTATE 40001, so
+    // PostgresRetryPolicy must run a second attempt on a second connection; both physical
+    // connections must end closed and the ledger must show exactly one effect.
     @Test
     void realRepositoryRetryClosesAndClearsTheFailedAttemptBeforeOpeningTheNextConnection() throws Exception {
         UUID commandId = TestPostingStack.uuid(60);
@@ -447,8 +449,9 @@ class PostingCrashRecoveryIT {
         PostingCommand command = CrashPostingWorker.command(commandId);
         CrashSnapshot before = rows.snapshot(commandId);
         PGSimpleDataSource slowDataSource = timeoutDataSource(credentials);
-        // Driver and server timeouts are widened past the 2 s bound so the harness, not the
-        // driver, has to be the one that cancels.
+        // Driver and session-level server timeouts are widened past the 2 s bound so the driver
+        // is not the one that cancels; PostingService still applies its transaction-local 1 s lock
+        // deadline on top of these.
         slowDataSource.setSocketTimeout(5);
         slowDataSource.setQueryTimeout(5);
         slowDataSource.setOptions("-c statement_timeout=5000 -c lock_timeout=5000");
@@ -497,9 +500,9 @@ class PostingCrashRecoveryIT {
             }));
     }
 
-    // This and the next three tests drive WorkerHandle with a MutableNanoClock, a
-    // DeterministicExitProcess and recording doubles, so budget arithmetic is asserted exactly
-    // without a real process or filesystem.
+    // This and the next three tests drive WorkerHandle and the startWorker failure path with a
+    // MutableNanoClock and process, wait and file doubles, so budget arithmetic is asserted
+    // exactly without a real process or filesystem.
     @Test
     void workerOperationAndCleanupBudgetsStartFreshAfterLongVisibilityPhase() {
         var clock = new MutableNanoClock();
@@ -1355,7 +1358,10 @@ class PostingCrashRecoveryIT {
 
     private record WorkerExit(int exitCode, String output) {}
 
-    /** Command-scoped view of every table a posting touches, compared whole by equality. */
+    /**
+     * View of every table a posting writes, scoped to one command and the two fixture accounts
+     * and compared whole by equality.
+     */
     private record CrashSnapshot(
         List<IdempotencyState> idempotency,
         List<JournalState> journals,
@@ -2169,8 +2175,8 @@ class PostingCrashRecoveryIT {
         @Override
         public void delete(Path path) throws IOException {
             Files.deleteIfExists(path);
-            // deleteIfExists returning quietly on a file that is still there would hide a failed
-            // cleanup; re-check so the handle can report it.
+            // Re-check so a file that somehow survives deleteIfExists is reported as a cleanup
+            // failure instead of leaking silently.
             if (Files.exists(path)) {
                 throw new IOException("worker output file still exists after deletion: " + path.getFileName());
             }
