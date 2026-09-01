@@ -31,11 +31,11 @@ Measured on 2026-09-01 against commit `3812f00`, using the Checkstyle 14.1.0 CLI
 
 | Measurement | Result |
 |---|---|
-| Public types in `src/main` under `MissingJavadocType` (scope `public`) | 44 types, **0 violations** |
+| Types in `src/main` under `MissingJavadocType` | **0 violations** at scope `public` (44 public types) and **0** at scope `package`, the scope this plan ships |
 | `InvalidJavadocPosition` on `src/main` | 0 violations |
 | `SummaryJavadoc`, `JavadocContentLocation`, `JavadocMissingWhitespaceAfterAsterisk`, `NonEmptyAtclauseDescription` on `src/main` | 0 violations |
 | `JavadocParagraph`, `SingleLineJavadoc` on `src/main` (measured, then excluded by decision D4) | 0 violations |
-| `MissingJavadocType` on `src/test` | **2 violations** — nested records `ModelLine` (`ReferenceLedgerModel.java:234`) and `SuccessfulCommand` (`:258`) |
+| `MissingJavadocType` on `src/test` | **2 violations** at either scope — nested records `ModelLine` (`ReferenceLedgerModel.java:234`) and `SuccessfulCommand` (`:258`). 21 of the 25 test classes are package-private, so scope `public` would check almost none of them, and scope `package` adds no violations |
 | Migration header blocks | All 8 migrations open with a `-- Vxxx:` block, 3 to 12 lines long; all pass `RegexpHeader` |
 | `TODO` / `FIXME` / `XXX` in `services/funds-core` | 0 occurrences |
 | `JavadocStyle` (named in the convention document) | **Does not exist.** Removed in Checkstyle 13; both 13.11.0 and 14.1.0 fail with `cannot initialize module JavadocStyle`. This is the one factual error in the current convention document |
@@ -44,11 +44,13 @@ Measured on 2026-09-01 against commit `3812f00`, using the Checkstyle 14.1.0 CLI
 
 Parameter names used in the POM below were confirmed against `META-INF/maven/plugin.xml` inside `maven-checkstyle-plugin-3.6.0.jar`. `configLocation`, `sourceDirectories`, `testSourceDirectories`, `includeResources`, `resourceIncludes`, `includeTestResources`, `includeTestSourceDirectory`, `violationSeverity`, `failOnViolation`, `failsOnError`, `consoleOutput` and `skip` all exist on the `check` goal. **`linkXRef` does not exist on `check`** (it is a reporting-goal parameter) and must not be added. Relevant defaults: `includeResources=true`, `includeTestResources=true`, `resourceIncludes=**/*.properties`, `includeTestSourceDirectory=false`, `consoleOutput=false`, `failsOnError=false`, `violationSeverity=error`, `failOnViolation=true`, `configLocation=sun_checks.xml`.
 
+`failsOnError` is deliberately **not** set, and should not be added. Despite the name it is not a crash switch: it fails the build on the raw error-severity violation count *before* the goal logs anything (`DefaultCheckstyleExecutor.executeCheckstyle`, `if (nbErrors > 0) { if (request.isFailsOnError()) throw ... }`), which bypasses `violationSeverity` and the console listing and reports a `MojoExecutionException` instead of a clean violation failure. Crash safety is already there without it: the plugin never calls `Checker.setHaltOnException`, so Checkstyle's default halt-and-rethrow propagates, and a bad `configLocation` throws in `getConfigFile`. `failOnViolation=true` with `violationSeverity=error` is the documented pairing and is what this plan uses.
+
 ## Decisions
 
 These were settled before the plan was written. Do not re-open them during execution.
 
-- **D1 — Test sources are in scope.** The convention already requires test-support classes to carry type comments, and the cost is exactly two short Javadoc blocks (Task 3). Test sources get `MissingJavadocType` and the rest of the `TreeWalker` set on the same terms as main sources.
+- **D1 — Test sources are in scope, at scope `package`.** The convention requires every test class to carry a type comment, and 21 of this module's 25 test classes are package-private: `MissingJavadocType` at scope `public` would check almost none of them, so the gate would claim a coverage it does not have. Scope `package` was measured at zero new violations across main and test sources, so the whole cost of test coverage is the two Javadoc blocks in Task 3. The side effect is that package-private *main* types are held to the rule too — stricter than the convention's Java table, which speaks only of public types, and free today.
 - **D2 — The execution binds to `validate`, not `verify`.** It fails in seconds rather than after the Testcontainers run. `mvn verify` runs `validate` first, so the checklist statement "the gate runs in `./mvnw clean verify`" stays true.
 - **D3 — The migration-header check is Checkstyle `RegexpHeader`, not a shell script.** No bash/Windows split, no `exec-maven-plugin`, no second failure format, and it is proven to catch both a missing header and a one-line header.
 - **D4 — Excluded rules.** `MissingJavadocMethod` is excluded because it pushes authors toward restating code, which the convention explicitly forbids. `JavadocParagraph` and `SingleLineJavadoc` are excluded as layout policing: both pass today, but they generate friction without protecting any invariant.
@@ -103,10 +105,12 @@ Create `services/funds-core/config/checkstyle/checkstyle.xml`:
   <module name="TreeWalker">
     <property name="fileExtensions" value="java"/>
 
-    <!-- Convention: every public type carries a one-block purpose comment. Nested public
-         types count; they are the ones authors forget. -->
+    <!-- Convention: every type carries a one-block purpose comment. Scope 'package' rather
+         than 'public' because the convention's Tests table asks every test class for one and
+         21 of this module's 25 test classes are package-private; 'public' would check none of
+         them. Nested types count; they are the ones authors forget. -->
     <module name="MissingJavadocType">
-      <property name="scope" value="public"/>
+      <property name="scope" value="package"/>
     </module>
 
     <!-- A Javadoc block between an annotation and its declaration documents nothing: the
@@ -153,12 +157,12 @@ In `services/funds-core/pom.xml`, add inside `<build><plugins>` after the `maven
                     </sourceDirectories>
                     <includeResources>false</includeResources>
                     <includeTestResources>false</includeTestResources>
+                    <!-- The goal already lists violations in its own format; this adds
+                         Checkstyle's native 'file:line:col: message [Rule]' lines, which is the
+                         format the canary steps in the plan quote. -->
                     <consoleOutput>true</consoleOutput>
                     <violationSeverity>error</violationSeverity>
                     <failOnViolation>true</failOnViolation>
-                    <!-- A Checkstyle crash - a parse failure on new syntax, a missing config -
-                         must fail the build rather than pass silently. The default is false. -->
-                    <failsOnError>true</failsOnError>
                 </configuration>
                 <executions>
                     <execution>
@@ -201,7 +205,9 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
-Expected: `BUILD FAILURE`, with three Checkstyle violations. Match on the bracketed rule names rather than whole lines — the console format comes from Checkstyle's `DefaultLogger`:
+Expected: `BUILD FAILURE`, with three Checkstyle violations.
+
+Each violation is printed **twice**, in two formats, and that is normal: the goal logs its own `file:[line,col] (category) RuleName: message` line, and `consoleOutput=true` additionally attaches Checkstyle's `DefaultLogger`, which prints the form quoted below. Match on the rule name, not on a whole line, and count distinct rule names rather than output lines:
 
 ```
 CanaryProbe.java:3:1: Missing a Javadoc comment for 'CanaryProbe'. [MissingJavadocType]
@@ -605,8 +611,9 @@ The machine-checkable part of this document runs as Checkstyle in the
 `services/funds-core` build, bound to `validate` so it fails before the test
 gate. The ruleset is `services/funds-core/config/checkstyle/checkstyle.xml`:
 
-- `MissingJavadocType` (scope `public`, main and test sources) — every public
-  type, including nested ones, carries a purpose comment.
+- `MissingJavadocType` (scope `package`, main and test sources) — every type
+  that is not private, including nested ones and package-private test classes,
+  carries a purpose comment.
 - `InvalidJavadocPosition` — a Javadoc block wedged between an annotation and
   its declaration documents nothing.
 - `SummaryJavadoc`, `JavadocContentLocation`,
@@ -659,16 +666,18 @@ git commit -m "Record comment-convention enforcement in the conventions"
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 git status --porcelain
-git diff --stat 3812f00..HEAD
+git diff --stat 3812f00..HEAD -- . ':(exclude)docs/superpowers/plans/'
 ```
 
 Expected: clean status; five files changed — `AGENTS.md`, `docs/conventions/code-comments.md`, `services/funds-core/config/checkstyle/checkstyle.xml`, `services/funds-core/pom.xml`, `ReferenceLedgerModel.java`.
+
+The pathspec excludes this plan document on purpose. If you are working on the branch that carries the plan, the plan's own commits are inside `3812f00..HEAD`, and without the exclusion this check reports six files and the next one reports two added files — a mismatch that means nothing.
 
 - [ ] **2. No canary artefact survived**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-git log --diff-filter=A --name-only --format= 3812f00..HEAD | sort -u
+git log --diff-filter=A --name-only --format= 3812f00..HEAD -- . ':(exclude)docs/superpowers/plans/' | sort -u
 ls services/funds-core/src/main/resources/db/migration/
 ```
 
