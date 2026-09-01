@@ -188,8 +188,8 @@ def _mask_markdown_code(text: str) -> str:
                 fence_length = 0
             offset += len(raw_line)
             continue
-        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-        if opening:
+        opening = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
             fence_character = opening.group(1)[0]
             fence_length = len(opening.group(1))
             for index in range(offset, offset + len(line)):

@@ -2751,6 +2751,11 @@ jobs:
         )
         self.assertEqual([], validator.validate_pr_body("\n".join(examples) + self.pr_body()))
 
+    def test_pr_body_rejects_a_section_exposed_by_an_invalid_backtick_fence_opener(self):
+        body = "```bad`\n````\n" + self.pr_body() + "````\n"
+        errors = validator.validate_pr_body(body)
+        self.assertTrue(any("exactly one canonical" in error for error in errors), errors)
+
     def test_pr_body_masks_multiline_inline_code_with_matching_runs(self):
         example = "``Related ADRs:\n- [x] No architecture impact``\n"
         self.assertEqual([], validator.validate_pr_body(example + self.pr_body()))
