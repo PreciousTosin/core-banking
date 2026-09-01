@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import html
 import json
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"adrs", "archive", "archive-review", "diagrams", "links", "metadata", "migration", "structure", "tooling", "traceability"})
+CHECKS = frozenset({"adrs", "archive", "archive-review", "diagrams", "links", "metadata", "migration", "structure", "tooling", "traceability", "workflow"})
 
 MIGRATION_SOURCE = "architecture/modern-core-banking-comprehensive-design-revised.md"
 MIGRATION_ARCHIVE_SOURCE = "architecture/archive/modern-core-banking-comprehensive-design-revised.md"
@@ -98,8 +99,10 @@ DIAGRAM_STATES = frozenset({"CURRENT", "PROPOSED"})
 DIAGRAM_METADATA_KEYS = ("state", "abstraction", "question", "owner", "arc42", "adrs", "last_verified")
 MERMAID_CLI_PACKAGE = "@mermaid-js/mermaid-cli"
 MERMAID_CLI_VERSION = "11.16.0"
+WORKFLOW_HISTORY_RUN_SHA256 = "f088f8691ea9cc621cceb6acd117dcd6c888023fb8e4f8f5c588325a0664f091"
 
 REQUIRED_GOVERNANCE_FILES = (
+    ".github/pull_request_template.md",
     "ARCHITECTURE.md",
     "architecture/README.md",
     "architecture/adr/README.md",
@@ -107,6 +110,34 @@ REQUIRED_GOVERNANCE_FILES = (
     "architecture/archive/proposals/README.md",
     "architecture/diagrams/README.md",
     "architecture/proposals/README.md",
+)
+PR_ARCHITECTURE_HEADING = "## Architecture impact"
+PR_ARCHITECTURE_CHECKBOXES = (
+    "No architecture impact",
+    "Architecture changed; linked below",
+)
+PR_ARCHITECTURE_FIELDS = (
+    "Related ADRs:",
+    "Current-state arc42 sections changed:",
+    "Proposals implemented, invalidated, or superseded:",
+    "Diagrams changed:",
+    "Verification evidence:",
+)
+PR_TEMPLATE_LITERALS = (
+    PR_ARCHITECTURE_HEADING,
+    "- [ ] No architecture impact",
+    "- [ ] Architecture changed; linked below",
+    *PR_ARCHITECTURE_FIELDS,
+)
+PR_TEMPLATE_BLOCK = (
+    "## Architecture impact\n"
+    "- [ ] No architecture impact\n"
+    "- [ ] Architecture changed; linked below\n\n"
+    "Related ADRs:\n"
+    "Current-state arc42 sections changed:\n"
+    "Proposals implemented, invalidated, or superseded:\n"
+    "Diagrams changed:\n"
+    "Verification evidence:"
 )
 
 @dataclass(frozen=True)
@@ -140,30 +171,61 @@ class StaleWarning:
 
 def _mask_markdown_code(text: str) -> str:
     chars = list(text)
-    i = 0
-    fence = None
-    inline = None
-    while i < len(text):
-        if fence:
-            if text.startswith(fence, i) and (i == 0 or text[i-1] == "\n"):
-                n = len(fence); chars[i:i+n] = " " * n; fence = None; i += n
-            elif text[i] != "\n": chars[i] = " "
-            i += 1; continue
-        if inline:
-            if text.startswith(inline, i):
-                n = len(inline); chars[i:i+n] = " " * n; inline = None; i += n
-            elif text[i] != "\n": chars[i] = " "
-            i += 1; continue
-        if text[i] in "`~" and (i == 0 or text[i-1] == "\n"):
-            ch = text[i]; n = 0
-            while i+n < len(text) and text[i+n] == ch: n += 1
-            if n >= 3:
-                fence = ch*n; chars[i:i+n] = " "*n; i += n; continue
-        if text[i] == "`":
-            n = 1
-            while i+n < len(text) and text[i+n] == "`": n += 1
-            inline = "`"*n; chars[i:i+n] = " "*n; i += n; continue
-        i += 1
+    offset = 0
+    fence_character = None
+    fence_length = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        if fence_character:
+            closing = re.match(
+                rf"^ {{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$",
+                line,
+            )
+            for index in range(offset, offset + len(line)):
+                chars[index] = " "
+            if closing:
+                fence_character = None
+                fence_length = 0
+            offset += len(raw_line)
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if opening:
+            fence_character = opening.group(1)[0]
+            fence_length = len(opening.group(1))
+            for index in range(offset, offset + len(line)):
+                chars[index] = " "
+            offset += len(raw_line)
+            continue
+        offset += len(raw_line)
+    index = 0
+    while index < len(text):
+        if text[index] != "`" or chars[index] != "`":
+            index += 1
+            continue
+        run_end = index + 1
+        while run_end < len(text) and text[run_end] == "`" and chars[run_end] == "`":
+            run_end += 1
+        run_length = run_end - index
+        search = run_end
+        closing_end = None
+        while search < len(text):
+            if text[search] != "`" or chars[search] != "`":
+                search += 1
+                continue
+            candidate_end = search + 1
+            while candidate_end < len(text) and text[candidate_end] == "`" and chars[candidate_end] == "`":
+                candidate_end += 1
+            if candidate_end - search == run_length:
+                closing_end = candidate_end
+                break
+            search = candidate_end
+        if closing_end is None:
+            index = run_end
+            continue
+        for masked_index in range(index, closing_end):
+            if text[masked_index] not in "\r\n":
+                chars[masked_index] = " "
+        index = closing_end
     return "".join(chars)
 
 def _mask(text: str) -> str:
@@ -285,7 +347,521 @@ def validate_structure(root: Path) -> list[str]:
     architecture = root / "ARCHITECTURE.md"
     if architecture.is_file() and len(architecture.read_text().splitlines()) >= 180:
         errors.append("ARCHITECTURE.md must contain fewer than 180 lines")
+    template = root / ".github/pull_request_template.md"
+    if template.is_file():
+        text = template.read_text()
+        for literal in PR_TEMPLATE_LITERALS:
+            if text.splitlines().count(literal) != 1:
+                errors.append(f".github/pull_request_template.md must contain exactly one literal prompt: {literal}")
+        if text.count(PR_TEMPLATE_BLOCK) != 1:
+            errors.append(".github/pull_request_template.md must contain the canonical architecture block exactly once and in order")
     return sorted(errors)
+
+def validate_pr_body(body: str) -> list[str]:
+    masked = _mask(body)
+    lines = masked.splitlines()
+    errors = []
+    section_starts = [index for index, line in enumerate(lines) if line == PR_ARCHITECTURE_HEADING]
+    if len(section_starts) != 1:
+        errors.append("pull-request body must contain exactly one canonical ## Architecture impact section")
+        return errors
+
+    start = section_starts[0]
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.match(r"^#{1,2}\s+\S", lines[index]):
+            end = index
+            break
+    section_lines = lines[start:end]
+    outside_lines = lines[:start] + lines[end:]
+
+    selections = {}
+    for label in PR_ARCHITECTURE_CHECKBOXES:
+        pattern = re.compile(rf"^- \[([ xX])\] {re.escape(label)}$")
+        matches = [pattern.fullmatch(line) for line in section_lines]
+        matches = [match for match in matches if match]
+        occurrence_pattern = re.compile(rf"- \[[ xX]\] {re.escape(label)}")
+        occurrences = sum(len(occurrence_pattern.findall(line)) for line in section_lines)
+        if len(matches) != 1 or occurrences != 1:
+            errors.append(f"pull-request architecture section must contain exactly one checkbox prompt: {label}")
+        else:
+            selections[label] = matches[0].group(1).casefold() == "x"
+        if any(occurrence_pattern.search(line) for line in outside_lines):
+            errors.append(f"pull-request body contains canonical checkbox literal outside architecture section: - [ ] {label}")
+
+    values = {}
+    section_text = "\n".join(section_lines)
+    outside_text = "\n".join(outside_lines)
+    for label in PR_ARCHITECTURE_FIELDS:
+        count = section_text.count(label)
+        field_lines = [line for line in section_lines if line.startswith(label)]
+        if count != 1 or len(field_lines) != 1:
+            errors.append(f"pull-request architecture section must contain exactly one field label: {label}")
+        else:
+            values[label] = field_lines[0][len(label):].strip()
+        if label in outside_text:
+            errors.append(f"pull-request body contains canonical field literal outside architecture section: {label}")
+
+    if len(selections) == len(PR_ARCHITECTURE_CHECKBOXES) and sum(selections.values()) != 1:
+        errors.append("pull-request architecture section must select exactly one architecture-impact checkbox")
+
+    changed = selections.get("Architecture changed; linked below", False)
+    if changed and len(values) == len(PR_ARCHITECTURE_FIELDS):
+        for label in PR_ARCHITECTURE_FIELDS:
+            if not values[label]:
+                errors.append(f"pull-request architecture field requires a non-empty value: {label}")
+        artifacts = [values[label] for label in PR_ARCHITECTURE_FIELDS[:4]]
+        if all(value == "None" for value in artifacts):
+            errors.append("pull-request architecture change must name at least one affected ADR, arc42 section, proposal, or diagram")
+        evidence = values["Verification evidence:"]
+        if evidence == "None":
+            errors.append("pull-request Verification evidence: must not be None for an architecture change")
+    return sorted(set(errors))
+
+def validate_pr_event(path: Path) -> list[str]:
+    try:
+        event = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return ["pull-request event must contain valid JSON"]
+    if not isinstance(event, dict) or not isinstance(event.get("pull_request"), dict):
+        return ["pull-request event must contain a pull_request object"]
+    body = event["pull_request"].get("body")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        return ["pull-request event pull_request.body must be a string or null"]
+    return validate_pr_body(body)
+
+def _strip_yaml_comment(value: str) -> str:
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and double_quoted:
+            escaped = True
+            continue
+        if character == "'" and not double_quoted:
+            single_quoted = not single_quoted
+            continue
+        if character == '"' and not single_quoted:
+            double_quoted = not double_quoted
+            continue
+        if character == "#" and not single_quoted and not double_quoted and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.rstrip()
+
+def _split_yaml_pair(value: str) -> tuple[str, str] | None:
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and double_quoted:
+            escaped = True
+            continue
+        if character == "'" and not double_quoted:
+            single_quoted = not single_quoted
+            continue
+        if character == '"' and not single_quoted:
+            double_quoted = not double_quoted
+            continue
+        if character == ":" and not single_quoted and not double_quoted:
+            key = value[:index].strip()
+            if key:
+                return key, value[index + 1:].strip()
+            return None
+    return None
+
+def _split_yaml_inline_sequence(value: str) -> list[str] | None:
+    if not value.startswith("[") or not value.endswith("]"):
+        return None
+    items = []
+    current = []
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    for character in value[1:-1]:
+        if escaped:
+            current.append(character)
+            escaped = False
+            continue
+        if character == "\\" and double_quoted:
+            current.append(character)
+            escaped = True
+            continue
+        if character == "'" and not double_quoted:
+            single_quoted = not single_quoted
+            current.append(character)
+            continue
+        if character == '"' and not single_quoted:
+            double_quoted = not double_quoted
+            current.append(character)
+            continue
+        if character == "," and not single_quoted and not double_quoted:
+            items.append(_yaml_scalar("".join(current).strip()))
+            current = []
+        else:
+            current.append(character)
+    if single_quoted or double_quoted:
+        return None
+    final = "".join(current).strip()
+    if final or items:
+        items.append(_yaml_scalar(final))
+    return items
+
+def _yaml_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+class _WorkflowYamlParser:
+    def __init__(self, text: str):
+        self.lines = text.splitlines()
+        self.errors: list[str] = []
+
+    def _line(self, index: int) -> tuple[int, str] | None:
+        raw = self.lines[index]
+        prefix = raw[:len(raw) - len(raw.lstrip(" \t"))]
+        if "\t" in prefix:
+            self.errors.append(f"workflow:{index + 1}: tabs are forbidden in YAML indentation")
+            return None
+        content = _strip_yaml_comment(raw[len(prefix):])
+        if not content:
+            return None
+        return len(prefix), content
+
+    def _next(self, index: int) -> tuple[int, tuple[int, str] | None]:
+        while index < len(self.lines):
+            parsed = self._line(index)
+            if parsed is not None:
+                return index, parsed
+            index += 1
+        return index, None
+
+    def _duplicate(self, path: str, key: str, line: int) -> None:
+        labels = {
+            "": "top-level",
+            "jobs": "jobs",
+            "jobs.architecture-docs": "architecture-docs job",
+        }
+        label = labels.get(path, f"{path} mapping")
+        self.errors.append(f"workflow:{line}: duplicate {label} key: {key}")
+
+    def _key(self, value: str, line: int) -> str:
+        normalized = _yaml_scalar(value)
+        if normalized != value:
+            self.errors.append(f"workflow:{line}: quoted YAML keys are forbidden in governed mappings: {value}")
+        return normalized
+
+    def _block(self, index: int, key_indent: int) -> tuple[str, int]:
+        end = index
+        while end < len(self.lines):
+            raw = self.lines[end]
+            if raw.strip():
+                indent = len(raw) - len(raw.lstrip(" "))
+                if "\t" in raw[:len(raw) - len(raw.lstrip(" \t"))] or indent <= key_indent:
+                    break
+            end += 1
+        content = self.lines[index:end]
+        indents = [len(line) - len(line.lstrip(" ")) for line in content if line.strip()]
+        content_indent = min(indents) if indents else key_indent + 2
+        body = "\n".join(line[content_indent:] if line.strip() else "" for line in content)
+        return body.rstrip("\n"), end
+
+    def _value(self, value: str, index: int, key_indent: int, path: str):
+        if value in {">", ">-", ">+"}:
+            self.errors.append(f"workflow: folded block scalar is forbidden at {path}; use literal |")
+            return self._block(index, key_indent)
+        if value in {"|", "|-", "|+"}:
+            return self._block(index, key_indent)
+        if value:
+            sequence = _split_yaml_inline_sequence(value)
+            return (sequence if sequence is not None else _yaml_scalar(value)), index
+        next_index, next_line = self._next(index)
+        if next_line is None or next_line[0] <= key_indent:
+            return {}, index
+        if next_line[1].startswith("- "):
+            return self._sequence(next_index, next_line[0], path)
+        return self._mapping(next_index, next_line[0], path)
+
+    def _mapping(self, index: int, indent: int, path: str, initial: tuple[str, int] | None = None):
+        result = {}
+        if initial is not None:
+            pair = _split_yaml_pair(initial[0])
+            if pair is None:
+                self.errors.append(f"workflow:{initial[1] + 1}: expected mapping entry")
+            else:
+                raw_key, value = pair
+                key = self._key(raw_key, initial[1] + 1)
+                result[key], index = self._value(value, index, indent, f"{path}.{key}" if path else key)
+        while True:
+            next_index, parsed = self._next(index)
+            if parsed is None:
+                return result, next_index
+            line_indent, content = parsed
+            if line_indent < indent or content.startswith("- "):
+                return result, next_index
+            if line_indent > indent:
+                self.errors.append(f"workflow:{next_index + 1}: unexpected indentation in {path or 'top-level'} mapping")
+                index = next_index + 1
+                continue
+            pair = _split_yaml_pair(content)
+            if pair is None:
+                self.errors.append(f"workflow:{next_index + 1}: expected mapping entry")
+                index = next_index + 1
+                continue
+            raw_key, value = pair
+            key = self._key(raw_key, next_index + 1)
+            if key in result:
+                self._duplicate(path, key, next_index + 1)
+            parsed_value, index = self._value(
+                value,
+                next_index + 1,
+                indent,
+                f"{path}.{key}" if path else key,
+            )
+            if key not in result:
+                result[key] = parsed_value
+
+    def _sequence(self, index: int, indent: int, path: str):
+        result = []
+        while True:
+            next_index, parsed = self._next(index)
+            if parsed is None:
+                return result, next_index
+            line_indent, content = parsed
+            if line_indent < indent:
+                return result, next_index
+            if line_indent != indent or not content.startswith("- "):
+                self.errors.append(f"workflow:{next_index + 1}: malformed sequence in {path}")
+                index = next_index + 1
+                continue
+            item = content[2:].strip()
+            if not item:
+                value, index = self._value("", next_index + 1, indent, f"{path}[{len(result)}]")
+                result.append(value)
+                continue
+            if _split_yaml_pair(item) is not None:
+                value, index = self._mapping(
+                    next_index + 1,
+                    indent + 2,
+                    f"{path}[{len(result)}]",
+                    (item, next_index),
+                )
+                result.append(value)
+                continue
+            result.append(_yaml_scalar(item))
+            index = next_index + 1
+
+    def parse(self) -> tuple[dict[str, object], list[str]]:
+        parsed, index = self._mapping(0, 0, "")
+        next_index, remaining = self._next(index)
+        if remaining is not None:
+            self.errors.append(f"workflow:{next_index + 1}: unparsed YAML content")
+        return parsed, sorted(set(self.errors))
+
+def _workflow_map(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+def _workflow_steps(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+def _workflow_run_values(value: object) -> Iterator[str]:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "run" and isinstance(nested, str):
+                yield nested
+            else:
+                yield from _workflow_run_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _workflow_run_values(nested)
+
+def _workflow_step_contract(steps: list[dict[str, object]], errors: list[str]) -> None:
+    if len(steps) != 10:
+        errors.append("architecture workflow must contain exactly ten ordered architecture-docs steps")
+        return
+    checkout, setup_python, setup_node = steps[:3]
+    allowed_keys = (
+        ({"uses", "with"}, "checkout step keys"),
+        ({"uses", "with"}, "Python setup step keys"),
+        ({"uses", "with"}, "Node setup step keys"),
+        ({"run"}, "unit-test step keys"),
+        ({"if", "run"}, "pull-request body step keys"),
+        ({"run"}, "full-validation step keys"),
+        ({"run"}, "tooling step keys"),
+        ({"run"}, "render step keys"),
+        ({"run"}, "stale-report step keys"),
+        ({"name", "shell", "run"}, "history step keys"),
+    )
+    for step, (allowed, label) in zip(steps, allowed_keys):
+        if set(step) != allowed:
+            errors.append(f"architecture workflow {label} must be exact")
+    if checkout.get("uses") != "actions/checkout@v4" or _workflow_map(checkout.get("with")).get("fetch-depth") != "0":
+        errors.append("architecture workflow checkout step must use actions/checkout@v4 with fetch-depth: 0")
+    if set(_workflow_map(checkout.get("with"))) != {"fetch-depth"}:
+        errors.append("architecture workflow checkout inputs must contain only fetch-depth")
+    if setup_python.get("uses") != "actions/setup-python@v5" or _workflow_map(setup_python.get("with")).get("python-version") != "3.12":
+        errors.append("architecture workflow must set up Python 3.12 with actions/setup-python@v5")
+    if set(_workflow_map(setup_python.get("with"))) != {"python-version"}:
+        errors.append("architecture workflow Python setup inputs must contain only python-version")
+    if setup_node.get("uses") != "actions/setup-node@v4" or _workflow_map(setup_node.get("with")).get("node-version") != "22":
+        errors.append("architecture workflow must set up Node 22 with actions/setup-node@v4")
+    if set(_workflow_map(setup_node.get("with"))) != {"node-version"}:
+        errors.append("architecture workflow Node setup inputs must contain only node-version")
+    commands = (
+        "python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v",
+        'python3 architecture/scripts/validate_architecture.py --root . --pr-event "$GITHUB_EVENT_PATH"',
+        "python3 architecture/scripts/validate_architecture.py --root .",
+        "python3 architecture/scripts/validate_architecture.py --root . --checks tooling",
+        "architecture/scripts/render-diagrams.sh",
+    )
+    diagnostics = (
+        "unit tests",
+        "pull-request body step",
+        "full repository validation",
+        "permanent tooling validation",
+        "direct executable diagram rendering",
+    )
+    for index, (command, diagnostic) in enumerate(zip(commands, diagnostics), 3):
+        if steps[index].get("run") != command:
+            errors.append(f"architecture workflow ordered {diagnostic} command is required")
+    if steps[4].get("if") != "github.event_name == 'pull_request'":
+        errors.append("architecture workflow pull-request body step must use the exact pull-request event guard")
+    stale = str(steps[8].get("run", ""))
+    expected_stale = (
+        "set -o pipefail\n"
+        'python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of "$(date -u +%F)" | tee -a "$GITHUB_STEP_SUMMARY"'
+    )
+    if stale != expected_stale:
+        if "date -u +%F" not in stale:
+            errors.append("architecture workflow stale reporting must use an explicit UTC date")
+        else:
+            errors.append("architecture workflow stale-report command is required")
+
+def _validate_whitespace_step(step: dict[str, object]) -> list[str]:
+    errors = []
+    if step.get("name") != "Check changed-tree whitespace" or step.get("shell") != "bash":
+        errors.append("architecture workflow changed-tree whitespace step must be the final named bash step")
+    run = str(step.get("run", ""))
+    if hashlib.sha256(run.encode()).hexdigest() != WORKFLOW_HISTORY_RUN_SHA256:
+        errors.append("architecture workflow requires the exact final history shell")
+    if not run.startswith("set -euo pipefail\n"):
+        errors.append("architecture workflow whitespace step must enable strict bash mode")
+    if "git diff-tree --check --root" in run:
+        errors.append("architecture workflow unavailable-base fallback forbids tip-only git diff-tree --check --root")
+    if re.search(r"(?m)^\s*git diff --check\s*$", run):
+        errors.append("architecture workflow forbids a bare working-tree-only git diff --check")
+    if "git rev-list --first-parent" in run or "--first-parent" in run:
+        errors.append("architecture workflow history walk must use all-parent semantics")
+    required_counts = (
+        ('git rev-list --reverse --topo-order --parents "$range_base..$range_head"', 1, "ranged all-parent history enumeration"),
+        ('git rev-list --reverse --topo-order --parents "$GITHUB_SHA"', 1, "reachable all-parent history enumeration"),
+        ('git diff --check "$parent" "$child"', 2, "parent-to-child whitespace checks"),
+        ('git diff --check "$empty_tree" "$child"', 2, "empty-tree root whitespace checks"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"', 2, "parent-to-child ADR checks"),
+    )
+    for literal, count, label in required_counts:
+        if run.count(literal) != count:
+            errors.append(f"architecture workflow requires {label} on every enumerated edge")
+    required_once = (
+        ('base_sha="$(jq -r \'.pull_request.base.sha // empty\' "$GITHUB_EVENT_PATH")"', "pull-request base SHA extraction"),
+        ('head_sha="$(jq -r \'.pull_request.head.sha // empty\' "$GITHUB_EVENT_PATH")"', "pull-request head SHA extraction"),
+        ('merge_base="$(git merge-base "$base_sha" "$head_sha")"', "pull-request merge-base calculation"),
+        ('git diff --check "$merge_base" "$head_sha"', "pull-request endpoint whitespace summary"),
+        ('check_ranged_edges "$merge_base" "$head_sha"', "pull-request ranged edge helper"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"', "pull-request endpoint ADR comparison"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"', "pull-request ADR edge range"),
+        ('before_sha="$(jq -r \'.before // empty\' "$GITHUB_EVENT_PATH")"', "push before SHA extraction"),
+        ('git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"', "known-base push ancestry check"),
+        ('git diff --check "$before_sha" "$GITHUB_SHA"', "known-base push endpoint whitespace summary"),
+        ('check_ranged_edges "$before_sha" "$GITHUB_SHA"', "known-base push ranged edge helper"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"', "push endpoint ADR comparison"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"', "push ADR edge range"),
+        ('git diff --check "$empty_tree" "$GITHUB_SHA"', "unavailable-base complete-tree summary"),
+        ('[[ "$base_sha" =~ $sha_pattern ]]', "pull-request event SHAs validation"),
+        ('[[ "$head_sha" =~ $sha_pattern ]]', "pull-request event SHAs validation"),
+        ('[[ "$merge_base" =~ $sha_pattern ]]', "pull-request merge-base SHA validation"),
+        ('[[ "$GITHUB_SHA" =~ $sha_pattern ]]', "push head SHA validation"),
+        ('if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"; then', "known-base push guard"),
+    )
+    for literal, label in required_once:
+        if run.count(literal) != 1:
+            errors.append(f"architecture workflow requires {label}")
+    if "sha_pattern='^[0-9a-f]{40}$'" not in run or run.count("git cat-file -e") < 6:
+        errors.append("architecture workflow must validate every event and history commit as an available lowercase full SHA")
+    return errors
+
+def validate_workflow_contract(root: Path) -> list[str]:
+    path = root / ".github/workflows/architecture-docs.yml"
+    if not path.is_file():
+        return [".github/workflows/architecture-docs.yml is required"]
+    document, errors = _WorkflowYamlParser(path.read_text()).parse()
+    if set(document) != {"name", "on", "permissions", "jobs"}:
+        errors.append("architecture workflow top-level keys must be exactly name, on, permissions, and jobs")
+    if document.get("name") != "Architecture documentation":
+        errors.append("architecture workflow name must be Architecture documentation")
+    triggers = _workflow_map(document.get("on"))
+    pull_request = _workflow_map(triggers.get("pull_request"))
+    push = _workflow_map(triggers.get("push"))
+    expected_types = ["opened", "synchronize", "reopened", "edited", "ready_for_review"]
+    if not triggers:
+        errors.append("architecture workflow top-level on mapping is required")
+    elif set(triggers) != {"pull_request", "push"}:
+        errors.append("architecture workflow top-level on mapping may contain only pull_request and push")
+    if pull_request.get("types") != expected_types:
+        errors.append("architecture workflow pull_request types must be [opened, synchronize, reopened, edited, ready_for_review]")
+    if pull_request and set(pull_request) != {"types"}:
+        errors.append("architecture workflow pull_request mapping may contain only types and no path filters")
+    if any(key in pull_request for key in ("paths", "paths-ignore")):
+        errors.append("architecture workflow pull_request path filters are forbidden")
+    if push.get("branches") != ["master"]:
+        errors.append("architecture workflow push branches must be [master]")
+    if push and set(push) != {"branches"}:
+        errors.append("architecture workflow push mapping may contain only branches and no path filters")
+    if any(key in push for key in ("paths", "paths-ignore")):
+        errors.append("architecture workflow push path filters are forbidden")
+
+    permissions = _workflow_map(document.get("permissions"))
+    if permissions != {"contents": "read"}:
+        errors.append("architecture workflow top-level permissions must contain only contents: read")
+    jobs = _workflow_map(document.get("jobs"))
+    if set(jobs) != {"architecture-docs"}:
+        errors.append("architecture workflow jobs must contain exactly the architecture-docs job")
+    job = _workflow_map(jobs.get("architecture-docs"))
+    if not job:
+        errors.append("architecture workflow architecture-docs job is required")
+        return sorted(set(errors))
+    if job.get("runs-on") != "ubuntu-24.04":
+        errors.append("architecture workflow architecture-docs job must run on ubuntu-24.04")
+    if set(job) != {"runs-on", "steps"}:
+        errors.append("architecture workflow architecture-docs job keys must be exactly runs-on and steps")
+    raw_steps = job.get("steps")
+    steps = _workflow_steps(raw_steps)
+    if not isinstance(raw_steps, list) or len(steps) != len(raw_steps):
+        errors.append("architecture workflow architecture-docs steps must be ordered mappings")
+        return sorted(set(errors))
+    _workflow_step_contract(steps, errors)
+    if len(steps) == 10:
+        errors.extend(_validate_whitespace_step(steps[9]))
+    all_runs = "\n".join(_workflow_run_values(document))
+    if re.search(r"architecture/tooling/node_modules/|\b(?:npm|npx)\s+", all_runs):
+        errors.append("architecture workflow must not invoke npm or depend on repository-local architecture tooling")
+    if re.search(r"(?:npm_config_cache|PUPPETEER_CACHE_DIR|XDG_(?:CACHE|CONFIG|DATA)_HOME)=", all_runs):
+        errors.append("architecture workflow must not bind npm, Puppeteer, or XDG cache state outside the render script's owned root")
+    render = root / "architecture/scripts/render-diagrams.sh"
+    if not render.is_file() or not render.stat().st_mode & 0o111:
+        errors.append("architecture workflow direct render script must exist and be executable")
+    else:
+        errors.extend(validate_render_script_contract(root))
+    return sorted(set(errors))
 
 def _metadata_error(path: Path, root: Path, message: str) -> str:
     return f"{path.relative_to(root).as_posix()}: {message}"
@@ -2518,6 +3094,7 @@ VALIDATORS: dict[str, Validator] = {
     "structure": validate_structure,
     "tooling": validate_tooling,
     "traceability": validate_traceability,
+    "workflow": validate_workflow_contract,
 }
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
@@ -2529,6 +3106,7 @@ def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, default=Path(".")); parser.add_argument("--checks")
+    parser.add_argument("--pr-event", type=Path)
     parser.add_argument("--report-stale", action="store_true")
     parser.add_argument("--as-of")
     parser.add_argument("--adr-base-ref"); parser.add_argument("--adr-head-ref")
@@ -2557,6 +3135,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if unknown:
         print("unknown validation check(s): " + ", ".join(unknown), file=sys.stderr); return 2
     errors = validate_repository(args.root, checks)
+    if args.pr_event:
+        errors.extend(validate_pr_event(args.pr_event))
     if args.adr_base_ref:
         errors.extend(validate_accepted_adr_immutability(args.root, args.adr_base_ref, args.adr_head_ref))
     if args.adr_edge_base_ref:

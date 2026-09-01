@@ -26,6 +26,10 @@ identifies affected architecture documents, ADRs, proposals, diagrams, and
 verification evidence. A stable pull-request URL or full commit hash provides
 traceability; branch links are not durable evidence.
 
+The [architecture documentation workflow](../.github/workflows/architecture-docs.yml)
+enforces the pull-request declaration, repository validators, locked diagram
+rendering, stale reporting, and edge-by-edge Git history checks in CI.
+
 Review current-versus-proposed classification and unimplemented accepted ADRs
 monthly during active PoC development; verify relevant arc42 views and
 diagrams at delivery milestones; and review accepted ADRs, risks, technical

@@ -15,6 +15,16 @@ from architecture.scripts import validate_architecture as validator
 
 
 class ValidatorTest(unittest.TestCase):
+    PR_TEMPLATE = (
+        "## Architecture impact\n"
+        "- [ ] No architecture impact\n"
+        "- [ ] Architecture changed; linked below\n\n"
+        "Related ADRs:\n"
+        "Current-state arc42 sections changed:\n"
+        "Proposals implemented, invalidated, or superseded:\n"
+        "Diagrams changed:\n"
+        "Verification evidence:\n"
+    )
     ARC42_FILES = (
         "01-introduction-and-goals.md",
         "02-constraints.md",
@@ -285,6 +295,7 @@ class ValidatorTest(unittest.TestCase):
     def test_report_stale_cli_warns_without_blocking_and_formats_local_output(self):
         for required in validator.REQUIRED_GOVERNANCE_FILES:
             self.write(required, "# fixture\n")
+        self.write(".github/pull_request_template.md", self.PR_TEMPLATE)
         self.write_arc42("01-introduction-and-goals.md", last_verified="2026-06-02")
         stdout = StringIO()
         stderr = StringIO()
@@ -305,6 +316,7 @@ class ValidatorTest(unittest.TestCase):
     def test_report_stale_cli_uses_github_warning_annotation(self):
         for required in validator.REQUIRED_GOVERNANCE_FILES:
             self.write(required, "# fixture\n")
+        self.write(".github/pull_request_template.md", self.PR_TEMPLATE)
         self.write_arc42("01-introduction-and-goals.md", last_verified="2026-06-02")
         stdout = StringIO()
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False), redirect_stdout(stdout):
@@ -322,6 +334,7 @@ class ValidatorTest(unittest.TestCase):
     def test_report_stale_future_date_is_a_blocking_validation_error(self):
         for required in validator.REQUIRED_GOVERNANCE_FILES:
             self.write(required, "# fixture\n")
+        self.write(".github/pull_request_template.md", self.PR_TEMPLATE)
         self.write_arc42("01-introduction-and-goals.md", last_verified="2026-09-02")
         stderr = StringIO()
 
@@ -845,6 +858,7 @@ class ValidatorTest(unittest.TestCase):
         errors = validator.validate_structure(self.root)
         self.assertEqual(
             [
+                ".github/pull_request_template.md is required",
                 "ARCHITECTURE.md is required",
                 "architecture/README.md is required",
                 "architecture/adr/README.md is required",
@@ -858,6 +872,7 @@ class ValidatorTest(unittest.TestCase):
 
     def test_root_architecture_must_be_fewer_than_180_lines(self):
         required_files = [
+            ".github/pull_request_template.md",
             "architecture/README.md",
             "architecture/adr/README.md",
             "architecture/adr/template.md",
@@ -866,7 +881,7 @@ class ValidatorTest(unittest.TestCase):
             "architecture/proposals/README.md",
         ]
         for path in required_files:
-            self.write(path, "\n")
+            self.write(path, self.PR_TEMPLATE if path == ".github/pull_request_template.md" else "\n")
 
         self.write("ARCHITECTURE.md", "line\n" * 179)
         self.assertEqual([], validator.validate_structure(self.root))
@@ -2403,6 +2418,775 @@ class AdrValidatorTest(unittest.TestCase):
                 ]
             ),
         )
+
+
+class ArchitectureCiValidatorTest(unittest.TestCase):
+    WORKFLOW = """name: Architecture documentation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  architecture-docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
+      - if: github.event_name == 'pull_request'
+        run: python3 architecture/scripts/validate_architecture.py --root . --pr-event "$GITHUB_EVENT_PATH"
+      - run: python3 architecture/scripts/validate_architecture.py --root .
+      - run: python3 architecture/scripts/validate_architecture.py --root . --checks tooling
+      - run: architecture/scripts/render-diagrams.sh
+      - run: |
+          set -o pipefail
+          python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of "$(date -u +%F)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check changed-tree whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          [[ "$empty_tree" =~ $sha_pattern ]]
+          check_ranged_edges() {
+            local range_base="$1"
+            local range_head="$2"
+            local commit_and_parents child parent
+            local -a edge_parts
+            while read -r commit_and_parents; do
+              read -r -a edge_parts <<<"$commit_and_parents"
+              child="${edge_parts[0]}"
+              [[ "$child" =~ $sha_pattern ]]
+              git cat-file -e "$child^{commit}"
+              if [[ "${#edge_parts[@]}" -eq 1 ]]; then
+                git diff --check "$empty_tree" "$child"
+                continue
+              fi
+              for parent in "${edge_parts[@]:1}"; do
+                [[ "$parent" =~ $sha_pattern ]]
+                git cat-file -e "$parent^{commit}"
+                git diff --check "$parent" "$child"
+                python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+              done
+            done < <(git rev-list --reverse --topo-order --parents "$range_base..$range_head")
+          }
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$(jq -r '.pull_request.base.sha // empty' "$GITHUB_EVENT_PATH")"
+            head_sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
+            [[ "$base_sha" =~ $sha_pattern ]]
+            [[ "$head_sha" =~ $sha_pattern ]]
+            git cat-file -e "$base_sha^{commit}"
+            git cat-file -e "$head_sha^{commit}"
+            merge_base="$(git merge-base "$base_sha" "$head_sha")"
+            [[ "$merge_base" =~ $sha_pattern ]]
+            git cat-file -e "$merge_base^{commit}"
+            git diff --check "$merge_base" "$head_sha"
+            check_ranged_edges "$merge_base" "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"
+            exit 0
+          fi
+          [[ "$GITHUB_SHA" =~ $sha_pattern ]]
+          git cat-file -e "$GITHUB_SHA^{commit}"
+          before_sha="$(jq -r '.before // empty' "$GITHUB_EVENT_PATH")"
+          zero_sha=0000000000000000000000000000000000000000
+          if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"; then
+            git diff --check "$before_sha" "$GITHUB_SHA"
+            check_ranged_edges "$before_sha" "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"
+          else
+            git diff --check "$empty_tree" "$GITHUB_SHA"
+            while read -r commit_and_parents; do
+              read -r -a edge_parts <<<"$commit_and_parents"
+              child="${edge_parts[0]}"
+              [[ "$child" =~ $sha_pattern ]]
+              git cat-file -e "$child^{commit}"
+              if [[ "${#edge_parts[@]}" -eq 1 ]]; then
+                git diff --check "$empty_tree" "$child"
+                continue
+              fi
+              for parent in "${edge_parts[@]:1}"; do
+                [[ "$parent" =~ $sha_pattern ]]
+                git cat-file -e "$parent^{commit}"
+                git diff --check "$parent" "$child"
+                python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+              done
+            done < <(git rev-list --reverse --topo-order --parents "$GITHUB_SHA")
+          fi
+"""
+
+    PR_FIELDS = (
+        "Related ADRs:",
+        "Current-state arc42 sections changed:",
+        "Proposals implemented, invalidated, or superseded:",
+        "Diagrams changed:",
+        "Verification evidence:",
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repository = Path(__file__).resolve().parents[3]
+        render = self.write(
+            "architecture/scripts/render-diagrams.sh",
+            (self.repository / "architecture/scripts/render-diagrams.sh").read_text(),
+        )
+        render.chmod(0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel: str, text: str) -> Path:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def write_workflow(self, text: str | None = None) -> Path:
+        return self.write(".github/workflows/architecture-docs.yml", text or self.WORKFLOW)
+
+    def pr_body(self, *, changed: bool = False) -> str:
+        no_mark, changed_mark = (" ", "x") if changed else ("x", " ")
+        values = (
+            "ADR-0009" if changed else "",
+            "None" if changed else "",
+            "None" if changed else "",
+            "None" if changed else "",
+            "python3 -m unittest" if changed else "",
+        )
+        fields = "\n".join(f"{label} {value}".rstrip() for label, value in zip(self.PR_FIELDS, values))
+        return (
+            "## Architecture impact\n"
+            f"- [{no_mark}] No architecture impact\n"
+            f"- [{changed_mark}] Architecture changed; linked below\n\n"
+            f"{fields}\n"
+        )
+
+    def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            check=check,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def init_git(self) -> None:
+        self.git("init", "-q")
+        self.git("config", "user.email", "architecture@example.invalid")
+        self.git("config", "user.name", "Architecture Tests")
+
+    def commit_all(self, message: str) -> str:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        return commit
+
+    def valid_adr(
+        self,
+        *,
+        status: str,
+        context: str,
+        retrospective: str = "No",
+        evidence: str = "None",
+    ) -> str:
+        implementation = "Not started" if status == "Proposed" else "Partial"
+        return (
+            "# ADR-0009: Test decision\n\n"
+            f"- Status: {status}\n"
+            f"- Retrospective: {retrospective}\n"
+            "- Decision date: 2026-09-01\n"
+            "- Deciders: Architecture\n"
+            "- Scope: Test scope\n"
+            f"- Implementation status: {implementation}\n"
+            "- Related proposals: None\n"
+            "- Related implementation plans: None\n"
+            "- Related pull requests: None\n"
+            "- Related commits: None\n"
+            "- Related architecture sections: None\n"
+            "- Supersedes: None\n"
+            "- Superseded by: None\n\n"
+            "## Context\n\n"
+            f"{context}\n\n"
+            "## Decision drivers\n\n- Preserve the contract.\n\n"
+            "## Considered options\n\n- Keep it.\n- Reject drift.\n\n"
+            "## Decision\n\nUse the governed boundary.\n\n"
+            "## Consequences\n\n"
+            "### Positive\n\nThe boundary is explicit.\n\n"
+            "### Negative\n\nThe contract requires maintenance.\n\n"
+            "### Risks\n\nDrift is rejected.\n\n"
+            "## Compliance and verification\n\n- Validation is required.\n\n"
+            "## Implementation evidence\n\n"
+            f"{evidence}\n"
+        )
+
+    def whitespace_script(self) -> str:
+        document, errors = validator._WorkflowYamlParser(
+            (self.repository / ".github/workflows/architecture-docs.yml").read_text()
+        ).parse()
+        self.assertEqual([], errors)
+        jobs = document["jobs"]
+        self.assertIsInstance(jobs, dict)
+        job = jobs["architecture-docs"]
+        self.assertIsInstance(job, dict)
+        steps = job["steps"]
+        self.assertIsInstance(steps, list)
+        final_step = steps[-1]
+        self.assertEqual("Check changed-tree whitespace", final_step["name"])
+        return final_step["run"] + "\n"
+
+    def run_whitespace_step(self, event_name: str, event: dict, head: str, python_log: Path | None = None) -> subprocess.CompletedProcess[str]:
+        event_path = self.write("event.json", json.dumps(event))
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir(exist_ok=True)
+        fake_python = fake_bin / "python3"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ -n ${FAKE_PYTHON_LOG:-} ]]; then printf '%s\\n' \"$*\" >>\"$FAKE_PYTHON_LOG\"; fi\n"
+            "exit 0\n"
+        )
+        fake_python.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "GITHUB_EVENT_NAME": event_name,
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_SHA": head,
+            "PATH": f"{fake_bin}:{env['PATH']}",
+        })
+        if python_log is not None:
+            env["FAKE_PYTHON_LOG"] = str(python_log)
+        return subprocess.run(
+            ["bash", "-c", self.whitespace_script()],
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def trailing_whitespace_history(self) -> tuple[str, str, str]:
+        self.init_git()
+        self.write("history.txt", "clean\n")
+        base = self.commit_all("base")
+        self.write("history.txt", "introduced  \n")
+        introduced = self.commit_all("introduce trailing whitespace")
+        self.write("history.txt", "clean\n")
+        head = self.commit_all("remove trailing whitespace")
+        endpoint = self.git("diff", "--check", base, head, check=False)
+        self.assertEqual(0, endpoint.returncode, endpoint.stderr)
+        edge = self.git("diff", "--check", base, introduced, check=False)
+        self.assertNotEqual(0, edge.returncode)
+        return base, introduced, head
+
+    def test_pr_body_requires_one_selection_all_labels_and_changed_values(self):
+        no_selection = self.pr_body().replace("- [x] No architecture impact", "- [ ] No architecture impact")
+        both = self.pr_body().replace("- [ ] Architecture changed", "- [x] Architecture changed")
+        missing_label = self.pr_body().replace("Diagrams changed:\n", "")
+        self.assertTrue(any("exactly one" in error for error in validator.validate_pr_body(no_selection)))
+        self.assertTrue(any("exactly one" in error for error in validator.validate_pr_body(both)))
+        self.assertTrue(any("Diagrams changed:" in error for error in validator.validate_pr_body(missing_label)))
+
+        self.assertEqual([], validator.validate_pr_body(self.pr_body()))
+        self.assertEqual([], validator.validate_pr_body(self.pr_body(changed=True)))
+        for label in self.PR_FIELDS:
+            with self.subTest(label=label):
+                body = self.pr_body(changed=True).replace(label + " ", label + "\n", 1)
+                errors = validator.validate_pr_body(body)
+                self.assertTrue(any(label in error and "value" in error for error in errors), errors)
+
+    def test_pr_body_changed_requires_a_non_none_artifact_and_non_none_evidence(self):
+        body = self.pr_body(changed=True).replace("Related ADRs: ADR-0009", "Related ADRs: None")
+        errors = validator.validate_pr_body(body)
+        self.assertTrue(any("at least one" in error for error in errors), errors)
+
+        body = self.pr_body(changed=True).replace("Verification evidence: python3 -m unittest", "Verification evidence: None")
+        errors = validator.validate_pr_body(body)
+        self.assertTrue(any("Verification evidence" in error and "None" in error for error in errors), errors)
+
+    def test_pr_body_enforces_one_canonical_section_and_literal_cardinality(self):
+        body = self.pr_body() + "\n" + self.pr_body()
+        errors = validator.validate_pr_body(body)
+        self.assertTrue(any("exactly one canonical" in error for error in errors), errors)
+
+        for literal in ("- [x] No architecture impact", *self.PR_FIELDS):
+            with self.subTest(literal=literal):
+                errors = validator.validate_pr_body(self.pr_body() + f"\n## Review notes\nProse duplicate: {literal}\n")
+                expected = "No architecture impact" if literal.startswith("- [") else literal.split(":", 1)[0]
+                self.assertTrue(any("outside" in error and expected in error for error in errors), errors)
+
+    def test_pr_body_masks_fences_inline_code_and_html_comments_before_counting(self):
+        examples = (
+            "```markdown\n" + self.pr_body() + "```\n",
+            "<!--\n" + self.pr_body() + "-->\n",
+            "`Related ADRs:` `- [x] No architecture impact`\n",
+            "``Related ADRs:`` ``- [x] No architecture impact``\n",
+        )
+        body = "\n".join(examples) + self.pr_body()
+        self.assertEqual([], validator.validate_pr_body(body))
+
+        fake_only = "```markdown\n" + self.pr_body() + "```\n"
+        errors = validator.validate_pr_body(fake_only)
+        self.assertTrue(any("canonical" in error for error in errors), errors)
+
+    def test_pr_body_masks_standard_indented_fences_and_tilde_fences(self):
+        examples = (
+            "   ```markdown\n" + self.pr_body() + "   ```\n",
+            "  ~~~~markdown\n" + self.pr_body() + "  ~~~~\n",
+        )
+        self.assertEqual([], validator.validate_pr_body("\n".join(examples) + self.pr_body()))
+
+    def test_pr_body_masks_multiline_inline_code_with_matching_runs(self):
+        example = "``Related ADRs:\n- [x] No architecture impact``\n"
+        self.assertEqual([], validator.validate_pr_body(example + self.pr_body()))
+
+    def test_pr_body_section_stops_at_the_next_level_one_or_two_heading(self):
+        body = self.pr_body() + "\n## Review notes\nRelated ADRs: duplicate\n"
+        errors = validator.validate_pr_body(body)
+        self.assertTrue(any("outside" in error and "Related ADRs:" in error for error in errors), errors)
+
+    def test_pr_event_cli_reads_body_handles_null_and_reports_invalid_json(self):
+        for required in validator.REQUIRED_GOVERNANCE_FILES:
+            self.write(required, "# fixture\n")
+        self.write(".github/pull_request_template.md", self.pr_body().replace("- [x] No architecture impact", "- [ ] No architecture impact"))
+        event = self.write("event.json", json.dumps({"pull_request": {"body": self.pr_body()}}))
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            result = validator.main(["--root", str(self.root), "--checks", "structure", "--pr-event", str(event)])
+        self.assertEqual(0, result)
+        self.assertIn("architecture validation passed", stdout.getvalue())
+
+        event.write_text(json.dumps({"pull_request": {"body": None}}))
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = validator.main(["--root", str(self.root), "--checks", "structure", "--pr-event", str(event)])
+        self.assertEqual(1, result)
+        self.assertIn("exactly one canonical", stderr.getvalue())
+
+        event.write_text("not json")
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = validator.main(["--root", str(self.root), "--checks", "structure", "--pr-event", str(event)])
+        self.assertEqual(1, result)
+        self.assertIn("pull-request event must contain valid JSON", stderr.getvalue())
+
+    def test_structure_requires_the_exact_pull_request_template_prompts(self):
+        for required in validator.REQUIRED_GOVERNANCE_FILES:
+            self.write(required, "# fixture\n")
+        template = self.write(".github/pull_request_template.md", self.pr_body().replace("- [x] No architecture impact", "- [ ] No architecture impact"))
+        self.assertEqual([], validator.validate_structure(self.root))
+        template.write_text(template.read_text().replace("Verification evidence:", "Evidence:"))
+        errors = validator.validate_structure(self.root)
+        self.assertTrue(any("Verification evidence:" in error for error in errors), errors)
+
+        template.write_text(self.pr_body().replace("- [x] No architecture impact", "- [ ] No architecture impact").replace(
+            "Related ADRs:\nCurrent-state arc42 sections changed:",
+            "Current-state arc42 sections changed:\nRelated ADRs:",
+        ))
+        errors = validator.validate_structure(self.root)
+        self.assertTrue(any("canonical architecture block" in error for error in errors), errors)
+
+    def test_workflow_contract_accepts_the_exact_structural_and_ordered_gate(self):
+        self.write_workflow()
+        self.assertEqual([], validator.validate_workflow_contract(self.root))
+        self.assertIn("workflow", validator.CHECKS)
+        self.assertIs(validator.VALIDATORS["workflow"], validator.validate_workflow_contract)
+
+    def test_workflow_trigger_permission_and_checkout_locations_are_structural(self):
+        mutations = (
+            ("missing edited", "opened, synchronize, reopened, edited, ready_for_review", "opened, synchronize, reopened, ready_for_review", "pull_request types"),
+            ("pull request paths", "    types: [opened, synchronize, reopened, edited, ready_for_review]\n", "    types: [opened, synchronize, reopened, edited, ready_for_review]\n    paths: [architecture/**]\n", "path filters"),
+            ("write permission", "  contents: read", "  contents: write", "contents: read"),
+            ("shallow checkout", "          fetch-depth: 0", "          fetch-depth: 1", "fetch-depth"),
+            ("wrong PR guard", "github.event_name == 'pull_request'", "github.event_name != 'pull_request'", "pull-request body step"),
+        )
+        for name, old, new, fragment in mutations:
+            with self.subTest(name=name):
+                self.write_workflow(self.WORKFLOW.replace(old, new, 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+        decoy = self.WORKFLOW.replace("on:\n", "on-missing:\n", 1) + (
+            "\nexample: |\n"
+            "  on:\n"
+            "    pull_request:\n"
+            "      types: [opened, synchronize, reopened, edited, ready_for_review]\n"
+            "  permissions:\n"
+            "    contents: read\n"
+        )
+        self.write_workflow(decoy)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("top-level on" in error for error in errors), errors)
+
+    def test_workflow_rejects_duplicate_governed_keys_and_wrong_job_decoys(self):
+        duplicate = self.WORKFLOW.replace(
+            "permissions:\n  contents: read\n",
+            "permissions:\n  contents: read\npermissions:\n  contents: read\n",
+        )
+        self.write_workflow(duplicate)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("duplicate top-level key: permissions" in error for error in errors), errors)
+
+        wrong_job = self.WORKFLOW.replace("  architecture-docs:\n", "  unrelated:\n", 1)
+        self.write_workflow(wrong_job)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("architecture-docs job" in error for error in errors), errors)
+
+        duplicate_job = self.WORKFLOW.replace(
+            "  architecture-docs:\n",
+            "  architecture-docs:\n    runs-on: ubuntu-24.04\n    steps: []\n  architecture-docs:\n",
+            1,
+        )
+        self.write_workflow(duplicate_job)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("duplicate jobs key: architecture-docs" in error for error in errors), errors)
+
+    def test_workflow_rejects_quoted_keys_and_semantic_duplicates(self):
+        mutations = (
+            ("on", "on:\n", 'on:\n  "on": ignored\n', "quoted YAML keys"),
+            ("permissions", "permissions:\n  contents: read\n", 'permissions:\n  contents: read\n"permissions":\n  contents: read\n', "duplicate top-level key: permissions"),
+            ("jobs", "jobs:\n", 'jobs:\n  "jobs": ignored\n', "quoted YAML keys"),
+            ("job", "    runs-on: ubuntu-24.04\n", '    runs-on: ubuntu-24.04\n    "runs-on": ubuntu-24.04\n', "duplicate architecture-docs job key: runs-on"),
+            ("step", "      - run: python3 architecture/scripts/validate_architecture.py --root .\n", '      - run: python3 architecture/scripts/validate_architecture.py --root .\n        "run": echo bypass\n', "duplicate jobs.architecture-docs.steps"),
+        )
+        for name, old, new, fragment in mutations:
+            with self.subTest(name=name):
+                self.write_workflow(self.WORKFLOW.replace(old, new, 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_workflow_rejects_job_step_and_shell_execution_bypasses(self):
+        mutations = (
+            ("job disabled", "    runs-on: ubuntu-24.04\n", "    if: false\n    runs-on: ubuntu-24.04\n", "architecture-docs job keys"),
+            ("unit tests disabled", "      - run: python3 -m unittest discover", "      - if: false\n        run: python3 -m unittest discover", "unit-test step keys"),
+            ("continue on error", "      - run: python3 architecture/scripts/validate_architecture.py --root . --checks tooling\n", "      - continue-on-error: true\n        run: python3 architecture/scripts/validate_architecture.py --root . --checks tooling\n", "tooling step keys"),
+            ("job write permission", "    runs-on: ubuntu-24.04\n", "    permissions:\n      contents: write\n    runs-on: ubuntu-24.04\n", "architecture-docs job keys"),
+            ("early success", "          set -euo pipefail\n", "          set -euo pipefail\n          exit 0\n", "exact final history shell"),
+            ("commented whitespace", '                git diff --check "$parent" "$child"\n', '                # git diff --check "$parent" "$child"\n', "exact final history shell"),
+            ("commented ADR", '                python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"\n', '                # python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"\n', "exact final history shell"),
+        )
+        for name, old, new, fragment in mutations:
+            with self.subTest(name=name):
+                self.write_workflow(self.WORKFLOW.replace(old, new, 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+        extra_job = self.WORKFLOW + (
+            "\n  writer:\n"
+            "    permissions:\n"
+            "      contents: write\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            "      - run: echo bypass\n"
+        )
+        self.write_workflow(extra_job)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("exactly the architecture-docs job" in error for error in errors), errors)
+
+    def test_workflow_rejects_extra_trigger_keys_and_preserves_quoted_hashes(self):
+        document, parse_errors = validator._WorkflowYamlParser(
+            'name: "Architecture # documentation" # an outside comment\n'
+        ).parse()
+        self.assertEqual([], parse_errors)
+        self.assertEqual("Architecture # documentation", document["name"])
+
+        quoted = self.WORKFLOW.replace(
+            "name: Architecture documentation",
+            'name: "Architecture documentation" # an outside comment',
+        ).replace("  contents: read", "  contents: read # least privilege")
+        self.write_workflow(quoted)
+        self.assertEqual([], validator.validate_workflow_contract(self.root))
+
+        mutations = (
+            ("extra event", "on:\n", "on:\n  schedule: []\n", "only pull_request and push"),
+            ("extra PR key", "    types: [opened, synchronize, reopened, edited, ready_for_review]\n", "    types: [opened, synchronize, reopened, edited, ready_for_review]\n    branches: [master]\n", "pull_request mapping"),
+            ("extra push key", "    branches: [master]\n", "    branches: [master]\n    tags: ['*']\n", "push mapping"),
+        )
+        for name, old, new, fragment in mutations:
+            with self.subTest(name=name):
+                self.write_workflow(self.WORKFLOW.replace(old, new, 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_workflow_rejects_folded_run_block_scalars(self):
+        mutations = (
+            ("stale-report", "      - run: |\n"),
+            ("history", "        run: |\n"),
+        )
+        for step, marker in mutations:
+            for style in (">", ">-", ">+"):
+                with self.subTest(step=step, style=style):
+                    self.write_workflow(self.WORKFLOW.replace(marker, marker[:-2] + style + "\n", 1))
+                    errors = validator.validate_workflow_contract(self.root)
+                    self.assertTrue(any("folded block scalar" in error for error in errors), errors)
+
+    def test_workflow_requires_ordered_tests_validation_tooling_render_and_stale_steps(self):
+        mutations = (
+            ("unit tests", "python3 -m unittest discover", "python3 -m unittest disabled", "unit tests"),
+            ("full validation", "validate_architecture.py --root .\n", "validate_architecture.py --root . --checks structure\n", "full repository validation"),
+            ("tooling", " --checks tooling", " --checks diagrams", "tooling"),
+            ("render", "architecture/scripts/render-diagrams.sh", "bash architecture/scripts/render-diagrams.sh", "direct executable diagram rendering"),
+            ("UTC stale", "$(date -u +%F)", "$(date +%F)", "UTC date"),
+        )
+        for name, old, new, fragment in mutations:
+            with self.subTest(name=name):
+                self.write_workflow(self.WORKFLOW.replace(old, new, 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_workflow_rejects_repository_local_installs_dependencies_and_cache_writes(self):
+        unsafe_commands = (
+            "npm ci",
+            "npm ci --prefix architecture/tooling",
+            "architecture/tooling/node_modules/.bin/mmdc --version",
+            "npm_config_cache=/tmp/shared architecture/scripts/render-diagrams.sh",
+            "PUPPETEER_CACHE_DIR=$HOME/.cache architecture/scripts/render-diagrams.sh",
+            "XDG_CACHE_HOME=/tmp/cache architecture/scripts/render-diagrams.sh",
+        )
+        for command in unsafe_commands:
+            with self.subTest(command=command):
+                workflow = self.WORKFLOW.replace(
+                    "      - run: architecture/scripts/render-diagrams.sh\n",
+                    f"      - run: {command}\n",
+                )
+                self.write_workflow(workflow)
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any("render" in error or "repository-local" in error or "cache" in error for error in errors), errors)
+
+        other_job = self.WORKFLOW + (
+            "\n  unsafe-decoy:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            "      - run: npm ci\n"
+        )
+        self.write_workflow(other_job)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("repository-local" in error for error in errors), errors)
+
+    def test_workflow_requires_the_render_script_to_be_executable(self):
+        self.write_workflow()
+        (self.root / "architecture/scripts/render-diagrams.sh").chmod(0o644)
+        errors = validator.validate_workflow_contract(self.root)
+        self.assertTrue(any("executable" in error for error in errors), errors)
+
+    def test_workflow_rejects_endpoint_first_parent_root_and_adr_edge_bypasses(self):
+        mutations = (
+            ("endpoint only", 'git diff --check "$parent" "$child"', 'git diff --check "$range_base..$range_head"', "parent-to-child whitespace"),
+            ("first parent", "git rev-list --reverse --topo-order --parents", "git rev-list --first-parent --reverse --topo-order --parents", "all-parent"),
+            ("skip root", 'git diff --check "$empty_tree" "$child"', ": # root skipped", "root"),
+            ("tip diff tree", 'git diff --check "$empty_tree" "$GITHUB_SHA"', 'git diff-tree --check --root "$GITHUB_SHA"', "diff-tree"),
+            ("missing PR edge range", 'python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"', ": # PR ADR range skipped", "pull-request ADR edge range"),
+            ("missing push edge range", 'python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"', ": # push ADR range skipped", "push ADR edge range"),
+            ("missing PR endpoint ADR", 'python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"', ": # PR endpoint ADR skipped", "pull-request endpoint ADR"),
+            ("missing push endpoint ADR", 'python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"', ": # push endpoint ADR skipped", "push endpoint ADR"),
+            ("missing PR SHA validation", '[[ "$base_sha" =~ $sha_pattern ]]', ": # base SHA pattern skipped", "pull-request event SHAs"),
+            ("weakened push guard", 'if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"; then', 'if git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"; then', "known-base push guard"),
+        )
+        for name, old, new, fragment in mutations:
+            with self.subTest(name=name):
+                self.write_workflow(self.WORKFLOW.replace(old, new, 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_pr_known_range_detects_whitespace_introduced_then_removed(self):
+        base, _, head = self.trailing_whitespace_history()
+        result = self.run_whitespace_step(
+            "pull_request",
+            {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}},
+            head,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("trailing whitespace", result.stdout + result.stderr)
+
+    def test_known_base_push_detects_whitespace_introduced_then_removed(self):
+        base, _, head = self.trailing_whitespace_history()
+        result = self.run_whitespace_step("push", {"before": base}, head)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("trailing whitespace", result.stdout + result.stderr)
+
+    def test_unavailable_base_walk_detects_whitespace_introduced_then_removed(self):
+        _, _, head = self.trailing_whitespace_history()
+        result = self.run_whitespace_step("push", {"before": "0" * 40}, head)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("trailing whitespace", result.stdout + result.stderr)
+
+    def test_unavailable_base_checks_empty_tree_to_root(self):
+        self.init_git()
+        self.write("root.txt", "root trailing  \n")
+        root_commit = self.commit_all("root with trailing whitespace")
+        empty_tree = self.git("hash-object", "-t", "tree", "/dev/null").stdout.strip()
+        direct = self.git("diff", "--check", empty_tree, root_commit, check=False)
+        self.assertNotEqual(0, direct.returncode)
+        result = self.run_whitespace_step("push", {"before": "0" * 40}, root_commit)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("trailing whitespace", result.stdout + result.stderr)
+
+    def test_all_parent_walk_checks_merge_edge_missed_by_first_parent(self):
+        self.init_git()
+        self.write("root.txt", "clean\n")
+        common = self.commit_all("common")
+        primary_branch = self.git("branch", "--show-current").stdout.strip() or "master"
+        self.write("primary.txt", "trailing on primary  \n")
+        first_parent = self.commit_all("primary introduces trailing whitespace")
+        self.git("checkout", "-q", "-b", "second", common)
+        self.write("second.txt", "clean second\n")
+        second_parent = self.commit_all("clean second parent")
+        self.git("checkout", "-q", primary_branch)
+        self.git("merge", "-q", "--no-ff", "second", "-m", "merge")
+        merge = self.git("rev-parse", "HEAD").stdout.strip()
+
+        self.assertEqual(0, self.git("diff", "--check", first_parent, merge, check=False).returncode)
+        self.assertNotEqual(0, self.git("diff", "--check", second_parent, merge, check=False).returncode)
+        first_parent_history = self.git("rev-list", "--first-parent", "--parents", f"{first_parent}..{merge}").stdout.splitlines()
+        self.assertEqual(1, len(first_parent_history))
+        self.assertEqual(merge, first_parent_history[0].split()[0])
+        self.assertEqual(first_parent, first_parent_history[0].split()[1])
+        self.assertEqual(0, self.git("diff", "--check", first_parent_history[0].split()[1], merge, check=False).returncode)
+
+        result = self.run_whitespace_step(
+            "pull_request",
+            {"pull_request": {"base": {"sha": first_parent}, "head": {"sha": merge}}},
+            merge,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("trailing whitespace", result.stdout + result.stderr)
+
+    def test_behind_base_pr_uses_merge_base_and_rejects_feature_adr_mutation(self):
+        self.init_git()
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v1", evidence="- https://github.com/acme/bank/pull/1"))
+        common = self.commit_all("common accepted ADR")
+        base_branch = self.git("branch", "--show-current").stdout.strip() or "master"
+        self.git("checkout", "-q", "-b", "feature")
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v2", evidence="- https://github.com/acme/bank/pull/1"))
+        feature_head = self.commit_all("feature mutates accepted ADR")
+        self.git("checkout", "-q", base_branch)
+        self.write("base.txt", "new base work\n")
+        base_tip = self.commit_all("advance base")
+
+        merge_base = self.git("merge-base", base_tip, feature_head).stdout.strip()
+        self.assertEqual(common, merge_base)
+        self.assertNotEqual(base_tip, merge_base)
+        python_log = self.root / "python-invocations.log"
+        result = self.run_whitespace_step(
+            "pull_request",
+            {"pull_request": {"base": {"sha": base_tip}, "head": {"sha": feature_head}}},
+            feature_head,
+            python_log,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn(
+            f"--adr-edge-base-ref {merge_base} --adr-edge-head-ref {feature_head}",
+            python_log.read_text(),
+        )
+        errors = validator.validate_accepted_adr_edge_range(self.root, merge_base, feature_head)
+        self.assertTrue(any(common in error and feature_head in error and "immutable section changed" in error for error in errors), errors)
+
+    def test_pr_and_push_adr_ranges_find_intermediate_accepted_mutation_edges(self):
+        histories = ("pr", "push")
+        for mode in histories:
+            with self.subTest(mode=mode):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.root = Path(self.tmp.name)
+                self.init_git()
+                self.write("README.md", "base\n")
+                base = self.commit_all("base")
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Proposed", context="context-v1"))
+                self.commit_all("introduce proposed")
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v1", evidence="- https://github.com/acme/bank/pull/1"))
+                accepted = self.commit_all("accept")
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v2", evidence="- https://github.com/acme/bank/pull/1"))
+                head = self.commit_all("mutate rationale")
+
+                python_log = self.root / f"{mode}-python-invocations.log"
+                if mode == "pr":
+                    result = self.run_whitespace_step(
+                        "pull_request",
+                        {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}},
+                        head,
+                        python_log,
+                    )
+                else:
+                    result = self.run_whitespace_step("push", {"before": base}, head, python_log)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertIn(
+                    f"--adr-edge-base-ref {base} --adr-edge-head-ref {head}",
+                    python_log.read_text(),
+                )
+
+                endpoint = validator.validate_accepted_adr_immutability(self.root, base, head)
+                self.assertFalse(any(accepted in error and head in error for error in endpoint), endpoint)
+                errors = validator.validate_accepted_adr_edge_range(self.root, base, head)
+                self.assertTrue(any(accepted in error and head in error and "immutable section changed" in error for error in errors), errors)
+
+    def test_push_range_from_proposed_base_finds_intermediate_mutation(self):
+        self.init_git()
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Proposed", context="context-v1"))
+        base = self.commit_all("base containing proposed")
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v1", evidence="- https://github.com/acme/bank/pull/1"))
+        accepted = self.commit_all("accept")
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v2", evidence="- https://github.com/acme/bank/pull/1"))
+        head = self.commit_all("mutate rationale")
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, base, head))
+        errors = validator.validate_accepted_adr_edge_range(self.root, base, head)
+        self.assertTrue(any(accepted in error and head in error for error in errors), errors)
+
+    def test_reachable_history_qualifies_retrospective_introduction_then_protects_it(self):
+        self.init_git()
+        self.write("evidence/history.txt", "historical\n")
+        base = self.commit_all("verified historical evidence")
+        evidence = f"- {base} snapshot: evidence/history.txt"
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v1", retrospective="Yes", evidence=evidence))
+        introduced = self.commit_all("qualified retrospective introduction")
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v2", retrospective="Yes", evidence=evidence))
+        mutated = self.commit_all("mutate rationale")
+        errors = validator.validate_accepted_adr_edge_range(self.root, base, mutated)
+        self.assertFalse(any(base in error and introduced in error for error in errors), errors)
+        self.assertTrue(any(introduced in error and mutated in error for error in errors), errors)
+
+        branch = self.git("branch", "--show-current").stdout.strip() or "master"
+        self.git("checkout", "-q", "-b", "non-retrospective", base)
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v1", retrospective="No", evidence=evidence))
+        invalid = self.commit_all("invalid direct introduction")
+        invalid_errors = validator.validate_accepted_adr_edge_range(self.root, base, invalid)
+        self.assertTrue(any(base in error and invalid in error and "new ADR must be Proposed" in error for error in invalid_errors), invalid_errors)
+        self.git("checkout", "-q", branch)
+
+    def test_adr_range_checks_merge_second_parent(self):
+        self.init_git()
+        self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v1", evidence="- https://github.com/acme/bank/pull/1"))
+        base = self.commit_all("accepted")
+        first_branch = self.git("branch", "--show-current").stdout.strip() or "master"
+        self.git("checkout", "-q", "-b", "second")
+        self.write("architecture/adr/0009-test-decision.md", self.valid_adr(status="Accepted", context="context-v2", evidence="- https://github.com/acme/bank/pull/1"))
+        second = self.commit_all("second mutates")
+        self.git("checkout", "-q", first_branch)
+        self.write("first.txt", "first\n")
+        first = self.commit_all("first unrelated")
+        self.git("merge", "--no-commit", "--no-ff", "second", check=False)
+        self.git("checkout", first, "--", "architecture/adr/0009-test-decision.md")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "merge restored")
+        merge = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, first, merge))
+        errors = validator.validate_accepted_adr_edge_range(self.root, base, merge)
+        self.assertTrue(any(second in error and merge in error for error in errors), errors)
 
 
 if __name__ == "__main__":
