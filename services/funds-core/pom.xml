@@ -93,7 +93,10 @@
                     <sourceDirectories>
                         <sourceDirectory>${project.basedir}/src/main/java</sourceDirectory>
                     </sourceDirectories>
-                    <includeResources>false</includeResources>
+                    <includeResources>true</includeResources>
+                    <!-- Default is **/*.properties; migrations are the only resources with a
+                         comment convention. -->
+                    <resourceIncludes>db/migration/*.sql</resourceIncludes>
                     <includeTestResources>false</includeTestResources>
                     <!-- The goal already lists violations in its own format; this adds
                          Checkstyle's native 'file:line:col: message [Rule]' lines, which is the

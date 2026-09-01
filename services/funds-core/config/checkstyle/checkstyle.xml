@@ -10,6 +10,21 @@
 <module name="Checker">
   <property name="severity" value="error"/>
 
+  <!-- Convention: work items live in the tracker or the plan documents, never in source. -->
+  <module name="RegexpSingleline">
+    <property name="format" value="\b(TODO|FIXME|XXX)\b"/>
+    <property name="fileExtensions" value="java,sql"/>
+    <property name="message" value="Work items belong in the tracker, not in source."/>
+  </module>
+
+  <!-- Convention: every migration opens with a SQL line-comment header block, whose first line
+       is 'Vxxx:' plus what the migration changes and why, relative to the previous version.
+       Two lines is the floor, not the target. -->
+  <module name="RegexpHeader">
+    <property name="fileExtensions" value="sql"/>
+    <property name="header" value="^-- V[0-9_]+.*$\n^--.*$"/>
+  </module>
+
   <module name="TreeWalker">
     <property name="fileExtensions" value="java"/>
 
