@@ -52,6 +52,17 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the concurrency contract of PostingService on the Quarkus dev-services PostgreSQL
+ * container (Testcontainers): two workers racing on one command id with the same or a
+ * different request hash produce exactly one ledger effect (ACC-32); a period close waits for
+ * an in-flight posting's shared period lock across five repetitions (ACC-01); and accounts are
+ * locked in canonical UUID-string order whatever the input line order, so reverse-ordered
+ * journals commit without deadlock (ACC-02). Races are made deterministic with
+ * {@link PostingTransactionObserver} gates plus pg_stat_activity polling for a real lock wait,
+ * never with sleeps. Catches double posting, a lost idempotency winner, a posting/governance
+ * deadlock, or materialised balances that drift from posting replay under contention.
+ */
 @QuarkusTest
 class PostingConcurrencyIT {
     private static final UUID BOOK_ID = uuid(1);
@@ -63,6 +74,8 @@ class PostingConcurrencyIT {
     private static final UUID PERIOD_ID = uuid(7);
     private static final UUID LEGAL_ENTITY_ID = uuid(8);
     private static final CurrencyCode NGN = new CurrencyCode("NGN");
+    // The repository's lock order is the lexical order of the UUID string, not UUID.compareTo
+    // (which compares signed halves); the assertion must use the same order.
     private static final Comparator<UUID> CANONICAL_UUID_ORDER = Comparator.comparing(UUID::toString);
 
     @Inject
@@ -81,6 +94,9 @@ class PostingConcurrencyIT {
         truncateAllTables();
     }
 
+    // Sequence (see race): the winner is parked right after it acquires the idempotency row, the
+    // loser is observed blocked on a PostgreSQL lock, then the winner is released. Both callers
+    // must receive the identical PostingResult and the ledger must hold one journal.
     @Test
     void concurrentSameCommandAndHashWaitsForTheWinnerAndReturnsOneEffect() throws Exception {
         UUID commandId = uuid(100);
@@ -102,6 +118,9 @@ class PostingConcurrencyIT {
         }
     }
 
+    // Same race, but the two requests differ in content (reversed line order changes the hash).
+    // Whichever wins, the loser must fail with IdempotencyConflictException and the persisted
+    // request hash, journal id and canonical hash must all belong to the winner.
     @Test
     void concurrentSameCommandAndDifferentHashesKeepsOnlyTheWinningRequest() throws Exception {
         UUID commandId = uuid(200);
@@ -136,6 +155,10 @@ class PostingConcurrencyIT {
         }
     }
 
+    // Sequence: a posting is parked at beforeCommit while holding the FOR SHARE period lock taken
+    // by funds.lock_period_for_posting; a second session's UPDATE to CLOSED is observed waiting
+    // on a lock; the posting is released. Both must complete, with the journal committed into
+    // the period before the close took effect. Repeated five times as ACC-01 requires.
     @RepeatedTest(5)
     void periodCloseWaitsForTheInFlightPostingBeforeItCanCommit() throws Exception {
         var postingGate = new BeforeCommitGate();
@@ -162,6 +185,7 @@ class PostingConcurrencyIT {
                             closingBackendPid.set(rows.getInt(1));
                         }
                         closeStarted.countDown();
+                        // Bounded so a regression fails the test instead of hanging it.
                         execute(connection, "SET LOCAL lock_timeout = '5s'");
                         execute(connection, """
                             UPDATE funds.accounting_period
@@ -208,6 +232,11 @@ class PostingConcurrencyIT {
         }
     }
 
+    // Sequence: 50 pairs, each an A->B journal and a B->A journal released together from a start
+    // latch. ObservedDataSource records every lock_account_mapping_for_posting call and every
+    // materialised_balance FOR UPDATE per connection; each committed trace must have locked
+    // exactly [A, B] in canonical order. Amounts 1..100 give the 5_050 totals, and the
+    // materialised balance must equal the replayed posting sum for both accounts.
     @Test
     void reverseInputOrderLocksCanonicallyAndCommitsOneHundredJournals() throws Exception {
         var observer = new AccountLockObserver();
@@ -283,6 +312,9 @@ class PostingConcurrencyIT {
         }
     }
 
+    // Self-test of the shutdownExecutor helper. ExecutorService.close() waits indefinitely for a
+    // stuck worker, which would turn a failed race into a hung build; cleanup must instead cancel
+    // the futures, shutdownNow, and give up after a bounded wait.
     @Test
     void boundedCleanupCancelsOutstandingFutureWithoutCallingExecutorClose() throws Exception {
         ExecutorService delegate = Executors.newSingleThreadExecutor();
@@ -332,6 +364,8 @@ class PostingConcurrencyIT {
         }
     }
 
+    // Self-test of the shutdownExecutor helper: when the test body has already failed, a cleanup
+    // failure must be attached as suppressed so the original cause is the one reported.
     @Test
     void cleanupFailureIsSuppressedWhenBodyAlreadyFailed() throws Exception {
         IllegalStateException expectedPrimary = new IllegalStateException("primary body failure");
@@ -377,6 +411,13 @@ class PostingConcurrencyIT {
         }
     }
 
+    /**
+     * Runs two commands with the same command id on two threads and returns both outcomes.
+     * Sequence: both workers wait on a start latch; the left command is parked by
+     * FirstWriterGate after acquiring the idempotency row; the test confirms the two workers
+     * hold distinct backends and that one of them is in a PostgreSQL lock wait; only then is the
+     * winner released. This proves the loser blocks on the row rather than racing past it.
+     */
     private List<Outcome> race(PostingCommand left, PostingCommand right) throws Exception {
         var observer = new FirstWriterGate(left.commandId());
         var observedDataSource = new ObservedDataSource(dataSource, 2);
@@ -427,6 +468,11 @@ class PostingConcurrencyIT {
         shutdownExecutor(executor, futures, description, null);
     }
 
+    /**
+     * Bounded cleanup: cancel outstanding futures, shutdownNow, wait at most ten seconds. A
+     * cleanup failure is thrown only when the body succeeded; otherwise it is added as
+     * suppressed so the body's failure stays primary.
+     */
     private static void shutdownExecutor(
         ExecutorService executor,
         List<? extends Future<?>> futures,
@@ -458,6 +504,10 @@ class PostingConcurrencyIT {
         }
     }
 
+    /**
+     * Polls pg_stat_activity until one of the two backends reports wait_event_type = 'Lock'.
+     * This is direct evidence of a database lock wait, which no amount of sleeping would give.
+     */
     private int awaitLockWait(List<Integer> backendPids) throws SQLException {
         long deadline = System.nanoTime() + SECONDS.toNanos(10);
         while (System.nanoTime() < deadline) {
@@ -770,6 +820,12 @@ class PostingConcurrencyIT {
 
     private record PersistedWinner(String requestHash, UUID journalId, String canonicalHash) {}
 
+    /**
+     * Parks the first worker for the given command inside its transaction, immediately after it
+     * has acquired the idempotency row, until the test releases it. The compareAndSet makes
+     * sure only the first claimant blocks, so no later call can park a worker with nobody left
+     * to release it.
+     */
     private static final class FirstWriterGate implements PostingTransactionObserver {
         private final UUID commandId;
         private final AtomicBoolean claimed = new AtomicBoolean();
@@ -797,6 +853,7 @@ class PostingConcurrencyIT {
         }
     }
 
+    /** Parks a posting with all its rows written and all its locks held, just before commit. */
     private static final class BeforeCommitGate implements PostingTransactionObserver {
         private final CountDownLatch beforeCommit = new CountDownLatch(1);
         private final CountDownLatch release = new CountDownLatch(1);
@@ -816,6 +873,7 @@ class PostingConcurrencyIT {
         }
     }
 
+    /** Records which commands got past account locking, to prove none was silently skipped. */
     private static final class AccountLockObserver implements PostingTransactionObserver {
         private final Set<UUID> lockedCommands = ConcurrentHashMap.newKeySet();
 
@@ -829,6 +887,11 @@ class PostingConcurrencyIT {
         }
     }
 
+    /**
+     * DataSource wrapper that records, per connection, its PostgreSQL backend pid, the account
+     * ids passed to the two lock statements (in execution order) and whether it committed. The
+     * pid lets the test query pg_stat_activity for that exact backend.
+     */
     private static final class ObservedDataSource implements DataSource {
         private final DataSource delegate;
         private final CountDownLatch observedConnections;
@@ -958,6 +1021,12 @@ class PostingConcurrencyIT {
         }
     }
 
+    /**
+     * Recognises the two per-account lock statements by their SQL text, so it is coupled to
+     * JdbcLedgerRepository: renaming funds.lock_account_mapping_for_posting or the
+     * materialised_balance FOR UPDATE query silently empties the traces and fails the
+     * canonical-order assertions.
+     */
     private enum LockKind {
         ACCOUNT {
             @Override
@@ -985,6 +1054,7 @@ class PostingConcurrencyIT {
         }
     }
 
+    /** One connection's lock sequence; a rolled-back attempt keeps its partial prefix. */
     private static final class ConnectionTrace {
         private final int backendPid;
         private final List<UUID> accountLocks = new CopyOnWriteArrayList<>();

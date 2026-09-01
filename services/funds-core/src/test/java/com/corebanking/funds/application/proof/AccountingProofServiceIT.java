@@ -30,6 +30,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves ACC-19: per-book, per-currency trial balances and independently sourced
+ * control-account proofs at an exact journal-sequence cutoff, including detection of a
+ * projection that no longer agrees with the immutable postings. Runs on the Quarkus
+ * dev-services PostgreSQL container (Testcontainers) over a book this class seeds itself;
+ * every account is mapped ASSET/DEBIT because the proofs only sum signed postings. Catches a
+ * proof that trusts the projection instead of the postings, leaks across book, currency or
+ * control-code coordinates, or overflows once aggregates leave the signed 64-bit range.
+ */
 @QuarkusTest
 class AccountingProofServiceIT {
     private static final UUID BOOK = uuid(1);
@@ -90,6 +99,10 @@ class AccountingProofServiceIT {
         assertProof(reversal.journalSequence(), 225_000, 225_000, 0);
     }
 
+    // Corrupts the projection by direct SQL, deliberately as the owning role funds_migrator
+    // (the ownership check makes that explicit); nothing on the service path updates a
+    // projection outside a posting. +37 on a -80_000 total must show up as difference -37 while
+    // the trial balance, sourced from postings alone, is unchanged and still balanced.
     @Test
     void projectionCorruptionReportsExactDifferenceWithoutChangingImmutableTrialProof() throws SQLException {
         PostingResult result = post(50, "INFLOW", null,
@@ -126,6 +139,9 @@ class AccountingProofServiceIT {
             () -> assertEquals(BigInteger.valueOf(-37), control.difference()));
     }
 
+    // The projection row is removed by direct SQL, bypassing the service. A control code with
+    // real postings but no projection must fail closed; a code with no postings at all has
+    // nothing to reconcile and proves as zero.
     @Test
     void missingProjectionForMappedSourceFailsClosedWhileEmptySourceUsesZero() throws SQLException {
         PostingResult result = post(55, "INFLOW", null,
@@ -145,6 +161,11 @@ class AccountingProofServiceIT {
                 proofService.controlAccount(BOOK, "NEVER-POSTED", NGN, result.journalSequence()).difference()));
     }
 
+    // The projection's latest_journal_sequence must equal the latest journal that actually
+    // touched this control code (first), even when the cutoff is a later unrelated journal.
+    // Sequence: prove at the unrelated cutoff (valid); rewrite the projection sequence to the
+    // unrelated journal (rejected: it never posted to CUSTOMER-DEPOSITS); rewrite it past the
+    // cutoff (rejected again). The trial balance is unaffected by projection tampering.
     @Test
     void exactSourceSequenceAcceptsUnrelatedLaterJournalAndRejectsRewrittenProjectionSequence()
         throws SQLException {
@@ -181,6 +202,8 @@ class AccountingProofServiceIT {
                 BOOK, "CUSTOMER-DEPOSITS", NGN, unrelated.journalSequence()));
     }
 
+    // The transfer moves 20 between two CUSTOMER-DEPOSITS accounts, so the control total is
+    // unchanged; only the sequence check can notice that the projection was rewound to before it.
     @Test
     void laterNetZeroMappedActivityCannotBeHiddenByRewindingProjectionSequence() throws SQLException {
         PostingResult first = post(75, "INFLOW", null,
@@ -198,6 +221,8 @@ class AccountingProofServiceIT {
             () -> proofService.controlAccount(BOOK, "CUSTOMER-DEPOSITS", NGN, transfer.journalSequence()));
     }
 
+    // The projection only holds the current total, so a control proof is defined at the current
+    // cutoff for its mapped activity; the trial balance, replayed from postings, stays historical.
     @Test
     void controlProjectionProofRejectsHistoricalCutoffAfterLaterMappedActivity() {
         PostingResult first = post(81, "INFLOW", null,
@@ -216,6 +241,10 @@ class AccountingProofServiceIT {
                 BOOK, "CUSTOMER-DEPOSITS", NGN, current.journalSequence()).sourceTotal()));
     }
 
+    // Two USD journals are needed: Long.MAX_VALUE is the largest single line the domain admits,
+    // so the second journal is what pushes the per-currency aggregate past the long range and
+    // forces the proof onto BigInteger. The NGN book and the base book's USD/NGN coordinates
+    // must each see only their own activity.
     @Test
     void isolatesBookAndCurrencyAndKeepsAggregatesBeyondLongExact() throws SQLException {
         UUID otherBook = uuid(100);
@@ -293,6 +322,9 @@ class AccountingProofServiceIT {
             () -> assertControl(BOOK, "OTHER-CONTROL", NGN, last.journalSequence(), -44));
     }
 
+    // Long.MIN_VALUE + 1 == -Long.MAX_VALUE is the most negative amount admission allows
+    // (MIN_VALUE itself is rejected so reversal negation is always exact); the credit column
+    // must report its magnitude without negating a long.
     @Test
     void trialProofHandlesOrderedLongMinimumWithoutNegationOverflow() throws SQLException {
         UUID minimum = uuid(300);
@@ -406,6 +438,7 @@ class AccountingProofServiceIT {
         }
     }
 
+    /** Leaves a book with one DRAFT chart and one OPEN January 2026 period; no accounts yet. */
     private static void seedBook(
         Connection connection, UUID book, UUID chart, UUID period, UUID entity, String currency
     ) throws SQLException {
@@ -425,6 +458,11 @@ class AccountingProofServiceIT {
             """, period, book);
     }
 
+    /**
+     * Leaves an OPEN internal account mapped on the (still DRAFT) chart under the given control
+     * code. Class and normal balance are fixed to ASSET/DEBIT: the proofs sum signed postings,
+     * so classification never enters the expected totals.
+     */
     private static void seedAccount(
         Connection connection, UUID account, UUID book, UUID chart, String code, String currency, String control
     ) throws SQLException {
@@ -443,6 +481,10 @@ class AccountingProofServiceIT {
             """, account, book, chart, code, currency, control);
     }
 
+    /**
+     * Activates the first chart by direct UPDATE rather than funds.rotate_chart_version, which
+     * needs an existing ACTIVE chart to retire. Must run after every account is mapped.
+     */
     private static void activateChart(Connection connection, UUID chart) throws SQLException {
         execute(connection, """
             UPDATE funds.chart_version

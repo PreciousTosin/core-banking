@@ -22,6 +22,16 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the all-or-nothing commit behind the ACC-02 persisted-posting and balance invariants:
+ * a failure injected through {@link PostingTransactionObserver#afterFinancialRowsBeforeOutbox}
+ * (journal, postings, materialised balances and control projections already written, outbox
+ * row not yet) must roll back every row, and a clean retry of the same command must then
+ * produce exactly the ledger effect a first-time post would. Runs on the Quarkus dev-services
+ * PostgreSQL container (Testcontainers) over the TestPostingStack fixture graph. Catches a
+ * partially committed journal, a leaked IN_PROGRESS idempotency row, or a projection that
+ * drifts from the postings after a mid-transaction fault.
+ */
 @QuarkusTest
 class PostingAtomicityIT {
     private static final UUID COMMAND_ID = TestPostingStack.uuid(20);
@@ -45,6 +55,10 @@ class PostingAtomicityIT {
         TestPostingStack.reset(dataSource);
     }
 
+    // Sequence: snapshot the six ledger tables, post with the failing observer, require the
+    // snapshot to be byte-for-byte unchanged, then post again with a no-op observer. The recovery
+    // assertions spell out every expected row; the +1 sequence and version offsets are relative
+    // to the seeded TestPostingStack balances, and INDEPENDENT_CONTROL must stay at its seed.
     @Test
     void failureAfterFinancialRowsButBeforeOutboxRollsBackEverything() throws SQLException {
         PostingCommand command = CrashPostingWorker.command(COMMAND_ID);
@@ -178,6 +192,7 @@ class PostingAtomicityIT {
         return snapshot.idempotency().stream().filter(fact -> "COMPLETED".equals(fact.state())).count();
     }
 
+    /** Unchecked so it propagates through the posting transaction like any runtime fault. */
     private static final class InjectedPostingFailure extends RuntimeException {
         private final UUID commandId;
 
@@ -191,6 +206,7 @@ class PostingAtomicityIT {
         }
     }
 
+    /** Committed state of every table a posting touches, scoped to one command and two accounts. */
     private record LedgerSnapshot(
         Map<UUID, BalanceFact> balances,
         Map<String, ControlFact> controls,
@@ -238,6 +254,10 @@ class PostingAtomicityIT {
         int publishAttempts
     ) {}
 
+    /**
+     * Reads the ledger through a fresh auto-commit connection, so a snapshot only ever sees
+     * committed rows and can never observe the failing transaction's own writes.
+     */
     private static final class RowProbe {
         private final DataSource dataSource;
 
@@ -425,6 +445,7 @@ class PostingAtomicityIT {
             int startIndex
         ) throws SQLException {
             List<UUID> ordered = accountIds.stream().sorted().toList();
+            // The probe SQL hard-codes two IN (?, ?) placeholders for the two fixture accounts.
             assertEquals(2, ordered.size());
             statement.setObject(startIndex, ordered.get(0));
             statement.setObject(startIndex + 1, ordered.get(1));
