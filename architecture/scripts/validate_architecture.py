@@ -876,7 +876,42 @@ def _parse_adr(path: str, raw: bytes) -> AdrRecord | None:
     return AdrRecord(path, raw, title, identifier, number, tuple(field_names), fields, _section_bodies(text))
 
 def _has_substantive_content(body: str) -> bool:
-    content = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    unfenced_lines = []
+    fence_character = None
+    fence_length = 0
+    for line in body.splitlines():
+        if fence_character:
+            closing = re.match(
+                rf"^\s{{0,3}}{re.escape(fence_character)}{{{fence_length},}}\s*$",
+                line,
+            )
+            unfenced_lines.append("")
+            if closing:
+                fence_character = None
+                fence_length = 0
+            continue
+        opening = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if opening:
+            fence_character = opening.group(1)[0]
+            fence_length = len(opening.group(1))
+            unfenced_lines.append("")
+            continue
+        unfenced_lines.append(line)
+
+    lines = _mask("\n".join(unfenced_lines)).splitlines()
+    syntax_only = set()
+    for index, line in enumerate(lines):
+        if re.match(r"^\s{0,3}#{1,6}(?:\s+|$)", line):
+            syntax_only.add(index)
+        if re.match(r"^\s{0,3}\[[^]]+\]:\s*(?:<[^>]+>|\S+)", line):
+            syntax_only.add(index)
+        if (
+            index > 0
+            and lines[index - 1].strip()
+            and re.fullmatch(r"\s{0,3}(?:=+|-+)\s*", line)
+        ):
+            syntax_only.update((index - 1, index))
+    content = "\n".join("" if index in syntax_only else line for index, line in enumerate(lines))
     content = re.sub(r"<[^>]+>", "", content)
     if extract_markdown_links(content):
         return True
@@ -884,8 +919,7 @@ def _has_substantive_content(body: str) -> bool:
         stripped = line.strip()
         if (
             not stripped
-            or re.match(r"^#{1,6}\s+", stripped)
-            or re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", stripped)
+            or re.fullmatch(r"(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})", stripped)
         ):
             continue
         if re.match(r"^(?:[-+*]|[0-9]+[.)])\s+\S", stripped):

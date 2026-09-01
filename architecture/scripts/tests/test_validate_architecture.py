@@ -751,9 +751,29 @@ class AdrValidatorTest(unittest.TestCase):
                 errors = validator.validate_adrs(self.root)
                 self.assertTrue(any("## Context must contain prose, a list item, or a link" in error for error in errors), errors)
 
+    def test_substantive_sections_reject_code_and_heading_syntax_only_content(self):
+        for name, body in (
+            ("unclosed-fence-info-only", "```python"),
+            ("fence-info-only", "```python\n```"),
+            ("fenced-code", "```python\nprint('not prose')\n```"),
+            ("indented-tilde-fence", "   ~~~sql\n   SELECT account_id FROM accounts;\n   ~~~"),
+            ("fenced-link", "```markdown\n[Not a substantive link](reference.md)\n```"),
+            ("inline-code", "`print('not prose')`"),
+            ("multiple-inline-code", "`first` / `second`"),
+            ("atx-heading", "### [Heading link](reference.md)"),
+            ("setext-heading", "Heading syntax\n---"),
+            ("reference-definition", "[reference]: reference.md"),
+        ):
+            with self.subTest(name=name):
+                text = self.replace_section(self.valid_adr(), "## Context", body)
+                self.write("architecture/adr/0009-test-decision.md", text)
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any("## Context must contain prose, a list item, or a link" in error for error in errors), errors)
+
     def test_substantive_sections_accept_prose_list_items_and_links(self):
         for name, body in (
             ("prose", "A prose statement."),
+            ("prose-with-inline-code", "Use `validate_architecture.py` to verify the repository."),
             ("list", "- A list item."),
             ("link", "[A reference](reference.md)"),
         ):
