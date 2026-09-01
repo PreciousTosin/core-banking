@@ -99,7 +99,8 @@ DIAGRAM_STATES = frozenset({"CURRENT", "PROPOSED"})
 DIAGRAM_METADATA_KEYS = ("state", "abstraction", "question", "owner", "arc42", "adrs", "last_verified")
 MERMAID_CLI_PACKAGE = "@mermaid-js/mermaid-cli"
 MERMAID_CLI_VERSION = "11.16.0"
-WORKFLOW_HISTORY_RUN_SHA256 = "f088f8691ea9cc621cceb6acd117dcd6c888023fb8e4f8f5c588325a0664f091"
+RENDER_SCRIPT_SHA256 = "83e5e543e7d6fbe4afb0ea6fce8d94825c81af18e364bd78c5864dc0977363b6"
+WORKFLOW_HISTORY_RUN_SHA256 = "ecd9f8a065fcd2e6b3ad83d4d8dd619d4d024497d1cad88c8757da00f73b483e"
 
 REQUIRED_GOVERNANCE_FILES = (
     ".github/pull_request_template.md",
@@ -142,11 +143,15 @@ PR_TEMPLATE_BLOCK = (
 
 @dataclass(frozen=True)
 class MarkdownLink:
+    """A prose Markdown destination paired with its source line."""
+
     destination: str
     line: int
 
 @dataclass(frozen=True)
 class MigrationRow:
+    """One classified material block from the comprehensive-design migration."""
+
     source_key: str
     source_heading: str
     covered_blocks: str
@@ -158,12 +163,16 @@ class MigrationRow:
 
 @dataclass(frozen=True)
 class MaterialHeading:
+    """A numbered source heading and its deterministic material blocks."""
+
     source_key: str
     heading: str
     blocks: tuple[str, ...]
 
 @dataclass(frozen=True)
 class StaleWarning:
+    """A non-blocking age report for a governed current-state artifact."""
+
     path: Path
     last_verified: date
     age_days: int
@@ -300,8 +309,9 @@ def _slug(value: str) -> str:
     return re.sub(r"\s+", "-", value.strip())
 
 def extract_anchors(text: str) -> set[str]:
-    anchors = set(re.findall(r"\bid\s*=\s*[\"']([^\"']+)[\"']", text, re.I)); counts = {}
-    for heading in re.findall(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", _mask(text), re.M):
+    masked = _mask(text)
+    anchors = set(re.findall(r"\bid\s*=\s*[\"']([^\"']+)[\"']", masked, re.I)); counts = {}
+    for heading in re.findall(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", masked, re.M):
         base = _slug(heading); idx = counts.get(base, 0); anchors.add(base if idx == 0 else f"{base}-{idx}"); counts[base] = idx + 1
     return anchors
 
@@ -767,6 +777,10 @@ def _validate_whitespace_step(step: dict[str, object]) -> list[str]:
         ('git diff --check "$parent" "$child"', 2, "parent-to-child whitespace checks"),
         ('git diff --check "$empty_tree" "$child"', 2, "empty-tree root whitespace checks"),
         ('python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"', 2, "parent-to-child ADR checks"),
+        ('check_proposal_edge "$child" "$child"', 2, "root proposal endpoint and edge checks"),
+        ('check_proposal_edge "$parent" "$child"', 2, "parent-to-child proposal endpoint and edge checks"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$edge_base" --proposal-head-ref "$edge_head"', 1, "proposal edge-helper endpoint validation"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$edge_base" --proposal-edge-head-ref "$edge_head"', 1, "proposal edge-helper range validation"),
     )
     for literal, count, label in required_counts:
         if run.count(literal) != count:
@@ -779,12 +793,16 @@ def _validate_whitespace_step(step: dict[str, object]) -> list[str]:
         ('check_ranged_edges "$merge_base" "$head_sha"', "pull-request ranged edge helper"),
         ('python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"', "pull-request endpoint ADR comparison"),
         ('python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"', "pull-request ADR edge range"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$merge_base" --proposal-head-ref "$head_sha"', "pull-request endpoint proposal comparison"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$merge_base" --proposal-edge-head-ref "$head_sha"', "pull-request proposal edge range"),
         ('before_sha="$(jq -r \'.before // empty\' "$GITHUB_EVENT_PATH")"', "push before SHA extraction"),
         ('git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"', "known-base push ancestry check"),
         ('git diff --check "$before_sha" "$GITHUB_SHA"', "known-base push endpoint whitespace summary"),
         ('check_ranged_edges "$before_sha" "$GITHUB_SHA"', "known-base push ranged edge helper"),
         ('python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"', "push endpoint ADR comparison"),
         ('python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"', "push ADR edge range"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$before_sha" --proposal-head-ref "$GITHUB_SHA"', "push endpoint proposal comparison"),
+        ('python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$before_sha" --proposal-edge-head-ref "$GITHUB_SHA"', "push proposal edge range"),
         ('git diff --check "$empty_tree" "$GITHUB_SHA"', "unavailable-base complete-tree summary"),
         ('[[ "$base_sha" =~ $sha_pattern ]]', "pull-request event SHAs validation"),
         ('[[ "$head_sha" =~ $sha_pattern ]]', "pull-request event SHAs validation"),
@@ -1063,34 +1081,38 @@ def _valid_proposal_evidence(root: Path, path: Path, value: str | list[str] | No
     entries = value if isinstance(value, list) else [value] if isinstance(value, str) else []
     if not entries or any(not entry.strip() for entry in entries):
         return False
-    origin = _github_origin(root)
+    local_entries = []
+    pull_requests = []
     for entry in entries:
-        links = extract_markdown_links(entry)
-        destinations = [link.destination for link in links]
-        if not destinations:
-            match = re.fullmatch(r"(?:[0-9a-f]{7,40}\s+(?:changed|snapshot):\s+)?(.+)", entry.strip())
-            if not match:
+        normalized = entry.strip()
+        local = ADR_EVIDENCE_LOCAL_RE.fullmatch(f"- {normalized}")
+        if local:
+            paths = tuple(item.strip() for item in local.group(3).split(";"))
+            if any(not item or Path(item).is_absolute() or ".." in Path(item).parts for item in paths):
                 return False
-            destinations = [item.strip() for item in match.group(1).split(";")]
-        valid_entry = False
-        for destination in destinations:
-            if re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/[1-9]\d*", destination):
-                match = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/[1-9]\d*", destination)
-                if origin and (match.group(1).casefold(), match.group(2).casefold()) == (origin[0].casefold(), origin[1].casefold()):
-                    valid_entry = True
-                continue
-            local = _local_destination(destination)
-            if local is None:
-                continue
-            destination_path, _ = local
-            target = (root / destination_path).resolve() if destination_path.startswith(("architecture/", "docs/", "services/", "infrastructure/", "contracts/", "test/")) else (path.parent / destination_path).resolve()
-            try:
-                target.relative_to(root.resolve())
-            except ValueError:
-                continue
-            if target.exists():
-                valid_entry = True
-        if not valid_entry:
+            local_entries.append((local.group(1), local.group(2), paths))
+            continue
+        pull_request = ADR_EVIDENCE_PR_RE.fullmatch(f"- {normalized}")
+        if pull_request:
+            pull_requests.append((pull_request.group(1), pull_request.group(2)))
+            continue
+        return False
+
+    for commit, mode, paths in local_entries:
+        if _run_git(root, "cat-file", "-e", f"{commit}^{{commit}}").returncode:
+            return False
+        changed = _changed_paths(root, commit) if mode == "changed" else None
+        if mode == "changed" and changed is None:
+            return False
+        for evidence_path in paths:
+            if _run_git(root, "cat-file", "-e", f"{commit}:{evidence_path}").returncode:
+                return False
+            if mode == "changed" and evidence_path not in changed:
+                return False
+
+    origin = _github_origin(root)
+    for owner, repository in pull_requests:
+        if origin != (owner.casefold(), repository.casefold()):
             return False
     return True
 
@@ -1231,6 +1253,13 @@ def validate_render_script_contract(root: Path) -> list[str]:
         return ["architecture/scripts/render-diagrams.sh is required"]
     text = path.read_text()
     errors = []
+    actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_digest != RENDER_SCRIPT_SHA256:
+        errors.append(
+            "architecture/scripts/render-diagrams.sh: content differs from the exact reviewed script "
+            f"(expected sha256 {RENDER_SCRIPT_SHA256}, got {actual_digest}); review every script byte and "
+            "the unsafe-mutation tests before updating RENDER_SCRIPT_SHA256"
+        )
     required = (
         "#!/usr/bin/env bash\nset -euo pipefail",
         'temp_root="$(mktemp -d)"',
@@ -2085,6 +2114,8 @@ ADR_BOOTSTRAP_DESIGN_PATH = "docs/superpowers/specs/2026-09-01-architecture-docu
 
 @dataclass(frozen=True)
 class AdrRecord:
+    """A parsed ADR together with the bytes protected across lifecycle edges."""
+
     path: str
     raw: bytes
     title: str
@@ -2387,6 +2418,8 @@ def validate_adrs(root: Path) -> list[str]:
             value = record.fields.get(field, "")
             if value != "None" and not _relationship_sequence(value):
                 errors.append(_adr_error(path, f"{field} must be None or a non-empty ordered sequence"))
+            elif value != "None" and ";" in value and "; ".join(_relationship_sequence(value)) != value:
+                errors.append(_adr_error(path, f"{field} must use canonical '; ' separators"))
         for heading in ADR_SUBSTANTIVE_HEADINGS:
             if not _has_substantive_content(record.sections.get(heading, "")):
                 errors.append(_adr_error(path, f"{heading} must contain prose, a list item, or a link"))
@@ -2684,6 +2717,8 @@ def validate_proposal_bootstrap(root: Path) -> list[str]:
 
 @dataclass(frozen=True)
 class ProposalSnapshot:
+    """The lifecycle fields compared for one governed proposal identity."""
+
     identity: str
     path: str
     status: str
@@ -2707,9 +2742,9 @@ def _proposal_snapshots_commit(root: Path, commit: str) -> tuple[dict[str, Propo
             result = _run_git(root, "show", f"{commit}:{path}")
             if result.returncode == 0:
                 found.append(_proposal_snapshot(identity, path, result.stdout))
-        if len(found) != 1:
-            errors.append(f"{commit}: proposal {identity} must have exactly one active or archive record")
-        else:
+        if len(found) > 1:
+            errors.append(f"{commit}: proposal {identity} must not have both active and archive records")
+        elif found:
             snapshots[identity] = found[0]
     return snapshots, errors
 
@@ -2738,7 +2773,16 @@ def _validate_proposal_edge(root: Path, parent_commit: str, child_commit: str | 
     for identity in PROPOSAL_IDENTITIES:
         before = parent.get(identity)
         after = child.get(identity)
-        if before is None or after is None:
+        if before is None and after is None:
+            continue
+        if before is None:
+            if after.path != f"architecture/proposals/{identity}.md" or after.status not in ACTIVE_PROPOSAL_STATUSES:
+                errors.append(
+                    f"{parent_commit} -> {child_label}: proposal {identity} must be introduced as an active record"
+                )
+            continue
+        if after is None:
+            errors.append(f"{parent_commit} -> {child_label}: proposal {identity} record was deleted without an archive successor")
             continue
         if not _is_prefix(before.related_plans, after.related_plans):
             errors.append(
@@ -3016,6 +3060,25 @@ def _validate_infrastructure_traceability(root: Path) -> list[str]:
         errors.append(f"{rel}: ADR-0008 Related proposals must link the full-PoC stable identity")
     return errors
 
+def _validate_numbered_source_citations(root: Path) -> list[str]:
+    governed = (
+        "architecture/infrastructure/infra-ubuntu24.04-poc.md",
+        ACCOUNTING_PLAN,
+    )
+    stale = re.compile(
+        r"\]\([^)]*ARCHITECTURE\.md[^)]*\)|\bparent\s+(?:architecture|design)\b|\barchitecture\s+§§?",
+        re.I,
+    )
+    errors = []
+    for relative in governed:
+        path = root / relative
+        if not path.is_file():
+            continue
+        for line_number, line in enumerate(_mask(path.read_text()).splitlines(), 1):
+            if stale.search(line):
+                errors.append(f"{relative}:{line_number}: stale numbered-source citation must use a maintained anchor or an explicit non-link historical label")
+    return errors
+
 def validate_traceability(root: Path) -> list[str]:
     errors = []
     registry = (root / "architecture/proposals/README.md").resolve()
@@ -3080,6 +3143,7 @@ def validate_traceability(root: Path) -> list[str]:
     errors.extend(_validate_reverse_proposal_edges(root))
     errors.extend(_validate_exact_plan_contracts(root))
     errors.extend(_validate_infrastructure_traceability(root))
+    errors.extend(_validate_numbered_source_citations(root))
     return sorted(set(errors))
 
 Validator = Callable[[Path], list[str]]

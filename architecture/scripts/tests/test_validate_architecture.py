@@ -618,17 +618,21 @@ class ValidatorTest(unittest.TestCase):
 
     def test_metadata_accepts_terminal_proposal_variants_and_rejects_invalid_contracts(self):
         self.write_proposal_fixture()
+        self.init_git()
+        self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
+        self.commit_all("proposal fixture")
         identity = "account-identifiers-and-nip-inbound"
         active = self.root / f"architecture/proposals/{identity}.md"
         archive_path = f"architecture/archive/proposals/{identity}.md"
         plan = self.PROPOSAL_PLANS[identity]
-        implemented = self.proposal_record(identity, status="implemented", implementation_status="Complete", replacement="[Current](../../arc42/05-building-block-view.md)", implementation_evidence="docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md")
+        pull_request_evidence = "https://github.com/acme/bank/pull/42"
+        implemented = self.proposal_record(identity, status="implemented", implementation_status="Complete", replacement="[Current](../../arc42/05-building-block-view.md)", implementation_evidence=pull_request_evidence)
         active.unlink(); self.write(archive_path, implemented)
         pointers = {name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}; pointers[identity] = f"../archive/proposals/{identity}.md"; self.write_proposal_registry(pointers)
         self.assertFalse(any(identity in error for error in validator.validate_metadata(self.root)), validator.validate_metadata(self.root))
         for status, plans, replacement in (("rejected", plan, "None"), ("superseded", plan, "[Next](../../proposals/full-poc-platform.md)")):
             with self.subTest(status=status, plans=plans):
-                self.write(archive_path, self.proposal_record(identity, status=status, related_plans=plans, implementation_status="Not applicable", replacement=replacement, implementation_evidence="architecture/proposals/README.md"))
+                self.write(archive_path, self.proposal_record(identity, status=status, related_plans=plans, implementation_status="Not applicable", replacement=replacement, implementation_evidence=pull_request_evidence))
                 self.assertFalse(any(identity in error for error in validator.validate_metadata(self.root)), validator.validate_metadata(self.root))
         active_identity = "production-platform"
         (self.root / f"architecture/proposals/{active_identity}.md").unlink()
@@ -637,7 +641,7 @@ class ValidatorTest(unittest.TestCase):
         self.write_proposal_registry(pointers)
         for status, replacement in (("rejected", "None"), ("superseded", "[Next](../../proposals/full-poc-platform.md)")):
             with self.subTest(status=status, plans="None"):
-                self.write(none_archive, self.proposal_record(active_identity, status=status, related_plans="None", implementation_status="Not applicable", replacement=replacement, implementation_evidence="architecture/proposals/README.md"))
+                self.write(none_archive, self.proposal_record(active_identity, status=status, related_plans="None", implementation_status="Not applicable", replacement=replacement, implementation_evidence=pull_request_evidence))
                 self.assertFalse(any(active_identity in error for error in validator.validate_metadata(self.root)), validator.validate_metadata(self.root))
         invalid = {
             "implementation-status": self.proposal_record(identity, status="implemented", implementation_status="Partial", replacement="[Current](../../arc42/05-building-block-view.md)", implementation_evidence="architecture/proposals/README.md"),
@@ -649,6 +653,68 @@ class ValidatorTest(unittest.TestCase):
                 self.write(archive_path, record)
                 errors = validator.validate_metadata(self.root)
                 self.assertTrue(any(identity in error for error in errors), errors)
+
+    def test_terminal_proposal_evidence_is_commit_bound_or_a_same_repository_pull_request(self):
+        self.write_proposal_fixture()
+        self.init_git()
+        self.git("remote", "add", "origin", "git@github.com:Acme/Bank.git")
+        self.write("evidence/unchanged.txt", "stable\n")
+        root_commit = self.commit_all("proposal evidence root")
+        self.write("evidence/changed.txt", "changed\n")
+        changed_commit = self.commit_all("proposal evidence change")
+        identity = "production-platform"
+        active = self.root / f"architecture/proposals/{identity}.md"
+        active.unlink()
+        archive_path = f"architecture/archive/proposals/{identity}.md"
+        pointers = {name: f"{name}.md" for name in self.PROPOSAL_IDENTITIES}
+        pointers[identity] = f"../archive/proposals/{identity}.md"
+        self.write_proposal_registry(pointers)
+
+        valid = (
+            f"{changed_commit} changed: evidence/changed.txt",
+            f"{changed_commit} snapshot: evidence/unchanged.txt",
+            f"{root_commit} changed: architecture/proposals/README.md; architecture/proposals/{identity}.md",
+            "https://github.com/ACME/BANK/pull/42",
+        )
+        invalid = (
+            "architecture/proposals/README.md",
+            f"{changed_commit[:7]} changed: evidence/changed.txt",
+            f"{'0' * 40} snapshot: evidence/unchanged.txt",
+            f"{changed_commit} snapshot: evidence/missing.txt",
+            f"{changed_commit} changed: evidence/unchanged.txt",
+            "https://github.com/other/bank/pull/42",
+            "https://github.com/acme/bank/issues/42",
+        )
+        for evidence in valid:
+            with self.subTest(valid=evidence):
+                self.write(
+                    archive_path,
+                    self.proposal_record(
+                        identity,
+                        status="rejected",
+                        related_plans="None",
+                        implementation_status="Not applicable",
+                        replacement="None",
+                        implementation_evidence=evidence,
+                    ),
+                )
+                errors = validator.validate_metadata(self.root)
+                self.assertFalse(any(identity in error and "implementation_evidence" in error for error in errors), errors)
+        for evidence in invalid:
+            with self.subTest(invalid=evidence):
+                self.write(
+                    archive_path,
+                    self.proposal_record(
+                        identity,
+                        status="rejected",
+                        related_plans="None",
+                        implementation_status="Not applicable",
+                        replacement="None",
+                        implementation_evidence=evidence,
+                    ),
+                )
+                errors = validator.validate_metadata(self.root)
+                self.assertTrue(any(identity in error and "implementation_evidence" in error for error in errors), errors)
 
     def test_traceability_enforces_proposal_plan_and_adr_reciprocity(self):
         self.write_proposal_fixture()
@@ -754,6 +820,28 @@ class ValidatorTest(unittest.TestCase):
                 errors = self.traceability_errors()
                 self.assertTrue(any(fragment in error for error in errors), errors)
 
+    def test_traceability_rejects_stale_numbered_parent_citation_patterns(self):
+        cases = (
+            (
+                "architecture/infrastructure/infra-ubuntu24.04-poc.md",
+                "\nParent architecture: [Architecture entry point](../../ARCHITECTURE.md) (§21.1).\n",
+            ),
+            (
+                "docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md",
+                "\n**Spec:** [Core banking architecture](../../../ARCHITECTURE.md)\n\n- architecture §§4–5 and 21.8;\n",
+            ),
+        )
+        for path, stale_text in cases:
+            with self.subTest(path=path):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.root = Path(self.tmp.name)
+                self.write_proposal_fixture()
+                target = self.root / path
+                target.write_text(target.read_text() + stale_text)
+                errors = self.traceability_errors()
+                self.assertTrue(any(path in error and "stale numbered-source citation" in error for error in errors), errors)
+
     def _archive_production_fixture(self, status="rejected"):
         identity = "production-platform"
         active = self.root / f"architecture/proposals/{identity}.md"
@@ -822,6 +910,23 @@ class ValidatorTest(unittest.TestCase):
         self.assertTrue(hasattr(validator, "validate_proposal_edge_range"), "validate_proposal_edge_range must be implemented")
         errors = validator.validate_proposal_edge_range(self.root, initial, terminal)
         self.assertTrue(any("related_plans history cannot be erased" in error for error in errors), errors)
+
+    def test_proposal_history_handles_pre_framework_roots_introduction_and_deletion(self):
+        self.init_git()
+        self.write("README.md", "pre-framework root\n")
+        root_commit = self.commit_all("pre-framework root")
+        self.assertEqual([], validator.validate_proposal_history(self.root, root_commit, root_commit))
+
+        self.write_proposal_fixture()
+        introduced = self.commit_all("introduce active proposals")
+        self.assertEqual([], validator.validate_proposal_history(self.root, root_commit, introduced))
+        self.assertEqual([], validator.validate_proposal_edge_range(self.root, root_commit, introduced))
+
+        identity = "production-platform"
+        (self.root / f"architecture/proposals/{identity}.md").unlink()
+        deleted = self.commit_all("delete proposal without archive successor")
+        errors = validator.validate_proposal_history(self.root, introduced, deleted)
+        self.assertTrue(any(identity in error and "deleted without an archive successor" in error for error in errors), errors)
 
     def test_infrastructure_governance_contract_is_exact_and_reciprocal(self):
         self.write_proposal_fixture()
@@ -923,6 +1028,24 @@ class ValidatorTest(unittest.TestCase):
         self.write("architecture/target.md", '<a id="stable-destination"></a>\n# Display title\n')
         self.write("architecture/source.md", "[target](target.md#stable-destination)\n")
         self.assertEqual([], validator.validate_links(self.root))
+
+    def test_explicit_html_ids_inside_code_and_comments_are_not_anchors(self):
+        self.write(
+            "architecture/target.md",
+            "`<a id=\"inline-id\"></a>`\n\n"
+            "```html\n<a id=\"fenced-id\"></a>\n```\n\n"
+            "<!-- <a id=\"comment-id\"></a> -->\n",
+        )
+        self.write(
+            "architecture/source.md",
+            "[inline](target.md#inline-id)\n"
+            "[fenced](target.md#fenced-id)\n"
+            "[comment](target.md#comment-id)\n",
+        )
+        errors = validator.validate_links(self.root)
+        for anchor in ("inline-id", "fenced-id", "comment-id"):
+            with self.subTest(anchor=anchor):
+                self.assertTrue(any(f"target.md#{anchor} does not exist" in error for error in errors), errors)
 
     def test_reference_style_link_and_definition_are_resolved(self):
         self.write("architecture/target.md", "# Stable section\n")
@@ -1517,23 +1640,10 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
         )
 
     def write_valid_render_script(self):
+        repository = Path(__file__).resolve().parents[3]
         path = self.write(
             "architecture/scripts/render-diagrams.sh",
-            "#!/usr/bin/env bash\nset -euo pipefail\n"
-            "script_dir=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd -P)\"\n"
-            "repository_root=\"$(cd \"$script_dir/../..\" && pwd -P)\"\n"
-            "tooling_dir=\"$repository_root/architecture/tooling\"\n"
-            "temp_root=\"$(mktemp -d)\"\ninstall_dir=\"$temp_root/install\"\noutput_dir=\"\"\n"
-            "cleanup() {\n  rm -rf -- \"$temp_root\"\n}\ntrap cleanup EXIT\n"
-            "if [[ $# -gt 1 ]]; then exit 2; fi\n"
-            "if [[ $# -eq 1 ]]; then output_dir=\"$1\"; mkdir -p -- \"$output_dir\"; else output_dir=\"$temp_root/output\"; fi\n"
-            "mkdir -p -- \"$install_dir\" \"$output_dir\" \"$temp_root/npm-cache\" \"$temp_root/puppeteer-cache\" \"$temp_root/xdg-cache\" \"$temp_root/xdg-config\" \"$temp_root/xdg-data\"\n"
-            "cp -- \"$tooling_dir/package.json\" \"$tooling_dir/package-lock.json\" \"$install_dir/\"\n"
-            "owned_env=(\"npm_config_cache=$temp_root/npm-cache\" \"PUPPETEER_CACHE_DIR=$temp_root/puppeteer-cache\" \"XDG_CACHE_HOME=$temp_root/xdg-cache\" \"XDG_CONFIG_HOME=$temp_root/xdg-config\" \"XDG_DATA_HOME=$temp_root/xdg-data\")\n"
-            "env \"${owned_env[@]}\" npm ci --prefix \"$install_dir\"\n"
-            "mmdc=\"$install_dir/node_modules/.bin/mmdc\"\ntest -x \"$mmdc\"\n"
-            "mapfile -t sources < <(find \"$repository_root/architecture/diagrams\" -maxdepth 1 -type f -name '*.mmd' -print | LC_ALL=C sort)\n"
-            "test \"${#sources[@]}\" -gt 0\nfor source in \"${sources[@]}\"; do output=\"$output_dir/$(basename \"${source%.mmd}\").svg\"; env \"${owned_env[@]}\" \"$mmdc\" -i \"$source\" -o \"$output\"; done\n",
+            (repository / "architecture/scripts/render-diagrams.sh").read_text(),
         )
         path.chmod(0o755)
         return path
@@ -1626,6 +1736,11 @@ class DiagramAndToolingValidatorTest(unittest.TestCase):
             "missing-puppeteer-binding": text.replace('env "${owned_env[@]}" "$mmdc"', '"$mmdc"'),
             "unsafe-cleanup": text.replace('rm -rf -- "$temp_root"', 'rm -rf -- "$output_dir"'),
             "home-cache": text.replace('$temp_root/npm-cache', '~/.npm'),
+            "appended-delete": text + "\nrm -rf -- /tmp/unowned-render-output\n",
+            "appended-touch": text + "\ntouch architecture/diagrams/generated/unsafe.svg\n",
+            "appended-redirection": text + "\nprintf unsafe > architecture/diagrams/unsafe.svg\n",
+            "appended-install": text + "\nnpm install --prefix architecture/tooling\n",
+            "appended-cache-write": text + "\nnpm_config_cache=/tmp/shared npm ci\n",
         }.items():
             with self.subTest(case=case):
                 script.write_text(bad)
@@ -2055,6 +2170,30 @@ class AdrValidatorTest(unittest.TestCase):
         errors = validator.validate_adrs(self.root)
         self.assertTrue(any("must contain exact Markdown-link items" in error for error in errors), errors)
 
+    def test_adr_relationship_sequences_require_exact_semicolon_space_separators(self):
+        for value in ("first;second", "first;  second"):
+            with self.subTest(value=value):
+                self.write(
+                    "architecture/adr/0009-test-decision.md",
+                    self.valid_adr(related_commits=value),
+                )
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any("Related commits must use canonical '; ' separators" in error for error in errors), errors)
+
+    def test_public_validator_records_have_purpose_docstrings(self):
+        records = (
+            validator.MarkdownLink,
+            validator.MigrationRow,
+            validator.MaterialHeading,
+            validator.StaleWarning,
+            validator.AdrRecord,
+            validator.ProposalSnapshot,
+        )
+        for record in records:
+            with self.subTest(record=record.__name__):
+                docstring = (record.__doc__ or "").strip()
+                self.assertTrue(docstring and not docstring.startswith(f"{record.__name__}("), docstring)
+
     def test_adr_validation_accepts_a_relative_repository_root(self):
         relative_root = Path(os.path.relpath(self.root, Path.cwd()))
         self.write("architecture/adr/0009-test-decision.md", self.valid_adr())
@@ -2461,6 +2600,12 @@ jobs:
           sha_pattern='^[0-9a-f]{40}$'
           empty_tree="$(git hash-object -t tree /dev/null)"
           [[ "$empty_tree" =~ $sha_pattern ]]
+          check_proposal_edge() {
+            local edge_base="$1"
+            local edge_head="$2"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$edge_base" --proposal-head-ref "$edge_head"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$edge_base" --proposal-edge-head-ref "$edge_head"
+          }
           check_ranged_edges() {
             local range_base="$1"
             local range_head="$2"
@@ -2473,6 +2618,7 @@ jobs:
               git cat-file -e "$child^{commit}"
               if [[ "${#edge_parts[@]}" -eq 1 ]]; then
                 git diff --check "$empty_tree" "$child"
+                check_proposal_edge "$child" "$child"
                 continue
               fi
               for parent in "${edge_parts[@]:1}"; do
@@ -2480,6 +2626,7 @@ jobs:
                 git cat-file -e "$parent^{commit}"
                 git diff --check "$parent" "$child"
                 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+                check_proposal_edge "$parent" "$child"
               done
             done < <(git rev-list --reverse --topo-order --parents "$range_base..$range_head")
           }
@@ -2497,6 +2644,8 @@ jobs:
             check_ranged_edges "$merge_base" "$head_sha"
             python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"
             python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$merge_base" --proposal-head-ref "$head_sha"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$merge_base" --proposal-edge-head-ref "$head_sha"
             exit 0
           fi
           [[ "$GITHUB_SHA" =~ $sha_pattern ]]
@@ -2508,6 +2657,8 @@ jobs:
             check_ranged_edges "$before_sha" "$GITHUB_SHA"
             python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"
             python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$before_sha" --proposal-head-ref "$GITHUB_SHA"
+            python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$before_sha" --proposal-edge-head-ref "$GITHUB_SHA"
           else
             git diff --check "$empty_tree" "$GITHUB_SHA"
             while read -r commit_and_parents; do
@@ -2517,6 +2668,7 @@ jobs:
               git cat-file -e "$child^{commit}"
               if [[ "${#edge_parts[@]}" -eq 1 ]]; then
                 git diff --check "$empty_tree" "$child"
+                check_proposal_edge "$child" "$child"
                 continue
               fi
               for parent in "${edge_parts[@]:1}"; do
@@ -2524,6 +2676,7 @@ jobs:
                 git cat-file -e "$parent^{commit}"
                 git diff --check "$parent" "$child"
                 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+                check_proposal_edge "$parent" "$child"
               done
             done < <(git rev-list --reverse --topo-order --parents "$GITHUB_SHA")
           fi
@@ -3007,6 +3160,87 @@ jobs:
                 self.write_workflow(self.WORKFLOW.replace(old, new, 1))
                 errors = validator.validate_workflow_contract(self.root)
                 self.assertTrue(any(fragment in error for error in errors), errors)
+
+    def test_committed_workflow_invokes_proposal_endpoint_and_edge_validation_for_every_event_mode(self):
+        self.init_git()
+        self.write("history.txt", "root\n")
+        root_commit = self.commit_all("root")
+        self.write("history.txt", "head\n")
+        head = self.commit_all("head")
+        cases = (
+            (
+                "pull_request",
+                {"pull_request": {"base": {"sha": root_commit}, "head": {"sha": head}}},
+                (
+                    f"--proposal-base-ref {root_commit} --proposal-head-ref {head}",
+                    f"--proposal-edge-base-ref {root_commit} --proposal-edge-head-ref {head}",
+                ),
+            ),
+            (
+                "push",
+                {"before": root_commit},
+                (
+                    f"--proposal-base-ref {root_commit} --proposal-head-ref {head}",
+                    f"--proposal-edge-base-ref {root_commit} --proposal-edge-head-ref {head}",
+                ),
+            ),
+            (
+                "push",
+                {"before": "0" * 40},
+                (
+                    f"--proposal-base-ref {root_commit} --proposal-head-ref {root_commit}",
+                    f"--proposal-edge-base-ref {root_commit} --proposal-edge-head-ref {root_commit}",
+                    f"--proposal-base-ref {root_commit} --proposal-head-ref {head}",
+                    f"--proposal-edge-base-ref {root_commit} --proposal-edge-head-ref {head}",
+                ),
+            ),
+        )
+        for event_name, event, expected in cases:
+            with self.subTest(event_name=event_name, event=event):
+                log = self.root / "python-invocations.log"
+                log.unlink(missing_ok=True)
+                result = self.run_whitespace_step(event_name, event, head, log)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                invocations = log.read_text()
+                for command in expected:
+                    self.assertIn(command, invocations)
+
+    def test_workflow_structural_contract_rejects_every_proposal_history_bypass(self):
+        governed_commands = (
+            'python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$edge_base" --proposal-head-ref "$edge_head"',
+            'python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$edge_base" --proposal-edge-head-ref "$edge_head"',
+            'python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$merge_base" --proposal-head-ref "$head_sha"',
+            'python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$merge_base" --proposal-edge-head-ref "$head_sha"',
+            'python3 architecture/scripts/validate_architecture.py --root . --proposal-base-ref "$before_sha" --proposal-head-ref "$GITHUB_SHA"',
+            'python3 architecture/scripts/validate_architecture.py --root . --proposal-edge-base-ref "$before_sha" --proposal-edge-head-ref "$GITHUB_SHA"',
+        )
+        for command in governed_commands:
+            with self.subTest(command=command):
+                self.assertIn(command, self.WORKFLOW)
+                self.write_workflow(self.WORKFLOW.replace(command, ": # proposal history bypassed", 1))
+                errors = validator.validate_workflow_contract(self.root)
+                self.assertTrue(any("proposal" in error or "exact final history shell" in error for error in errors), errors)
+
+    def test_committed_workflow_checks_proposal_history_on_both_merge_parents(self):
+        self.init_git()
+        self.write("root.txt", "root\n")
+        common = self.commit_all("common")
+        primary_branch = self.git("branch", "--show-current").stdout.strip() or "master"
+        self.write("first.txt", "first\n")
+        first_parent = self.commit_all("first parent")
+        self.git("checkout", "-q", "-b", "second", common)
+        self.write("second.txt", "second\n")
+        second_parent = self.commit_all("second parent")
+        self.git("checkout", "-q", primary_branch)
+        self.git("merge", "-q", "--no-ff", "second", "-m", "merge")
+        merge = self.git("rev-parse", "HEAD").stdout.strip()
+        log = self.root / "python-invocations.log"
+        result = self.run_whitespace_step("push", {"before": "0" * 40}, merge, log)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        invocations = log.read_text()
+        for parent in (first_parent, second_parent):
+            self.assertIn(f"--proposal-base-ref {parent} --proposal-head-ref {merge}", invocations)
+            self.assertIn(f"--proposal-edge-base-ref {parent} --proposal-edge-head-ref {merge}", invocations)
 
     def test_pr_known_range_detects_whitespace_introduced_then_removed(self):
         base, _, head = self.trailing_whitespace_history()
