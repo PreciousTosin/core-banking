@@ -81,7 +81,7 @@ def _definitions(masked: str):
 
 def extract_markdown_links(text: str) -> list[MarkdownLink]:
     masked = _mask(text); defs, _ = _definitions(masked); links = []
-    definition_lines = {n for _, (_, n) in defs.items()}
+    definition_lines = {n for n, line in enumerate(masked.splitlines(), 1) if re.match(r"^\s{0,3}\[[^]]+\]:\s*(?:<[^>]+>|\S+)", line)}
     for n, line in enumerate(masked.splitlines(), 1):
         if n in definition_lines: continue
         for m in re.finditer(r"\[([^\]]+)\]\((?:<([^>]+)>|([^\s)]+))\)", line):
@@ -140,7 +140,10 @@ def validate_links(root: Path) -> list[str]:
             if local is None: continue
             dest, fragment = local; target = path if not dest else (path.parent / dest).resolve()
             if not target.exists() or not target.is_file(): errors.append(f"{rel}:{link.line}: {dest} does not exist"); continue
-            if fragment and fragment not in extract_anchors(target.read_text()): errors.append(f"{target.relative_to(root).as_posix()}#{fragment} does not exist (linked from {rel}:{link.line})")
+            if fragment and fragment not in extract_anchors(target.read_text()):
+                try: target_name = target.relative_to(root).as_posix()
+                except ValueError: target_name = str(target)
+                errors.append(f"{target_name}#{fragment} does not exist (linked from {rel}:{link.line})")
     return sorted(errors)
 
 Validator = Callable[[Path], list[str]]
@@ -148,12 +151,17 @@ VALIDATORS: dict[str, Validator] = {"links": validate_links}
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
     errors = []
-    for check in sorted(checks): errors.extend(VALIDATORS[check](root))
+    for check in sorted(checks):
+        if check not in VALIDATORS: errors.append(f"unknown validation check: {check}")
+        else: errors.extend(VALIDATORS[check](root))
     return sorted(errors)
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--root", type=Path, default=Path(".")); parser.add_argument("--checks")
     args = parser.parse_args(argv); checks = frozenset(args.checks.split(",")) if args.checks else CHECKS
+    unknown = sorted(checks - CHECKS)
+    if unknown:
+        print("unknown validation check(s): " + ", ".join(unknown), file=sys.stderr); return 2
     errors = validate_repository(args.root, checks)
     if errors:
         print("\n".join(errors), file=sys.stderr); return 1

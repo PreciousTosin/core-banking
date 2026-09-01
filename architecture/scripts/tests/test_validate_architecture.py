@@ -79,6 +79,12 @@ class ValidatorTests(unittest.TestCase):
         self.write("architecture/source.md", "[target][id]\n\n[id]: first.md\n[ID]: second.md\n")
         self.assertEqual(["architecture/source.md:4: duplicate reference definition: id (first defined on line 3)"], validator.validate_links(self.root))
 
+    def test_duplicate_definition_lines_are_not_scanned_as_shortcut_links(self):
+        self.write("architecture/first.md", "# First\n")
+        self.write("architecture/second.md", "# Second\n")
+        self.write("architecture/source.md", "[target][id]\n\n[id]: first.md\n[ID]: second.md\n")
+        self.assertEqual(["architecture/source.md:4: duplicate reference definition: id (first defined on line 3)"], validator.validate_links(self.root))
+
     def test_broken_links_inside_fenced_and_inline_code_are_examples(self):
         self.write("architecture/examples.md", "`[inline](missing-inline.md)`\n\n```markdown\n[fenced](missing-fenced.md)\n```\n")
         self.assertEqual([], validator.validate_links(self.root))
@@ -99,6 +105,19 @@ class ValidatorTests(unittest.TestCase):
     def test_windows_drive_paths_remain_local_paths(self):
         self.write("architecture/source.md", "[drive](C:/missing/local.md)\n")
         self.assertTrue(any("C:/missing/local.md does not exist" in e for e in validator.validate_links(self.root)))
+
+    def test_external_file_with_fragment_reports_actionable_error(self):
+        external = self.root.parent / "non-repository-target.md"
+        external.write_text("# Existing\n")
+        try:
+            self.write("architecture/source.md", f"[outside]({external}#missing)\n")
+            errors = validator.validate_links(self.root)
+            self.assertTrue(any("missing" in e and "source.md" in e for e in errors))
+        finally:
+            external.unlink()
+
+    def test_unknown_cli_check_is_actionable(self):
+        self.assertEqual(2, validator.main(["--root", str(self.root), "--checks", "unknown"]))
 
     def test_link_scan_includes_new_untracked_governed_markdown(self):
         self.write("docs/superpowers/plans/new-task-not-added-to-git.md", "[missing](governed-missing.md)\n")
