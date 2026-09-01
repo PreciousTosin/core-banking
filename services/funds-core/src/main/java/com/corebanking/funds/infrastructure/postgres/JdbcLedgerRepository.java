@@ -62,7 +62,7 @@ import java.util.UUID;
 public class JdbcLedgerRepository implements LedgerRepository {
     // Driver-side cancel for the replay reads (findCompleted and the V004 loaders), which run
     // before any row lock is taken. Independent of the transaction-local statement_timeout that
-    // PostingService applies, so a caller using the repository directly is still bounded.
+    // PostingService applies, so those reads stay bounded even for a direct repository caller.
     private static final int LEGACY_QUERY_TIMEOUT_SECONDS = 5;
     // The same total order CanonicalJournalHasher sorts postings by. Every journal locks its
     // accounts in this order, so overlapping account sets can never be taken in opposite
@@ -448,7 +448,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
     /**
      * Claims the command row before any financial work. ON CONFLICT DO NOTHING plus the FOR
      * UPDATE that follows turn the row into the per-command mutex, and V003.2 refuses postings
-     * whose command row is missing or already COMPLETED.
+     * whose journal is not visible or whose command is already COMPLETED.
      */
     private static void insertIdempotencyCommand(Connection connection, PostingCommand command)
         throws SQLException {
