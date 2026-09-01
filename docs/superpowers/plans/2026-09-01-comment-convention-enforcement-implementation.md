@@ -14,6 +14,7 @@
 
 ## Global Constraints
 
+- Every command runs inside whichever checkout the executor was given — the main checkout or an isolated worktree. Each command block anchors itself with `cd "$(git rev-parse --show-toplevel)"` instead of an absolute path, because this repository executes implementation plans in worktrees (`superpowers:using-git-worktrees`), and a worktree-isolated session is refused outright if a git command targets the shared checkout. Never substitute a literal path.
 - Checkstyle is pinned to exactly `14.1.0` and the plugin to exactly `3.6.0`. The plugin bundles Checkstyle `9.3` (2022), which cannot parse Java 25 sources, so the `<dependencies>` override is required for the build to work at all — it is not a preference.
 - Java 25 only. `services/funds-core/mise.toml` pins `java = "25"` and the POM's enforcer rule is `[25,26)`. Every Maven command in this plan is run from `services/funds-core`, never from the repository root with `-f`, because mise resolves the toolchain by working directory and the root selects JDK 27.
 - The Checkstyle configuration contains no Maven property expansion (`${...}`), so the same file can be run standalone with the Checkstyle CLI. Do not introduce `propertyExpansion`.
@@ -76,7 +77,7 @@ These were settled before the plan was written. Do not re-open them during execu
 - [ ] **Step 1: Confirm the toolchain before touching anything**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw -v
 ```
 
@@ -172,7 +173,7 @@ In `services/funds-core/pom.xml`, add inside `<build><plugins>` after the `maven
 - [ ] **Step 4: Prove the gate passes on the untouched module**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -196,7 +197,7 @@ public class CanaryProbe {
 - [ ] **Step 6: Run the gate and confirm it fails on all three rules**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -230,7 +231,7 @@ public class CanaryProbe {
 - [ ] **Step 8: Run the gate and confirm the summary rule fires**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -246,7 +247,7 @@ This is also the proof that `MissingJavadocMethod` is absent: the undocumented-m
 - [ ] **Step 9: Remove the canary and confirm a clean run**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 rm src/main/java/com/corebanking/funds/CanaryProbe.java
 ./mvnw checkstyle:check
 ```
@@ -256,7 +257,7 @@ Expected: `BUILD SUCCESS`.
 - [ ] **Step 10: Prove the lifecycle binding, not just the goal**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw validate
 ```
 
@@ -265,7 +266,7 @@ Expected: `BUILD SUCCESS`, and the log contains `--- checkstyle:3.6.0:check (che
 - [ ] **Step 11: Confirm no canary survived, then commit**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git status --porcelain
 ```
 
@@ -301,15 +302,19 @@ In `services/funds-core/config/checkstyle/checkstyle.xml`, insert immediately af
     <property name="message" value="Work items belong in the tracker, not in source."/>
   </module>
 
-  <!-- Convention: every migration opens with a '-- Vxxx:' header block saying what it changes
-       and why, relative to the previous version. Two lines is the floor, not the target. -->
+  <!-- Convention: every migration opens with a SQL line-comment header block, whose first line
+       is 'Vxxx:' plus what the migration changes and why, relative to the previous version.
+       Two lines is the floor, not the target. -->
   <module name="RegexpHeader">
     <property name="fileExtensions" value="sql"/>
     <property name="header" value="^-- V[0-9_]+.*$\n^--.*$"/>
   </module>
 ```
 
-The `\n` inside the `header` value is Checkstyle's own line separator for multi-line headers; leave it as a literal two-character escape in the XML.
+Two things in that block are easy to get wrong:
+
+- **Never write a doubled hyphen inside an XML comment.** XML forbids the sequence anywhere in a comment body, not just at its end, and Checkstyle then rejects the whole file with `CheckstyleException: unable to parse configuration stream - The string "--" is not permitted within comments.` — which loads no rules at all, rather than failing one. That is why the comment above says "SQL line-comment header block" instead of quoting the marker. The `--` inside the `header` property *value* is fine: attribute values are not comments.
+- The `\n` inside the `header` value is Checkstyle's own line separator for multi-line headers; leave it as a literal two-character escape in the XML.
 
 - [ ] **Step 2: Let the plugin see the migration resources**
 
@@ -333,7 +338,7 @@ Leave `<includeTestResources>false</includeTestResources>` as it is.
 - [ ] **Step 3: Prove the eight real migrations pass**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -352,7 +357,7 @@ Do not run `verify` or any test goal while this file exists.
 - [ ] **Step 5: Confirm the header rule fires**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -368,7 +373,7 @@ CREATE TABLE funds.canary(id int);
 ```
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -385,7 +390,7 @@ CREATE TABLE funds.canary(id int);
 ```
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -407,7 +412,7 @@ public class CanaryProbe {
 ```
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -416,7 +421,7 @@ Expected: `BUILD FAILURE` with `CanaryProbe.java:6: Work items belong in the tra
 - [ ] **Step 9: Delete both canaries and confirm a clean run**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 rm src/main/resources/db/migration/V999__canary.sql
 rm src/main/java/com/corebanking/funds/CanaryProbe.java
 ./mvnw checkstyle:check
@@ -427,7 +432,7 @@ Expected: `BUILD SUCCESS`.
 - [ ] **Step 10: Confirm no canary survived, then commit**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git status --porcelain
 ```
 
@@ -461,7 +466,7 @@ In `services/funds-core/pom.xml`, inside the checkstyle plugin's `<configuration
 ```
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
@@ -493,14 +498,14 @@ Above `public record SuccessfulCommand(` at what is now line 259, add:
 - [ ] **Step 4: Confirm the gate is green and nothing else moved**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD SUCCESS`.
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw -q -DskipTests compile test-compile
 ```
 
@@ -509,19 +514,25 @@ Expected: success. Comments cannot break compilation, but this catches a stray e
 - [ ] **Step 5: Prove the edit was comment-only**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git diff -U0 -- services/funds-core/src/test/java/com/corebanking/funds/testsupport/ReferenceLedgerModel.java
 ```
 
 Expected: exactly two added lines, both beginning with `+` then whitespace then `/**`. No other change of any kind.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Commit, comments separately from wiring**
+
+Two commits, not one. The comments are documentation that stands on its own; the POM change is the gate. Splitting them is what makes the Rollback section true — reverting the gate must not delete the two Javadoc blocks.
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
-git add services/funds-core/pom.xml services/funds-core/src/test/java/com/corebanking/funds/testsupport/ReferenceLedgerModel.java
+cd "$(git rev-parse --show-toplevel)"
+git add services/funds-core/src/test/java/com/corebanking/funds/testsupport/ReferenceLedgerModel.java
+git commit -m "Document the nested records in ReferenceLedgerModel"
+git add services/funds-core/pom.xml
 git commit -m "Extend comment enforcement to funds-core test sources"
 ```
+
+Expected: `git status --porcelain` is empty afterwards.
 
 ---
 
@@ -585,7 +596,7 @@ Re-read both edits against the committed `checkstyle.xml`. Every rule named in t
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git add docs/conventions/code-comments.md AGENTS.md
 git commit -m "Record comment-convention enforcement in the conventions"
 ```
@@ -597,7 +608,7 @@ git commit -m "Record comment-convention enforcement in the conventions"
 - [ ] **1. The working tree holds nothing but the intended change**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git status --porcelain
 git diff --stat 3812f00..HEAD
 ```
@@ -607,7 +618,7 @@ Expected: clean status; five files changed — `AGENTS.md`, `docs/conventions/co
 - [ ] **2. No canary artefact survived**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git log --diff-filter=A --name-only --format= 3812f00..HEAD | sort -u
 ls services/funds-core/src/main/resources/db/migration/
 ```
@@ -617,7 +628,7 @@ Expected: the only added file in the range is `services/funds-core/config/checks
 - [ ] **3. No production behaviour changed**
 
 ```bash
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 git diff 3812f00..HEAD -- services/funds-core/src/main
 ```
 
@@ -626,7 +637,7 @@ Expected: empty.
 - [ ] **4. The gate is green from a cold start**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw clean
 ./mvnw validate
 ```
@@ -636,7 +647,7 @@ Expected: `BUILD SUCCESS` with the `check-comment-conventions` execution in the 
 - [ ] **5. The full test gate — human partner's step**
 
 ```bash
-cd services/funds-core
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
 ./mvnw clean verify
 ```
 
@@ -644,7 +655,9 @@ Requires Docker for PostgreSQL Testcontainers, which is unreachable from Claude 
 
 ## Rollback
 
-The wiring is one plugin block. To disable the gate without reverting the work, set `-Dcheckstyle.skip=true`, or revert the three commits from Tasks 1-3 in reverse order. The two Javadoc blocks from Task 3 and the documentation from Task 4 stand on their own and need not be reverted.
+The wiring is one plugin block. To disable the gate for a single run without touching history, pass `-Dcheckstyle.skip=true`.
+
+To remove it permanently, revert in reverse order the three commits that touch `pom.xml` and `checkstyle.xml`: Task 3's `Extend comment enforcement to funds-core test sources`, Task 2's `Enforce migration headers and the work-item ban`, then Task 1's `Enforce Javadoc conventions on funds-core main sources`. This is why Task 3 commits its two Javadoc blocks separately: those two comments, and Task 4's documentation, are not part of any revert and stay. If Task 4's text was already committed, correct it in the same change — a convention document describing a gate that no longer exists is the defect this plan set out to remove.
 
 ## Risks
 
@@ -667,7 +680,7 @@ The measurements in "Baseline evidence" were taken with the Checkstyle CLI, with
 ```bash
 curl -L -o /tmp/checkstyle-14.1.0-all.jar \
   https://github.com/checkstyle/checkstyle/releases/download/checkstyle-14.1.0/checkstyle-14.1.0-all.jar
-cd /home/precioustosin/Documents/personal/repositories/core-banking
+cd "$(git rev-parse --show-toplevel)"
 java -jar /tmp/checkstyle-14.1.0-all.jar \
   -c services/funds-core/config/checkstyle/checkstyle.xml \
   services/funds-core/src/main/java \
