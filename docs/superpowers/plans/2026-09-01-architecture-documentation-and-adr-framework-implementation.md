@@ -91,15 +91,24 @@
 - Produces: `validate_repository(root: Path, checks: frozenset[str]) -> list[str]`, where an empty list means success and each non-empty string is one actionable validation error.
 - CLI: `python3 architecture/scripts/validate_architecture.py --root . --checks links`; omit `--checks` to run all checks registered at that point in the plan.
 
-- [ ] **Step 1: Capture the implementation baseline**
+- [ ] **Step 1: Preflight the exact Task 1 write scope, then capture the implementation baseline**
 
-Run before changing a file:
+Run this single fail-fast block before changing a file. It verifies both that the durable ref is absent and that the exact Task 1 paths are clean before creating the ref, so an owned-path overlap cannot leave a baseline ref behind:
 
 ```bash
 set -euo pipefail
 base_ref=refs/codex/architecture-docs-framework-base
 if git show-ref --verify --quiet "$base_ref"; then
   echo "$base_ref already exists; inspect and remove it deliberately before restarting" >&2
+  exit 1
+fi
+task1_paths=(
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task1_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 1 owned paths overlap existing work; stop and coordinate without stashing, resetting, restoring, deleting, or cleaning:' "$owned_state" >&2
   exit 1
 fi
 base_commit="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -111,28 +120,9 @@ printf '%s' "$recorded_base" | grep -Eq '^[0-9a-f]{40}$'
 git cat-file -e "$recorded_base^{commit}"
 ```
 
-Expected: the previously absent local ref resolves to the exact starting commit. Keep it through Final Verification; no task may overwrite or delete it.
+Expected: the owned-path check emits no output, then the previously absent local ref resolves to the exact starting commit. Any owned-path output is a coordination stop and occurs before `git update-ref`; it is not permission to discard overlapping state. Keep the ref through Final Verification; no task may overwrite or delete it. The `task1_paths` array is identical to the commit array in Step 6.
 
-- [ ] **Step 2: Preflight the exact Task 1 write scope**
-
-Run before creating or editing either task-owned file:
-
-```bash
-set -euo pipefail
-task1_paths=(
-  architecture/scripts/tests/test_validate_architecture.py
-  architecture/scripts/validate_architecture.py
-)
-owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task1_paths[@]}")"
-if [[ -n "$owned_state" ]]; then
-  printf '%s\n' 'Task 1 owned paths overlap existing work; stop and coordinate without stashing, resetting, restoring, deleting, or cleaning:' "$owned_state" >&2
-  exit 1
-fi
-```
-
-Expected: no output. Any output is a coordination stop, not permission to discard the overlapping state. The `task1_paths` array is identical to the commit array in Step 7.
-
-- [ ] **Step 3: Write failing validator unit tests**
+- [ ] **Step 2: Write failing validator unit tests**
 
 Create temporary repositories in `unittest.TestCase` methods and cover only the generic primitives owned by this task:
 
@@ -276,7 +266,7 @@ related_adrs: []
     )
 ```
 
-- [ ] **Step 4: Run the unit tests to verify they fail**
+- [ ] **Step 3: Run the unit tests to verify they fail**
 
 Run:
 
@@ -287,7 +277,7 @@ python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 
 Expected: failure because `validate_architecture` and its validation functions do not exist.
 
-- [ ] **Step 5: Implement the standard-library validator**
+- [ ] **Step 4: Implement the standard-library validator**
 
 Use these constants and public functions exactly; later tasks add check names and validators only when they add the corresponding failing contract test:
 
@@ -317,7 +307,7 @@ Implement the bodies with these exact rules:
 - Sort errors by path and message so local and CI output is deterministic.
 - Print each error to stderr and return `1`; print `architecture validation passed` and return `0` when clean.
 
-- [ ] **Step 6: Run validator unit tests**
+- [ ] **Step 5: Run validator unit tests**
 
 Run:
 
@@ -328,7 +318,7 @@ python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 
 Expected: all generic primitive tests pass without third-party packages. No arc42, ADR, proposal, diagram, migration, archive, PR-body, workflow, or staleness contract is implemented in this task.
 
-- [ ] **Step 7: Commit the validator**
+- [ ] **Step 6: Commit the validator**
 
 ```bash
 set -euo pipefail
@@ -461,10 +451,10 @@ Run:
 ```bash
 set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
-python3 architecture/scripts/validate_architecture.py --root . --checks links
+python3 architecture/scripts/validate_architecture.py --root . --checks structure,links
 ```
 
-Expected: unit tests pass; link validation passes because not-yet-created arc42 paths are plain code until Task 3.
+Expected: unit tests pass; the repository structure check passes for the seven governance files and the root-size limit; link validation passes because not-yet-created arc42 paths are plain code until Task 3.
 
 - [ ] **Step 7: Commit governance**
 
@@ -602,7 +592,7 @@ python3 architecture/scripts/validate_architecture.py --root . --checks metadata
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
-Expected: metadata, links, and unit tests pass. Full structure validation begins after Task 4 creates the required migration inventory.
+Expected: metadata, links, and unit tests pass. The seven-file/root-size `structure` check has been available and passing since Task 2; Task 4 introduces the separate `migration` check for the inventory contract.
 
 - [ ] **Step 8: Commit current-state baseline**
 
@@ -783,14 +773,34 @@ Add `migration` to `CHECKS` and `VALIDATORS` and implement `validate_migration_i
 
 - [ ] **Step 5: Validate the inventory's deliberate interim state**
 
-Run:
+First run the full unit-test suite as the green half of the Task 4 red/green cycle. Only after it passes, run repository migration validation separately and prove that its complete diagnostic set is exactly the deliberately deferred decision/proposal rows:
 
 ```bash
 set -euo pipefail
-python3 architecture/scripts/validate_architecture.py --root . --checks migration
+python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
+migration_report="$(mktemp)"
+expected_report="$(mktemp)"
+trap 'rm -f "$migration_report" "$expected_report"' EXIT
+if python3 architecture/scripts/validate_architecture.py --root . --checks migration 2>"$migration_report"; then
+  echo "migration unexpectedly has no deliberately deferred ADR/proposal rows" >&2
+  exit 1
+fi
+awk -F'|' '
+  function trim(value) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); return value }
+  /^\|/ {
+    disposition = trim($5)
+    resolution = trim($9)
+    if ((disposition == "decision" || disposition == "proposal") && resolution == "unresolved") {
+      print "architecture/archive/comprehensive-design-migration-inventory.md: unresolved migration row " trim($2)
+    }
+  }
+' architecture/archive/comprehensive-design-migration-inventory.md | LC_ALL=C sort >"$expected_report"
+test -s "$expected_report"
+LC_ALL=C sort -o "$migration_report" "$migration_report"
+diff -u "$expected_report" "$migration_report"
 ```
 
-Expected: fail only with one or more `unresolved migration row` diagnostics for ADR/proposal extraction scheduled in Tasks 5 and 7. All schema, coverage, uniqueness, destination, and evidence checks pass.
+Expected: the full unit suite passes after the focused Step 2 red failure and Step 4 implementation. The separate repository migration command then fails only with the exact `unresolved migration row` diagnostics for ADR/proposal extraction scheduled in Tasks 5 and 7; `diff` is silent, proving all schema, coverage, uniqueness, destination, marker, rationale, and evidence checks are green.
 
 - [ ] **Step 6: Commit the classification inventory**
 
@@ -907,7 +917,7 @@ Add repository-backed lifecycle/evidence fixtures in temporary Git repositories:
 - `Supersedes` and `Superseded by` reject a missing ADR target, self-reference, non-reciprocal edge, incompatible statuses, and a cycle; accept a reciprocal `Accepted` successor that supersedes a `Superseded` predecessor;
 - an ADR Accepted at the base rejects mutations to `Context`, `Decision drivers`, `Considered options`, `Decision`, or the complete `Consequences` subtree including `Positive`, `Negative`, and `Risks`;
 - an Accepted-at-base ADR accepts only `Accepted -> Superseded` or `Accepted -> Deprecated`, rejects every reverse or lateral decision-status change, and enforces implementation status monotonically as `Not started -> Partial -> Complete`; `Not applicable` may remain unchanged but cannot transition to or from another implementation status;
-- relationship/evidence sequences are append-only: legal suffix additions to `Related pull requests`, `Related commits`, `Related architecture sections`, `Related proposals`, `Supersedes`, `Superseded by`, `Compliance and verification`, and `Implementation evidence` pass, while rewriting, removal, insertion before an existing item, or reordering fails;
+- relationship/evidence sequences are append-only: legal suffix additions to `Related pull requests`, `Related commits`, `Related architecture sections`, `Related proposals`, `Supersedes`, `Superseded by`, `Compliance and verification`, and `Implementation evidence` pass, while rewriting, removal, insertion before an existing item, or reordering fails. The positive fixture must combine `Implementation status: Partial -> Complete` with appended command/result entries under `Compliance and verification`, an appended `changed` evidence entry, and an appended path-bound `snapshot` entry for unchanged files; this exact legal completion transition must pass;
 - an ADR introduced as `Accepted` is exempt only on its introduction edge, then a rationale mutation in the next commit fails;
 - an ADR introduced as `Proposed`, accepted in a later commit, and mutated in a third commit fails on the accepted-to-mutated edge even though an endpoint-only comparison from the range base would not protect it;
 - an ADR that is `Proposed` at the range base, accepted in the first ranged commit, and mutated in the next commit fails;
@@ -945,7 +955,7 @@ Add `adrs` to `CHECKS` and `VALIDATORS`. Implement the exact numbering, filename
 
 Resolve every `Supersedes` and `Superseded by` ADR ID. Reject missing targets, self-reference, non-reciprocal declarations, and cycles in the directed predecessor-to-successor graph. Every predecessor with `Superseded by: ADR-NNNN` must be `Superseded`, every named successor must be `Accepted`, and the successor's `Supersedes` field must name the predecessor; `Deprecated` records do not claim a superseding ADR. Reject multiple successors for one predecessor.
 
-Implement `validate_accepted_adr_immutability` with `git rev-parse --verify REF^{commit}`, `git show COMMIT:PATH`, and current filesystem reads when `head_ref` is omitted. For every ADR present with `Status: Accepted` at the base, compare parsed records and require byte-stable normalized content for `Context`, `Decision drivers`, `Considered options`, `Decision`, and the entire `Consequences` section including its three required subsections. Allow decision status to remain `Accepted` or transition once to `Superseded`/`Deprecated`; enforce the implementation-status ordering and fixed `Not applicable` rule from Step 1. Treat each mutable relationship/evidence area as an ordered sequence, interpret the literal `None` as an empty sequence, and require the base sequence to be an exact prefix of the head/current sequence. Reject edits to all other accepted-record fields. An ADR absent from an edge's parent is exempt on that introduction edge only; if it is Accepted in that child, every later child edge protects it.
+Implement `validate_accepted_adr_immutability` with `git rev-parse --verify REF^{commit}`, `git show COMMIT:PATH`, and current filesystem reads when `head_ref` is omitted. For every ADR present with `Status: Accepted` at the base, compare parsed records and require byte-stable normalized content for `Context`, `Decision drivers`, `Considered options`, `Decision`, and the entire `Consequences` section including its three required subsections. Allow decision status to remain `Accepted` or transition once to `Superseded`/`Deprecated`; enforce the implementation-status ordering and fixed `Not applicable` rule from Step 1. Treat each mutable relationship/evidence area as an ordered sequence, interpret the literal `None` as an empty sequence, and require the base sequence to be an exact prefix of the head/current sequence. In particular, accept the tested `Partial -> Complete` transition when command/results are appended to `Compliance and verification` and valid `changed`/`snapshot` entries are appended to `Implementation evidence`; path-bound snapshot semantics remain the observed-tree-state semantics defined above. Reject edits to all other accepted-record fields. An ADR absent from an edge's parent is exempt on that introduction edge only; if it is Accepted in that child, every later child edge protects it.
 
 Implement `validate_accepted_adr_edge_range` by resolving both refs to verified commits, requiring the base to be an ancestor of the head, and reading `git rev-list --reverse --topo-order --parents <base>..<head>`. For each emitted child, validate `parent -> child` against every listed parent, including parents outside `<base>..<head>` and every parent of a merge commit, by calling the two-tree immutability primitive. Prefix deterministic diagnostics with `<parent> -> <child>`. A root child has no edge and is skipped. This all-parent rule validates changes introduced by either side of a merge and must not be reduced to first-parent traversal. Extend `main` with `--adr-base-ref` and optional `--adr-head-ref`, plus the paired `--adr-edge-base-ref` and `--adr-edge-head-ref`; reject a lone edge flag, emit deterministic errors, and return non-zero on comparison failure.
 
@@ -1914,7 +1924,7 @@ git commit --only -m "ci: enforce architecture documentation contracts" -- "${ta
 
 **Interfaces:**
 - Consumes: the full commit hash produced by Task 10.
-- Produces: ADR-0001 with `Implementation status: Complete` and immutable local implementation evidence.
+- Produces: ADR-0001 with `Implementation status: Complete`, immutable path-bound evidence for the complete implemented framework at the Task 10 commit, and append-only command/result records under `Compliance and verification`.
 
 - [ ] **Step 0: Preflight the exact Task 11 write scope**
 
@@ -1930,7 +1940,7 @@ if [[ -n "$owned_state" ]]; then
 fi
 ```
 
-Expected: no output. Run this before capturing evidence or editing the ADR; non-owned state is allowed. This exact array is repeated unchanged in Step 4.
+Expected: no output. Run this before capturing evidence or editing the ADR; non-owned state is allowed. This exact array is repeated unchanged in Step 5.
 
 - [ ] **Step 1: Capture and validate the Task 10 commit hash**
 
@@ -1938,30 +1948,100 @@ Run:
 
 ```bash
 set -euo pipefail
-framework_commit="$(git rev-parse HEAD)"
-test "$(printf '%s' "$framework_commit" | wc -c)" -eq 40
-git show --quiet --format='%s' "$framework_commit"
+framework_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+printf '%s' "$framework_commit" | grep -Eq '^[0-9a-f]{40}$'
+git cat-file -e "$framework_commit^{commit}"
+test "$(git show --quiet --format='%s' "$framework_commit")" = "ci: enforce architecture documentation contracts"
 ```
 
 Expected: a 40-character hash and subject `ci: enforce architecture documentation contracts`.
 
-- [ ] **Step 2: Append evidence without rewriting rationale**
+- [ ] **Step 2: Append complete path-bound evidence without rewriting rationale**
 
-Change only `Implementation status: Partial` to `Implementation status: Complete`. Generate the exact path-bound entry with the captured Task 10 hash:
+Change only `Implementation status: Partial` to `Implementation status: Complete`. Retain the Task 10 `changed` evidence for its five CI-enforcement paths and append it as the first new implementation-evidence item. Then append one Task 10 `snapshot` item covering every completed framework artifact present in that commit. Define and verify the exact sets before editing the ADR:
 
 ```bash
 set -euo pipefail
-printf -- '- %s changed: .github/pull_request_template.md; .github/workflows/architecture-docs.yml; architecture/README.md; architecture/scripts/tests/test_validate_architecture.py; architecture/scripts/validate_architecture.py\n' "$framework_commit"
+task10_changed_paths=(
+  .github/pull_request_template.md
+  .github/workflows/architecture-docs.yml
+  architecture/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+framework_snapshot_paths=(
+  .github/pull_request_template.md
+  .github/workflows/architecture-docs.yml
+  .gitignore
+  ARCHITECTURE.md
+  architecture/README.md
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+  architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
+  architecture/adr/0003-use-signed-integer-minor-units.md
+  architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md
+  architecture/adr/0005-use-immutable-journals-and-additive-corrections.md
+  architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md
+  architecture/adr/0007-separate-ledger-identity-from-account-addresses.md
+  architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md
+  architecture/adr/README.md
+  architecture/adr/template.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/archive/comprehensive-design-migration-review.md
+  architecture/archive/modern-core-banking-comprehensive-design-revised.md
+  architecture/archive/proposals/README.md
+  architecture/diagrams/README.md
+  architecture/diagrams/containers.mmd
+  architecture/diagrams/context.mmd
+  architecture/diagrams/funds-core-components.mmd
+  architecture/diagrams/posting-sequence.mmd
+  architecture/diagrams/single-vm-deployment.mmd
+  architecture/infrastructure/infra-ubuntu24.04-poc.md
+  architecture/proposals/README.md
+  architecture/proposals/account-identifiers-and-nip-inbound.md
+  architecture/proposals/conventional-deposit-products-and-accrual.md
+  architecture/proposals/full-poc-platform.md
+  architecture/proposals/non-interest-banking-products.md
+  architecture/proposals/production-platform.md
+  architecture/proposals/providers-and-reconciliation.md
+  architecture/scripts/render-diagrams.sh
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  architecture/tooling/package-lock.json
+  architecture/tooling/package.json
+  docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md
+  docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md
+  services/funds-core/README.md
+)
+task10_changed="$(git show --format= --name-only --no-renames "$framework_commit" | LC_ALL=C sort -u)"
+for path in "${task10_changed_paths[@]}"; do
+  grep -Fqx "$path" <<<"$task10_changed"
+done
+for path in "${framework_snapshot_paths[@]}"; do
+  git cat-file -e "$framework_commit:$path"
+done
+printf -v changed_entry '%s; ' "${task10_changed_paths[@]}"
+changed_entry="${changed_entry%; }"
+printf -v snapshot_entry '%s; ' "${framework_snapshot_paths[@]}"
+snapshot_entry="${snapshot_entry%; }"
+printf -- '- %s changed: %s\n' "$framework_commit" "$changed_entry"
+printf -- '- %s snapshot: %s\n' "$framework_commit" "$snapshot_entry"
 ```
 
-Append that command's one-line output under `## Implementation evidence` and verify that every listed path is present in that commit's changed-path set. Then append these verified commands under the same section:
-
-```text
-python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
-python3 architecture/scripts/validate_architecture.py --root .
-npm ci --prefix architecture/tooling
-architecture/scripts/render-diagrams.sh
-```
+Append those two generated lines, in that order, as an exact suffix under `## Implementation evidence`. The `changed` line proves the five Task 10 paths changed in that commit. The `snapshot` line is path-bound immutable evidence that the complete root/governance, twelve-file arc42 set, ADR set and templates, proposal set, diagram sources and governance, archive source/inventory/review, infrastructure update, validator/tests/render script, tooling manifests, PR/workflow gate, `.gitignore`, service document, and four existing plans all exist together in the Task 10 tree; it does not claim Task 10 introduced or changed every snapshot path. Do not put validation commands in `Implementation evidence`.
 
 - [ ] **Step 3: Re-run the complete gate**
 
@@ -1978,9 +2058,32 @@ git diff --check -- architecture/adr/0001-manage-architecture-as-versioned-code.
 git diff -- architecture/adr/0001-manage-architecture-as-versioned-code.md
 ```
 
-Expected: all automated checks pass, the git-aware accepted-ADR check accepts the monotonic status/evidence append, and the ADR diff changes only implementation status and appended evidence.
+Expected: all automated checks pass, including validation of every `changed` and `snapshot` path against the Task 10 commit. The git-aware accepted-ADR check accepts the monotonic status transition and append-only evidence suffix; the ADR diff changes only implementation status and appended implementation evidence at this point.
 
-- [ ] **Step 4: Commit evidence finalization**
+- [ ] **Step 4: Append command/results as compliance evidence and verify immutability**
+
+Only after the four substantive verification commands and the ADR/diff checks in Step 3 succeed, append these exact result records, in this order, as a suffix under `## Compliance and verification`:
+
+```markdown
+- `python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v` — PASS (exit 0).
+- `python3 architecture/scripts/validate_architecture.py --root .` — PASS (exit 0).
+- `npm ci --prefix architecture/tooling` — PASS (exit 0).
+- `architecture/scripts/render-diagrams.sh` — PASS (exit 0; every governed Mermaid source rendered).
+```
+
+These are append-only command/result records, not immutable artifact evidence. Re-run the accepted-record and repository checks after the append:
+
+```bash
+set -euo pipefail
+python3 architecture/scripts/validate_architecture.py --root .
+python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$framework_commit"
+git diff --check -- architecture/adr/0001-manage-architecture-as-versioned-code.md
+git diff -- architecture/adr/0001-manage-architecture-as-versioned-code.md
+```
+
+Expected: repository and accepted-ADR validation pass. The final diff contains only `Implementation status: Partial -> Complete`, an append-only suffix to `Compliance and verification`, and the two append-only path-bound entries under `Implementation evidence`; accepted rationale, alternatives, consequences, existing relationships, and prior evidence remain byte-stable.
+
+- [ ] **Step 5: Commit evidence finalization**
 
 ```bash
 set -euo pipefail
