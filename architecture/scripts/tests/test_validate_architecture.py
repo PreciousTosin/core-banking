@@ -6,6 +6,21 @@ from architecture.scripts import validate_architecture as validator
 
 
 class ValidatorTest(unittest.TestCase):
+    ARC42_FILES = (
+        "01-introduction-and-goals.md",
+        "02-constraints.md",
+        "03-context-and-scope.md",
+        "04-solution-strategy.md",
+        "05-building-block-view.md",
+        "06-runtime-view.md",
+        "07-deployment-view.md",
+        "08-crosscutting-concepts.md",
+        "09-decisions.md",
+        "10-quality-requirements.md",
+        "11-risks-and-technical-debt.md",
+        "12-glossary.md",
+    )
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -18,6 +33,83 @@ class ValidatorTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
         return path
+
+    def write_arc42(self, name, *, status="current", owners="  - architecture", last_verified="2026-09-01", code_refs="  - services/funds-core/", replacement=None):
+        replacement_line = "" if replacement is None else f"replacement: {replacement}\n"
+        return self.write(
+            f"architecture/arc42/{name}",
+            "---\n"
+            f"title: {name}\n"
+            f"status: {status}\n"
+            f"owners:\n{owners}\n"
+            f"last_verified: {last_verified}\n"
+            "related_adrs: []\n"
+            f"code_refs:\n{code_refs}\n"
+            f"{replacement_line}"
+            "---\n"
+            "# Arc42\n",
+        )
+
+    def write_complete_arc42(self):
+        self.write("services/funds-core/.keep", "")
+        for name in self.ARC42_FILES:
+            self.write_arc42(name)
+
+    def test_metadata_requires_exact_arc42_collection(self):
+        self.write_complete_arc42()
+        self.write("architecture/arc42/unexpected.md", "# Unexpected\n")
+        errors = validator.validate_metadata(self.root)
+        self.assertTrue(any("unexpected arc42 file: architecture/arc42/unexpected.md" in error for error in errors))
+
+    def test_metadata_rejects_invalid_arc42_status_owner_code_reference_and_date(self):
+        self.write_complete_arc42()
+        self.write_arc42("01-introduction-and-goals.md", status="proposed")
+        self.write_arc42("02-constraints.md", owners="")
+        self.write_arc42("03-context-and-scope.md", code_refs="  - missing/source")
+        self.write_arc42("04-solution-strategy.md", last_verified="2026-9-1")
+        errors = validator.validate_metadata(self.root)
+        self.assertTrue(any("01-introduction-and-goals.md: status must be current or deprecated" in error for error in errors))
+        self.assertTrue(any("02-constraints.md: owners must not be empty" in error for error in errors))
+        self.assertTrue(any("03-context-and-scope.md: code_refs path does not exist: missing/source" in error for error in errors))
+        self.assertTrue(any("04-solution-strategy.md: last_verified must use ISO YYYY-MM-DD" in error for error in errors))
+
+    def test_metadata_accepts_deprecated_arc42_with_existing_replacement_link(self):
+        self.write_complete_arc42()
+        self.write_arc42(
+            "01-introduction-and-goals.md",
+            status="deprecated",
+            replacement="[Replacement](02-constraints.md)",
+        )
+        self.assertEqual([], validator.validate_metadata(self.root))
+
+    def test_metadata_rejects_invalid_deprecated_arc42_replacements(self):
+        cases = {
+            "missing": None,
+            "empty": "",
+            "non-link": "02-constraints.md",
+            "missing-target": "[Missing](missing.md)",
+            "self": "[Self](01-introduction-and-goals.md)",
+        }
+        for name, replacement in cases.items():
+            with self.subTest(name=name):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.root = Path(self.tmp.name)
+                self.write_complete_arc42()
+                self.write_arc42(
+                    "01-introduction-and-goals.md",
+                    status="deprecated",
+                    replacement=replacement,
+                )
+                errors = validator.validate_metadata(self.root)
+                self.assertTrue(any("01-introduction-and-goals.md: deprecated replacement" in error for error in errors))
+
+    def test_metadata_enforces_proposal_placement_terminal_statuses(self):
+        self.write("architecture/proposals/active.md", "---\nstatus: implemented\n---\n# Active\n")
+        self.write("architecture/archive/proposals/archive.md", "---\nstatus: proposed\n---\n# Archive\n")
+        errors = validator.validate_metadata(self.root)
+        self.assertTrue(any("architecture/proposals/active.md: terminal status implemented belongs in architecture/archive/proposals/" in error for error in errors))
+        self.assertTrue(any("architecture/archive/proposals/archive.md: status proposed is not terminal" in error for error in errors))
 
     def test_required_governance_files(self):
         errors = validator.validate_structure(self.root)

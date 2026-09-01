@@ -4,11 +4,30 @@ import html
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"links", "structure"})
+CHECKS = frozenset({"links", "metadata", "structure"})
+
+ARC42_FILENAMES = frozenset({
+    "01-introduction-and-goals.md",
+    "02-constraints.md",
+    "03-context-and-scope.md",
+    "04-solution-strategy.md",
+    "05-building-block-view.md",
+    "06-runtime-view.md",
+    "07-deployment-view.md",
+    "08-crosscutting-concepts.md",
+    "09-decisions.md",
+    "10-quality-requirements.md",
+    "11-risks-and-technical-debt.md",
+    "12-glossary.md",
+})
+ARC42_REQUIRED_FIELDS = ("title", "status", "owners", "last_verified", "related_adrs", "code_refs")
+ARC42_STATUSES = frozenset({"current", "deprecated"})
+TERMINAL_PROPOSAL_STATUSES = frozenset({"implemented", "rejected", "superseded"})
 
 REQUIRED_GOVERNANCE_FILES = (
     "ARCHITECTURE.md",
@@ -163,8 +182,96 @@ def validate_structure(root: Path) -> list[str]:
         errors.append("ARCHITECTURE.md must contain fewer than 180 lines")
     return sorted(errors)
 
+def _metadata_error(path: Path, root: Path, message: str) -> str:
+    return f"{path.relative_to(root).as_posix()}: {message}"
+
+def _has_values(value: str | list[str] | None) -> bool:
+    if isinstance(value, list):
+        return bool(value) and all(item.strip() for item in value)
+    return isinstance(value, str) and bool(value.strip())
+
+def _replacement_target(path: Path, value: str, root: Path) -> str | None:
+    links = extract_markdown_links(value)
+    if len(links) != 1 or not re.fullmatch(r"\s*\[[^]]+\]\((?:<[^>]+>|[^\s)]+)\)\s*", value):
+        return "must be one local Markdown link"
+    local = _local_destination(links[0].destination)
+    if local is None:
+        return "must be a local Markdown link"
+    destination, _ = local
+    target = path if not destination else (path.parent / destination).resolve()
+    if target == path.resolve():
+        return "must not link to itself"
+    if not target.is_file():
+        return f"target does not exist: {destination}"
+    return None
+
+def _validate_arc42_document(path: Path, root: Path) -> list[str]:
+    metadata = parse_front_matter(path)
+    errors = []
+    for field in ARC42_REQUIRED_FIELDS:
+        if field not in metadata:
+            errors.append(_metadata_error(path, root, f"{field} is required"))
+    if "title" in metadata and not _has_values(metadata["title"]):
+        errors.append(_metadata_error(path, root, "title must not be empty"))
+    status = metadata.get("status")
+    if status not in ARC42_STATUSES:
+        errors.append(_metadata_error(path, root, "status must be current or deprecated"))
+    if "owners" in metadata and not _has_values(metadata["owners"]):
+        errors.append(_metadata_error(path, root, "owners must not be empty"))
+    verified = metadata.get("last_verified")
+    if not isinstance(verified, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", verified):
+        errors.append(_metadata_error(path, root, "last_verified must use ISO YYYY-MM-DD"))
+    else:
+        try:
+            date.fromisoformat(verified)
+        except ValueError:
+            errors.append(_metadata_error(path, root, "last_verified must use ISO YYYY-MM-DD"))
+    refs = metadata.get("code_refs")
+    if not _has_values(refs):
+        errors.append(_metadata_error(path, root, "code_refs must not be empty"))
+    else:
+        for ref in refs if isinstance(refs, list) else [refs]:
+            if not (root / ref).exists():
+                errors.append(_metadata_error(path, root, f"code_refs path does not exist: {ref}"))
+    if status == "deprecated":
+        replacement = metadata.get("replacement")
+        if not isinstance(replacement, str) or not replacement.strip():
+            errors.append(_metadata_error(path, root, "deprecated replacement is required"))
+        else:
+            replacement_error = _replacement_target(path, replacement, root)
+            if replacement_error:
+                errors.append(_metadata_error(path, root, f"deprecated replacement {replacement_error}"))
+    return errors
+
+def validate_metadata(root: Path) -> list[str]:
+    errors = []
+    arc42 = root / "architecture/arc42"
+    arc42_files = {path.relative_to(arc42).as_posix() for path in arc42.rglob("*.md")} if arc42.is_dir() else set()
+    expected = set(ARC42_FILENAMES)
+    for name in sorted(expected - arc42_files):
+        errors.append(f"architecture/arc42/{name} is required")
+    for name in sorted(arc42_files - expected):
+        errors.append(f"unexpected arc42 file: architecture/arc42/{name}")
+    for name in sorted(expected & arc42_files):
+        errors.extend(_validate_arc42_document(arc42 / name, root))
+
+    active = root / "architecture/proposals"
+    archive = root / "architecture/archive/proposals"
+    for directory, archived in ((active, False), (archive, True)):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*.md")):
+            if path.name == "README.md":
+                continue
+            status = parse_front_matter(path).get("status")
+            if archived and status not in TERMINAL_PROPOSAL_STATUSES:
+                errors.append(_metadata_error(path, root, f"status {status or 'missing'} is not terminal"))
+            elif not archived and status in TERMINAL_PROPOSAL_STATUSES:
+                errors.append(_metadata_error(path, root, f"terminal status {status} belongs in architecture/archive/proposals/"))
+    return sorted(errors)
+
 Validator = Callable[[Path], list[str]]
-VALIDATORS: dict[str, Validator] = {"links": validate_links, "structure": validate_structure}
+VALIDATORS: dict[str, Validator] = {"links": validate_links, "metadata": validate_metadata, "structure": validate_structure}
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
     errors = []

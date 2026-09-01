@@ -31,22 +31,20 @@ ADRs define the applicable evidence and boundaries for those invariants.
 
 ## Documentation map
 
-Current architecture will be organized using the twelve arc42 paths below.
-They are intentionally code placeholders until the files exist; Task 3 turns
-them into links.
+Current architecture is organized in these twelve arc42 views:
 
-- `architecture/arc42/01-introduction-and-goals.md`
-- `architecture/arc42/02-constraints.md`
-- `architecture/arc42/03-context-and-scope.md`
-- `architecture/arc42/04-solution-strategy.md`
-- `architecture/arc42/05-building-block-view.md`
-- `architecture/arc42/06-runtime-view.md`
-- `architecture/arc42/07-deployment-view.md`
-- `architecture/arc42/08-crosscutting-concepts.md`
-- `architecture/arc42/09-decisions.md`
-- `architecture/arc42/10-quality-requirements.md`
-- `architecture/arc42/11-risks-and-technical-debt.md`
-- `architecture/arc42/12-glossary.md`
+- [Introduction and goals](architecture/arc42/01-introduction-and-goals.md)
+- [Constraints](architecture/arc42/02-constraints.md)
+- [Context and scope](architecture/arc42/03-context-and-scope.md)
+- [Solution strategy](architecture/arc42/04-solution-strategy.md)
+- [Building-block view](architecture/arc42/05-building-block-view.md)
+- [Runtime view](architecture/arc42/06-runtime-view.md)
+- [Deployment view](architecture/arc42/07-deployment-view.md)
+- [Crosscutting concepts](architecture/arc42/08-crosscutting-concepts.md)
+- [Decisions](architecture/arc42/09-decisions.md)
+- [Quality requirements](architecture/arc42/10-quality-requirements.md)
+- [Risks and technical debt](architecture/arc42/11-risks-and-technical-debt.md)
+- [Glossary](architecture/arc42/12-glossary.md)
 
 The architecture index, ADR collection, diagrams, and proposals live under
 `architecture/`. Plans describe delivery rather than current system truth.
