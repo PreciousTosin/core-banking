@@ -4,7 +4,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import java.util.UUID;
 
 /**
- * Test seam for crash and failure injection inside the posting transaction. Production wires
+ * Test seam for crash and failure injection around the posting transaction. Production wires
  * the no-op bean below. PostingCrashRecoveryIT halts a child JVM from beforeCommit and
  * afterCommitBeforeReturn to prove replay recovers a command on either side of the commit;
  * PostingAtomicityIT throws from afterFinancialRowsBeforeOutbox to prove the whole transaction

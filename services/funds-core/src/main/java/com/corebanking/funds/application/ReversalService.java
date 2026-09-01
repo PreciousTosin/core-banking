@@ -38,7 +38,6 @@ import org.postgresql.util.PSQLException;
  */
 @ApplicationScoped
 public class ReversalService {
-    // POC guardrails keep a single correction comfortably bounded on an 8 GiB VM.
     static final int MAX_POSTINGS_PER_JOURNAL = JournalValidator.MAX_POSTINGS_PER_JOURNAL;
     static final int MAX_DIMENSIONS_PER_POSTING = JournalValidator.MAX_DIMENSIONS_PER_POSTING;
     static final int MAX_DIMENSION_JSON_BYTES = JournalValidator.MAX_DIMENSION_JSON_BYTES;
@@ -449,7 +448,7 @@ public class ReversalService {
     /**
      * Reassembles the original's postings in account_sequence order, refusing anything past the
      * POC limits instead of reading it. The bounds equal JournalValidator's and the V005 posting
-     * CHECKs, so exceeding one here means corrupted or out-of-envelope data, not a large input.
+     * envelope, so exceeding one here means corrupted or out-of-envelope data, not a large input.
      */
     private static List<PostingLine> loadBoundedPostings(Connection connection, UUID journalId)
         throws SQLException {

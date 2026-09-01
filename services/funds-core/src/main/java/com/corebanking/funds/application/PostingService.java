@@ -69,7 +69,7 @@ public class PostingService {
 
     /**
      * Posts a generic journal. Proves the TYPED_V2 request hash is postingV2 of the journal and
-     * rejects reversal metadata, so only ReversalService can create linked reversals.
+     * rejects reversal metadata; linked reversals enter only through the trusted path.
      */
     public PostingResult post(PostingCommand command) {
         return post(command, false);
