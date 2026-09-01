@@ -1,3 +1,20 @@
+-- V004: application roles. Bootstraps the three capability roles (migrator as
+-- schema owner, app as the service role, proof_reader for external proof
+-- jobs), transfers ownership of every funds object to the migrator, pins
+-- SECURITY DEFINER/INVOKER and search_path on every routine, revokes PUBLIC
+-- and grants funds_app only the column-level DML the kernel needs. V003.x
+-- finished the ledger invariants; from here the database, not the service,
+-- decides who may mutate ledger facts (ACC-24). See MIGRATION-ROLES.md.
+--
+-- Guarded by MigrationIT.roleBootstrapIsFailClosedAndNeverAltersExistingClusterRoles,
+-- which reads this file as text: exactly three role-creation lines must exist,
+-- and the idempotent-create, role-alter, membership-catalogue and dynamic
+-- revoke-from idioms are forbidden anywhere in the file. Keep comments free of
+-- those phrases and never begin a comment line with a role-creation statement.
+
+-- Fail closed: plain creation errors if any of the three roles already exists,
+-- so a pre-existing cluster role is never adopted or changed. NOINHERIT keeps a
+-- login granted one capability from silently acquiring another's privileges.
 CREATE ROLE funds_migrator WITH
     NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 CREATE ROLE funds_app WITH
@@ -5,6 +22,8 @@ CREATE ROLE funds_app WITH
 CREATE ROLE funds_proof_reader WITH
     NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 
+-- A COMPLETED result is the replay answer for its commandId forever; only
+-- IN_PROGRESS rows may still change (completion, or owner-abandonment cleanup).
 CREATE FUNCTION funds.reject_completed_idempotency_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -24,11 +43,16 @@ BEGIN
 END
 $function$;
 
+-- Applies to every role, including the owner: finality is not a grant.
 CREATE TRIGGER completed_idempotency_immutable
 BEFORE UPDATE OR DELETE ON funds.idempotency_command
 FOR EACH ROW
 EXECUTE FUNCTION funds.reject_completed_idempotency_mutation();
 
+-- Row locks (FOR SHARE / FOR UPDATE) need UPDATE privilege, which funds_app
+-- must never hold on reference tables. These definer routines take the lock
+-- on the caller's behalf and return only the governed columns. Replaced by
+-- lock_book_chart_for_posting in V005 once journals pin a chart.
 CREATE FUNCTION funds.lock_book_for_posting(p_book_id uuid)
 RETURNS TABLE (legal_entity_id uuid, accounting_policy_version integer)
 LANGUAGE sql
@@ -42,6 +66,8 @@ AS $function$
     FOR SHARE OF book
 $function$;
 
+-- Shared period lock: a period close cannot commit between the OPEN check and
+-- the journal insert (ACC-20 closed-period rejection). Still used after V005.
 CREATE FUNCTION funds.lock_period_for_posting(p_period_id uuid)
 RETURNS TABLE (
     book_id uuid,
@@ -60,6 +86,10 @@ AS $function$
     FOR SHARE OF period
 $function$;
 
+-- Exclusive account lock serialises balance updates; the shared chart lock pins
+-- the classification read in the same statement. Callers lock accounts in
+-- canonical UUID-string order. Replaced by lock_account_mapping_for_posting
+-- in V005.
 CREATE FUNCTION funds.lock_account_for_posting(p_account_id uuid)
 RETURNS TABLE (
     book_id uuid,
@@ -111,6 +141,8 @@ ALTER FUNCTION funds.reject_posting_to_completed_journal()
 ALTER FUNCTION funds.reject_completed_idempotency_mutation()
     SECURITY INVOKER SET search_path = pg_catalog, funds;
 
+-- Nothing in funds is reachable by default; every capability below is an
+-- explicit grant to a named role.
 REVOKE ALL ON SCHEMA funds FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA funds FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA funds FROM PUBLIC;
@@ -120,8 +152,12 @@ REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA funds FROM funds_app, funds_proof_
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA funds FROM funds_app, funds_proof_reader;
 REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA funds FROM funds_app, funds_proof_reader;
 
+-- Ownership moves to the non-login migrator so every later migration runs
+-- under SET ROLE and new objects inherit its hardened default privileges.
 ALTER SCHEMA funds OWNER TO funds_migrator;
 
+-- Transfer every table (and standalone sequence) created by V001-V003.x under
+-- the bootstrap login. Owned serial sequences follow their table automatically.
 DO $relations$
 DECLARE
     relation record;
@@ -164,6 +200,8 @@ BEGIN
 END
 $relations$;
 
+-- Same transfer for routines: SECURITY DEFINER bodies must execute as the
+-- migrator, never as whichever login happened to run the earlier migrations.
 DO $functions$
 DECLARE
     function_row record;
@@ -185,6 +223,7 @@ BEGIN
 END
 $functions$;
 
+-- Objects the migrator creates in later migrations start with no PUBLIC access.
 ALTER DEFAULT PRIVILEGES FOR ROLE funds_migrator IN SCHEMA funds
     REVOKE ALL ON TABLES FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE funds_migrator IN SCHEMA funds
@@ -198,6 +237,9 @@ ALTER DEFAULT PRIVILEGES FOR ROLE funds_migrator
 
 GRANT USAGE ON SCHEMA funds TO funds_app, funds_proof_reader;
 
+-- funds_app: read where the kernel reads, and column-scoped INSERT/UPDATE only
+-- on the columns it writes. No DELETE anywhere, no UPDATE on journal or
+-- posting, so direct ledger mutation is denied by privilege as well as trigger.
 GRANT SELECT ON
     funds.book,
     funds.accounting_period,
@@ -212,6 +254,7 @@ TO funds_app;
 
 GRANT INSERT (command_id, request_hash, state, created_at)
     ON funds.idempotency_command TO funds_app;
+-- Completion path only: command_id and request_hash can never be rewritten.
 GRANT UPDATE (state, journal_id, result_json, completed_at)
     ON funds.idempotency_command TO funds_app;
 GRANT INSERT (
@@ -237,9 +280,13 @@ GRANT INSERT (
     payload, created_at
 ) ON funds.outbox_event TO funds_app;
 
+-- USAGE is the minimum nextval needs; it does not permit setval or sequence
+-- UPDATE (MIGRATION-ROLES.md). Gaps after rollback are expected.
 GRANT USAGE ON SEQUENCE funds.journal_journal_sequence_seq TO funds_app;
 GRANT EXECUTE ON FUNCTION funds.lock_book_for_posting(uuid) TO funds_app;
 GRANT EXECUTE ON FUNCTION funds.lock_period_for_posting(uuid) TO funds_app;
 GRANT EXECUTE ON FUNCTION funds.lock_account_for_posting(uuid) TO funds_app;
 
+-- Provisional whole-schema read for the external proof job; V005 replaces it
+-- with exact column grants.
 GRANT SELECT ON ALL TABLES IN SCHEMA funds TO funds_proof_reader;
