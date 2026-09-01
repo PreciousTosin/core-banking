@@ -14,7 +14,7 @@
 
 ## Global Constraints
 
-- Every command runs inside the checkout the executor was given — main checkout or worktree. Anchor each block with `cd "$(git rev-parse --show-toplevel)"`; never a literal absolute path.
+- Every command runs inside the checkout the executor was given — main checkout or worktree. Anchor each block with `cd "$(git rev-parse --show-toplevel)"`; never a literal absolute path. **The one exception is "Merging: the strategy is load-bearing", which must run in the main checkout** because that is where `master` is checked out; the reason and the commands are in that section.
 - **The ADR, the decisions-index edit and the plan backlink are one commit.** Every split produces an intermediate tree that fails: the ADR alone fails both reciprocity checks, the backlink alone fails link resolution, the index alone fails nothing but proves nothing. There is no valid multi-commit ordering.
 - **If validation fails after the ADR is committed, fix it with `git commit --amend`, never a follow-up commit.** The record is `Accepted` from birth, so from its very next commit edge the validator freezes, byte-for-byte:
   - the sections `Context`, `Decision drivers`, `Considered options`, `Decision` and `Consequences`, plus any heading you added beyond the required ten;
@@ -393,16 +393,21 @@ The repository validates the PR body itself on `pull_request` events. The descri
 
 ## Merging: the strategy is load-bearing
 
-Merge with a true merge commit and verify afterwards. This is the one step that cannot be checked from the branch.
+**This section runs in the main checkout, not in the worktree, and it is the maintainer's step.** It is the one part of this plan whose working directory is not the one every other command uses. `master` is checked out in the main checkout while this work sits in a linked worktree, and git refuses to check out a branch that another worktree already holds — `git checkout master` from the worktree fails with `fatal: 'master' is already used by worktree at ...`. An agent confined to the worktree cannot run this section at all, and should hand it over rather than work around it.
+
+Because the main checkout already has `master` checked out, no `checkout` is needed — merge into it directly:
 
 ```bash
-cd "$(git rev-parse --show-toplevel)"
-git checkout master
-git merge --no-ff worktree-comment-convention-enforcement-plan
-python3 architecture/scripts/validate_architecture.py --root .
+MAIN=$(git worktree list --porcelain | head -1 | cut -d' ' -f2)
+git -C "$MAIN" branch --show-current      # expect: master
+git -C "$MAIN" status --porcelain         # expect: empty
+git -C "$MAIN" merge --no-ff worktree-comment-convention-enforcement-plan
+python3 "$MAIN/architecture/scripts/validate_architecture.py" --root "$MAIN"
 ```
 
 Expected: `architecture validation passed`.
+
+If `branch --show-current` is not `master`, stop: you are not in the checkout that holds it. If `status --porcelain` is not empty, deal with that first — merging into a dirty tree is how unrelated work ends up inside this commit.
 
 If it instead reports `evidence hash does not resolve to a commit`, the merge did not preserve the branch's commits — the merge was squashed or rebased. **Do not push.** Reset `master` back and redo the merge with `--no-ff`; every evidence hash must resolve from `master` before this reaches CI, because after that the failure is permanent.
 
