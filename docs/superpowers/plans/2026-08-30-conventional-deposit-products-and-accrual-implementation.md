@@ -28,8 +28,8 @@ services/funds-core/src/main/java/com/corebanking/funds/domain/product/
 services/funds-core/src/main/java/com/corebanking/funds/application/accrual/
 services/funds-core/src/main/java/com/corebanking/funds/application/deposit/
 services/funds-core/src/main/java/com/corebanking/funds/infrastructure/postgres/JdbcDepositContractRepository.java
-services/funds-core/src/main/resources/db/migration/V006__deposit_contracts.sql
-services/funds-core/src/main/resources/db/migration/V007__accrual_facts.sql
+services/funds-core/src/main/resources/db/migration/V007__deposit_contracts.sql
+services/funds-core/src/main/resources/db/migration/V008__accrual_facts.sql
 services/txn-orchestrator/internal/workflows/deposit_schedule.go
 test/acceptance/conventional_deposits.sh
 ```
@@ -46,7 +46,7 @@ test/acceptance/conventional_deposits.sh
 
 ### Task 2: Open deposit contracts atomically
 
-- [ ] Create V006 for `deposit_contract`, maturity instruction and immutable contract-version binding. Customer ledger account plus contract must commit together.
+- [ ] Create V007 for `deposit_contract`, maturity instruction and immutable contract-version binding. Customer ledger account plus contract must commit together.
 - [ ] Test savings/current/fixed opening; reject inactive/future product versions, currency mismatch, missing maturity for fixed deposit and fixed maturity before value date.
 - [ ] Current accounts may declare approved overdraft; savings/fixed default to zero authorised floor unless their product explicitly permits otherwise.
 - [ ] Publish `DepositContractOpened` atomically without putting PII/account number in headers.
@@ -62,7 +62,7 @@ test/acceptance/conventional_deposits.sh
 
 ### Task 4: Persist idempotent accrual facts and journals
 
-- [ ] Create V007 `accrual_run`, `accrual_fact`, checkpoint and unique `(contract_id, accrual_date, rule_version)` constraints.
+- [ ] Create V008 `accrual_run`, `accrual_fact`, checkpoint and unique `(contract_id, accrual_date, rule_version)` constraints.
 - [ ] Write integration tests for debit interest expense / credit accrued-interest payable, zero-accrual policy, closed period, account restriction and duplicate/crash retry.
 - [ ] Commit each bounded page under deterministic commands. Partial job failure leaves completed facts intact and resumes after its durable last key; it never marks the whole date complete until coverage proves.
 - [ ] Independently aggregate facts and journals to prove recognised expense equals payable movement per currency.
