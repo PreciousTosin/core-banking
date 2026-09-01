@@ -1,6 +1,7 @@
 package com.corebanking.funds.application;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -272,19 +273,9 @@ class AcceptanceHardeningIT {
                 SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-16 00:00:00+00'
                 WHERE chart_version_id = ?
                 """, nextChart));
-
-            connection.setAutoCommit(false);
-            execute(connection, """
-                UPDATE funds.chart_version
-                SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-16 00:00:00+00'
-                WHERE chart_version_id = ?
-                """, TestPostingStack.CHART_VERSION_ID);
-            execute(connection, """
-                UPDATE funds.chart_version
-                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-16 00:00:00+00'
-                WHERE chart_version_id = ?
-                """, nextChart);
-            connection.commit();
+            rotateChart(connection, TestPostingStack.BOOK_ID,
+                TestPostingStack.CHART_VERSION_ID, nextChart,
+                Instant.parse("2026-01-16T00:00:00Z"));
             assertConstraint("ledger_account_chart_mapping_frozen",
                 () -> executeInRollback(connection, """
                     UPDATE funds.ledger_account_chart_mapping SET account_class = 'EQUITY'
@@ -352,11 +343,15 @@ class AcceptanceHardeningIT {
                     """, TestPostingStack.uuid(1_149), TestPostingStack.BOOK_ID));
 
             createChartWithProviderMappingOnly(connection, partialChart);
-            assertConstraint("chart_mapping_incomplete", () -> executeInRollback(connection, """
-                UPDATE funds.chart_version
-                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-                WHERE chart_version_id = ?
-                """, partialChart));
+            assertConstraint("chart_mapping_incomplete", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                partialChart, Instant.parse("2026-01-10T00:00:00Z")));
+            assertEquals("ACTIVE", queryString(connection,
+                "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+                TestPostingStack.CHART_VERSION_ID));
+            assertEquals("DRAFT", queryString(connection,
+                "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+                partialChart));
             execute(connection, """
                 INSERT INTO funds.ledger_account_chart_mapping
                     (account_id, book_id, chart_version_id, account_code, account_currency,
@@ -369,18 +364,9 @@ class AcceptanceHardeningIT {
                 WHERE chart_version_id = ? AND account_id = ?
                 """, partialChart, TestPostingStack.CHART_VERSION_ID,
                 TestPostingStack.CUSTOMER_LIABILITY);
-            connection.setAutoCommit(false);
-            execute(connection, """
-                UPDATE funds.chart_version
-                SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-                WHERE chart_version_id = ?
-                """, TestPostingStack.CHART_VERSION_ID);
-            execute(connection, """
-                UPDATE funds.chart_version
-                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-                WHERE chart_version_id = ?
-                """, partialChart);
-            connection.commit();
+            rotateChart(connection, TestPostingStack.BOOK_ID,
+                TestPostingStack.CHART_VERSION_ID, partialChart,
+                Instant.parse("2026-01-10T00:00:00Z"));
         }
 
         PostingResult governed = postingService.post(command(
@@ -392,15 +378,366 @@ class AcceptanceHardeningIT {
     }
 
     @Test
-    void repeatableReadActivationSerializesAgainstAConcurrentMappingDeletion()
+    void governedChartRotationRejectsHistoricalAndInvalidEffectiveBoundsAtomically()
+        throws SQLException {
+        postingService.post(command(
+            TestPostingStack.uuid(1_153), TestPostingStack.uuid(1_154),
+            TestPostingStack.CHART_VERSION_ID,
+            Instant.parse("2026-01-15T10:00:00Z"), LocalDate.of(2026, 1, 15), null,
+            100));
+        UUID candidateChart = TestPostingStack.uuid(1_155);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidate(connection, candidateChart);
+
+            assertConstraint("chart_rotation_historical_cutoff", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                candidateChart, Instant.parse("2026-01-15T10:00:00Z")));
+            assertConstraint("chart_rotation_effective_bounds", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                candidateChart, Instant.parse("2025-12-31T23:59:59Z")));
+            assertConstraint("chart_rotation_effective_bounds", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                candidateChart, Instant.parse("2099-01-01T00:00:00Z")));
+        }
+
+        assertEquals("ACTIVE", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            TestPostingStack.CHART_VERSION_ID));
+        assertEquals("DRAFT", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            candidateChart));
+    }
+
+    @Test
+    void governedChartRotationRequiresDistinctExistingLifecycleRowsForOneBook()
+        throws SQLException {
+        UUID candidateChart = TestPostingStack.uuid(1_156);
+        UUID otherBook = TestPostingStack.uuid(1_157);
+        UUID otherChart = TestPostingStack.uuid(1_158);
+        UUID olderChart = TestPostingStack.uuid(1_160);
+        UUID futureChart = TestPostingStack.uuid(1_161);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidate(connection, candidateChart);
+            execute(connection, """
+                INSERT INTO funds.book
+                    (book_id, legal_entity_id, functional_currency, timezone, calendar_code,
+                     accounting_policy_version)
+                VALUES (?, ?, 'NGN', 'Africa/Lagos', 'NG', 1)
+                """, otherBook, TestPostingStack.uuid(1_159));
+            execute(connection, """
+                INSERT INTO funds.chart_version
+                    (chart_version_id, book_id, version, status, approval_reference)
+                VALUES (?, ?, 2, 'DRAFT', 'APP-OTHER-CANDIDATE')
+                """, otherChart, otherBook);
+            execute(connection, """
+                INSERT INTO funds.chart_version
+                    (chart_version_id, book_id, version, status, approval_reference)
+                VALUES (?, ?, 1, 'DRAFT', 'APP-OLDER-CANDIDATE')
+                """, olderChart, otherBook);
+
+            assertConstraint("chart_rotation_distinct_versions", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                TestPostingStack.CHART_VERSION_ID,
+                Instant.parse("2026-01-10T00:00:00Z")));
+            assertConstraint("chart_rotation_versions_exist", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                TestPostingStack.uuid(9_999), Instant.parse("2026-01-10T00:00:00Z")));
+            assertConstraint("chart_rotation_book_exists", () -> rotateChart(
+                connection, TestPostingStack.uuid(9_998),
+                TestPostingStack.CHART_VERSION_ID, candidateChart,
+                Instant.parse("2026-01-10T00:00:00Z")));
+            assertConstraint("chart_rotation_identifiers_required", () -> rotateChart(
+                connection, null, TestPostingStack.CHART_VERSION_ID, candidateChart,
+                Instant.parse("2026-01-10T00:00:00Z")));
+            assertConstraint("chart_rotation_effective_time_required", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                candidateChart, null));
+            assertConstraint("chart_rotation_book_consistency", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, TestPostingStack.CHART_VERSION_ID,
+                otherChart, Instant.parse("2026-01-10T00:00:00Z")));
+            assertConstraint("chart_rotation_current_active", () -> rotateChart(
+                connection, TestPostingStack.BOOK_ID, candidateChart,
+                TestPostingStack.CHART_VERSION_ID,
+                Instant.parse("2026-01-10T00:00:00Z")));
+
+            execute(connection, """
+                UPDATE funds.chart_version
+                SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+                WHERE chart_version_id = ?
+                """, otherChart);
+            assertConstraint("chart_rotation_version_order", () -> rotateChart(
+                connection, otherBook, otherChart, olderChart,
+                Instant.parse("2026-01-10T00:00:00Z")));
+            execute(connection, """
+                INSERT INTO funds.chart_version
+                    (chart_version_id, book_id, version, status, approval_reference)
+                VALUES (?, ?, 3, 'DRAFT', 'APP-FUTURE-CANDIDATE')
+                """, futureChart, otherBook);
+            rotateChart(connection, otherBook, otherChart, futureChart,
+                Instant.parse("2026-01-10T00:00:00Z"));
+            assertConstraint("chart_rotation_candidate_draft", () -> rotateChart(
+                connection, otherBook, futureChart, otherChart,
+                Instant.parse("2026-01-11T00:00:00Z")));
+        }
+
+        assertEquals("ACTIVE", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            TestPostingStack.CHART_VERSION_ID));
+        assertEquals("DRAFT", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            candidateChart));
+    }
+
+    @RepeatedTest(5)
+    void governedChartRotationDoesNotDeadlockWithCandidateMappingInsert() throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_159);
+        UUID closedAccount = TestPostingStack.uuid(1_158);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidate(connection, candidateChart);
+            execute(connection, """
+                INSERT INTO funds.ledger_account
+                    (account_id, book_id, account_scope, product_version_id,
+                     currency, status, created_at)
+                VALUES (?, ?, 'INTERNAL', NULL, 'NGN', 'CLOSED', CURRENT_TIMESTAMP)
+                """, closedAccount, TestPostingStack.BOOK_ID);
+        }
+
+        SQLException rotationFailure = raceGovernedRotationWithCandidateMutation(
+            candidateChart, connection -> execute(connection, """
+                INSERT INTO funds.ledger_account_chart_mapping
+                    (account_id, book_id, chart_version_id, account_code, account_currency,
+                     account_class, normal_balance, control_account_code, account_role)
+                VALUES (?, ?, ?, 'CLOSED-INTERNAL', 'NGN', 'ASSET', 'DEBIT',
+                        'CLOSED-INTERNAL', 'INTERNAL')
+                """, closedAccount, TestPostingStack.BOOK_ID, candidateChart));
+
+        assertNull(rotationFailure);
+        assertSuccessfulRotation(candidateChart);
+        assertEquals(1, queryLong("""
+            SELECT count(*) FROM funds.ledger_account_chart_mapping
+            WHERE account_id = ? AND chart_version_id = ?
+            """, closedAccount, candidateChart));
+    }
+
+    @RepeatedTest(5)
+    void governedChartRotationDoesNotDeadlockWithCandidateMappingUpdate() throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_160);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidate(connection, candidateChart);
+        }
+
+        SQLException rotationFailure = raceGovernedRotationWithCandidateMutation(
+            candidateChart, connection -> execute(connection, """
+                UPDATE funds.ledger_account_chart_mapping
+                SET account_class = 'EQUITY'
+                WHERE account_id = ? AND chart_version_id = ?
+                """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
+
+        assertNull(rotationFailure);
+        assertSuccessfulRotation(candidateChart);
+        assertEquals("EQUITY", queryString("""
+            SELECT account_class FROM funds.ledger_account_chart_mapping
+            WHERE account_id = ? AND chart_version_id = ?
+            """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
+    }
+
+    @RepeatedTest(5)
+    void governedChartRotationDoesNotDeadlockWithCandidateMappingDelete() throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_161);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidate(connection, candidateChart);
+        }
+
+        SQLException rotationFailure = raceGovernedRotationWithCandidateMutation(
+            candidateChart, connection -> execute(connection, """
+                DELETE FROM funds.ledger_account_chart_mapping
+                WHERE account_id = ? AND chart_version_id = ?
+                """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
+
+        assertTrue(rotationFailure instanceof PSQLException,
+            "expected governed completeness rejection but received " + rotationFailure);
+        PSQLException postgresFailure = (PSQLException) rotationFailure;
+        assertEquals("23514", postgresFailure.getSQLState());
+        assertEquals("chart_mapping_incomplete",
+            postgresFailure.getServerErrorMessage().getConstraint());
+        assertEquals("ACTIVE", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            TestPostingStack.CHART_VERSION_ID));
+        assertEquals("DRAFT", queryString(
+            "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
+            candidateChart));
+        assertEquals(1, queryLong("""
+            SELECT count(*) FROM funds.ledger_account_chart_mapping
+            WHERE chart_version_id = ?
+            """, candidateChart));
+    }
+
+    @Test
+    void directJournalGovernanceWaitsForChartBeforeBookDuringRotation() throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_162);
+        try (var connection = dataSource.getConnection()) {
+            createCompleteCandidate(connection, candidateChart);
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<SQLException> rotation = null;
+        Future<SQLException> journalInsert = null;
+        try (var candidateBlocker = dataSource.getConnection();
+             var rotationConnection = dataSource.getConnection();
+             var journalConnection = dataSource.getConnection()) {
+            candidateBlocker.setAutoCommit(false);
+            queryLong(candidateBlocker, """
+                SELECT governance_revision
+                FROM funds.chart_version WHERE chart_version_id = ? FOR UPDATE
+                """, candidateChart);
+
+            rotationConnection.setAutoCommit(false);
+            int rotationPid = (int) queryLong(
+                rotationConnection, "SELECT pg_backend_pid()");
+            rotation = executor.submit(() -> {
+                try {
+                    rotateChart(rotationConnection, TestPostingStack.BOOK_ID,
+                        TestPostingStack.CHART_VERSION_ID, candidateChart,
+                        Instant.parse("2026-01-10T00:00:00Z"));
+                    rotationConnection.commit();
+                    return null;
+                } catch (SQLException failure) {
+                    rotationConnection.rollback();
+                    return failure;
+                }
+            });
+            awaitBackendLock(rotationPid, rotation);
+
+            int journalPid = (int) queryLong(journalConnection, "SELECT pg_backend_pid()");
+            journalInsert = executor.submit(() -> {
+                try {
+                    insertDirectJournal(
+                        journalConnection, TestPostingStack.uuid(1_163),
+                        TestPostingStack.uuid(1_164), TestPostingStack.BOOK_ID,
+                        TestPostingStack.CHART_VERSION_ID, TestPostingStack.PERIOD_ID,
+                        Instant.parse("2026-01-15T10:00:00Z"),
+                        LocalDate.of(2026, 1, 15), null, "DIRECT");
+                    return null;
+                } catch (SQLException failure) {
+                    return failure;
+                }
+            });
+            awaitBackendLock(journalPid, journalInsert);
+
+            candidateBlocker.commit();
+            SQLException rotationFailure = rotation.get(5, TimeUnit.SECONDS);
+            SQLException journalFailure = journalInsert.get(5, TimeUnit.SECONDS);
+            assertTrue(rotationFailure == null || !"40P01".equals(rotationFailure.getSQLState()),
+                "rotation deadlocked against direct journal governance: " + rotationFailure);
+            assertTrue(journalFailure == null || !"40P01".equals(journalFailure.getSQLState()),
+                "direct journal governance deadlocked against rotation: " + journalFailure);
+            assertNull(rotationFailure);
+            assertTrue(journalFailure instanceof PSQLException,
+                "expected retired-chart rejection but received " + journalFailure);
+            PSQLException postgresFailure = (PSQLException) journalFailure;
+            assertEquals("23514", postgresFailure.getSQLState());
+            assertEquals("journal_effective_chart",
+                postgresFailure.getServerErrorMessage().getConstraint());
+        } finally {
+            if (rotation != null && !rotation.isDone()) {
+                rotation.cancel(true);
+            }
+            if (journalInsert != null && !journalInsert.isDone()) {
+                journalInsert.cancel(true);
+            }
+            executor.shutdownNow();
+        }
+    }
+
+    private SQLException raceGovernedRotationWithCandidateMutation(
+        UUID candidateChart,
+        ConnectionSqlAction candidateMutation
+    ) throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<SQLException> mapping = null;
+        Future<SQLException> rotation = null;
+        try (var bookBlocker = dataSource.getConnection();
+             var rotationConnection = dataSource.getConnection();
+             var mappingConnection = dataSource.getConnection()) {
+            bookBlocker.setAutoCommit(false);
+            queryLong(bookBlocker, """
+                SELECT chart_governance_revision
+                FROM funds.book
+                WHERE book_id = ?
+                FOR UPDATE
+                """, TestPostingStack.BOOK_ID);
+
+            mappingConnection.setAutoCommit(false);
+            int mappingBackendPid = (int) queryLong(
+                mappingConnection, "SELECT pg_backend_pid()");
+            mapping = executor.submit(() -> {
+                try {
+                    candidateMutation.run(mappingConnection);
+                    mappingConnection.commit();
+                    return null;
+                } catch (SQLException failure) {
+                    mappingConnection.rollback();
+                    return failure;
+                }
+            });
+            awaitBackendLock(mappingBackendPid, mapping);
+
+            rotationConnection.setAutoCommit(false);
+            int rotationBackendPid = (int) queryLong(
+                rotationConnection, "SELECT pg_backend_pid()");
+            rotation = executor.submit(() -> {
+                try {
+                    rotateChart(rotationConnection, TestPostingStack.BOOK_ID,
+                        TestPostingStack.CHART_VERSION_ID, candidateChart,
+                        Instant.parse("2026-01-10T00:00:00Z"));
+                    rotationConnection.commit();
+                    return null;
+                } catch (SQLException failure) {
+                    rotationConnection.rollback();
+                    return failure;
+                }
+            });
+
+            awaitBackendLock(rotationBackendPid, rotation);
+
+            assertEquals(1, queryLong(bookBlocker, """
+                SELECT count(*)
+                FROM unnest(pg_blocking_pids(?)) AS blocker(pid)
+                WHERE blocker.pid = ?
+                """, rotationBackendPid, mappingBackendPid),
+                "rotation must wait on the candidate-chart lock acquired by mapping DML");
+
+            bookBlocker.commit();
+            SQLException mutationFailure = mapping.get(5, TimeUnit.SECONDS);
+            SQLException rotationFailure = rotation.get(5, TimeUnit.SECONDS);
+
+            assertNull(mutationFailure,
+                "candidate mapping mutation must have a defined successful outcome");
+            assertTrue(rotationFailure == null || !"40P01".equals(rotationFailure.getSQLState()),
+                "governed rotation deadlocked: " + rotationFailure);
+            return rotationFailure;
+        } finally {
+            if (mapping != null && !mapping.isDone()) {
+                mapping.cancel(true);
+            }
+            if (rotation != null && !rotation.isDone()) {
+                rotation.cancel(true);
+            }
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void repeatableReadGovernedRotationSerializesAgainstAConcurrentMappingDeletion()
         throws Exception {
         UUID candidateChart = TestPostingStack.uuid(1_160);
         try (var connection = dataSource.getConnection()) {
-            createCompleteCandidateAndRetireCurrent(connection, candidateChart);
+            createCompleteCandidate(connection, candidateChart);
         }
 
-        SQLException activationFailure = raceRepeatableReadActivation(
-            candidateChart, connection -> execute(connection, """
+        SQLException activationFailure = raceGovernedRotation(
+            candidateChart, Connection.TRANSACTION_REPEATABLE_READ,
+            connection -> execute(connection, """
                 DELETE FROM funds.ledger_account_chart_mapping
                 WHERE account_id = ? AND chart_version_id = ?
                 """, TestPostingStack.CUSTOMER_LIABILITY, candidateChart));
@@ -453,14 +790,14 @@ class AcceptanceHardeningIT {
     }
 
     @Test
-    void readCommittedActivationRevalidatesAfterConcurrentMappingDeletion()
+    void readCommittedGovernedRotationRevalidatesAfterConcurrentMappingDeletion()
         throws Exception {
         UUID candidateChart = TestPostingStack.uuid(1_180);
         try (var connection = dataSource.getConnection()) {
-            createCompleteCandidateAndRetireCurrent(connection, candidateChart);
+            createCompleteCandidate(connection, candidateChart);
         }
 
-        SQLException activationFailure = raceActivation(
+        SQLException activationFailure = raceGovernedRotation(
             candidateChart, Connection.TRANSACTION_READ_COMMITTED,
             connection -> execute(connection, """
                 DELETE FROM funds.ledger_account_chart_mapping
@@ -959,6 +1296,18 @@ class AcceptanceHardeningIT {
         Connection connection,
         UUID chartVersionId
     ) throws SQLException {
+        createCompleteCandidate(connection, chartVersionId);
+        execute(connection, """
+            UPDATE funds.chart_version
+            SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+            WHERE chart_version_id = ?
+            """, TestPostingStack.CHART_VERSION_ID);
+    }
+
+    private static void createCompleteCandidate(
+        Connection connection,
+        UUID chartVersionId
+    ) throws SQLException {
         createChartWithProviderMappingOnly(connection, chartVersionId);
         execute(connection, """
             INSERT INTO funds.ledger_account_chart_mapping
@@ -972,11 +1321,6 @@ class AcceptanceHardeningIT {
             WHERE chart_version_id = ? AND account_id = ?
             """, chartVersionId, TestPostingStack.CHART_VERSION_ID,
             TestPostingStack.CUSTOMER_LIABILITY);
-        execute(connection, """
-            UPDATE funds.chart_version
-            SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-            WHERE chart_version_id = ?
-            """, TestPostingStack.CHART_VERSION_ID);
     }
 
     private static void insertDirectBalancedJournal(
@@ -1099,6 +1443,12 @@ class AcceptanceHardeningIT {
         }
     }
 
+    private long queryLong(String sql, Object... values) throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            return queryLong(connection, sql, values);
+        }
+    }
+
     private String queryString(String sql, Object... values) throws SQLException {
         try (var connection = dataSource.getConnection()) {
             return queryString(connection, sql, values);
@@ -1123,7 +1473,7 @@ class AcceptanceHardeningIT {
         while (System.nanoTime() < deadline) {
             if (operation.isDone()) {
                 throw new AssertionError(
-                    "activation completed without waiting for the mapping mutation");
+                    "governed database operation completed before the expected lock wait");
             }
             try (var connection = dataSource.getConnection()) {
                 if (queryLong(connection, """
@@ -1135,7 +1485,7 @@ class AcceptanceHardeningIT {
             }
             Thread.onSpinWait();
         }
-        throw new AssertionError("activation did not block on the chart governance row");
+        throw new AssertionError("governed database operation did not reach its expected lock");
     }
 
     private void awaitBackendLockOrCompletion(int backendPid, Future<?> operation)
@@ -1166,10 +1516,29 @@ class AcceptanceHardeningIT {
             chartVersionId, Connection.TRANSACTION_REPEATABLE_READ, concurrentMutation);
     }
 
+    private SQLException raceGovernedRotation(
+        UUID chartVersionId,
+        int transactionIsolation,
+        ConnectionSqlAction concurrentMutation
+    ) throws Exception {
+        return raceChartLifecycle(
+            chartVersionId, transactionIsolation, concurrentMutation, true);
+    }
+
     private SQLException raceActivation(
         UUID chartVersionId,
         int transactionIsolation,
         ConnectionSqlAction concurrentMutation
+    ) throws Exception {
+        return raceChartLifecycle(
+            chartVersionId, transactionIsolation, concurrentMutation, false);
+    }
+
+    private SQLException raceChartLifecycle(
+        UUID chartVersionId,
+        int transactionIsolation,
+        ConnectionSqlAction concurrentMutation,
+        boolean governedRotation
     ) throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         Future<SQLException> activation = null;
@@ -1184,12 +1553,18 @@ class AcceptanceHardeningIT {
                 activationConnection, "SELECT pg_backend_pid()");
             activation = executor.submit(() -> {
                 try {
-                    execute(activationConnection, """
-                        UPDATE funds.chart_version
-                        SET status = 'ACTIVE',
-                            activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
-                        WHERE chart_version_id = ?
-                        """, chartVersionId);
+                    if (governedRotation) {
+                        rotateChart(activationConnection, TestPostingStack.BOOK_ID,
+                            TestPostingStack.CHART_VERSION_ID, chartVersionId,
+                            Instant.parse("2026-01-10T00:00:00Z"));
+                    } else {
+                        execute(activationConnection, """
+                            UPDATE funds.chart_version
+                            SET status = 'ACTIVE',
+                                activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                            WHERE chart_version_id = ?
+                            """, chartVersionId);
+                    }
                     activationConnection.commit();
                     return null;
                 } catch (SQLException failure) {
@@ -1218,6 +1593,41 @@ class AcceptanceHardeningIT {
             try (var rows = statement.executeQuery()) {
                 rows.next();
                 return rows.getString(1);
+            }
+        }
+    }
+
+    private void assertSuccessfulRotation(UUID candidateChart) throws SQLException {
+        assertEquals(2, queryLong("""
+            SELECT count(*)
+            FROM funds.chart_version
+            WHERE (chart_version_id = ? AND status = 'RETIRED'
+                   AND retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00')
+               OR (chart_version_id = ? AND status = 'ACTIVE'
+                   AND activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00')
+            """, TestPostingStack.CHART_VERSION_ID, candidateChart));
+        assertEquals(1, queryLong("""
+            SELECT count(*) FROM funds.chart_version
+            WHERE book_id = ? AND status = 'ACTIVE'
+            """, TestPostingStack.BOOK_ID));
+    }
+
+    private static void rotateChart(
+        Connection connection,
+        UUID bookId,
+        UUID currentChart,
+        UUID candidateChart,
+        Instant effectiveAt
+    ) throws SQLException {
+        try (var statement = connection.prepareStatement(
+            "SELECT funds.rotate_chart_version(?, ?, ?, ?)")) {
+            statement.setObject(1, bookId);
+            statement.setObject(2, currentChart);
+            statement.setObject(3, candidateChart);
+            statement.setObject(4,
+                effectiveAt == null ? null : effectiveAt.atOffset(ZoneOffset.UTC));
+            try (var rows = statement.executeQuery()) {
+                rows.next();
             }
         }
     }

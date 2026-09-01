@@ -49,7 +49,7 @@ class MigrationUpgradeIT {
     private static final UUID LEGACY_REVERSAL_JOURNAL = uuid(33);
 
     @Test
-    void v005BackfillsHistoricalProductClassificationChartMappingAndJournalPin()
+    void v006PreservesTheAuthenticV005UpgradeWhileAddingGovernedRotation()
         throws Exception {
         try (var postgres = new PostgreSQLContainer(
             DockerImageName.parse("postgres:18.6-bookworm"))
@@ -63,6 +63,7 @@ class MigrationUpgradeIT {
                 MigrationVersion.fromVersion("004"),
                 throughV004.info().current().getVersion());
 
+            String preservedJournalHash;
             try (Connection connection = DriverManager.getConnection(
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
                 seedV004History(connection);
@@ -108,6 +109,9 @@ class MigrationUpgradeIT {
                     JOIN funds.journal journal ON journal.command_id = command.command_id
                     WHERE command.command_id = ?
                     """, uuid(9)));
+                preservedJournalHash = queryString(connection, """
+                    SELECT canonical_hash FROM funds.journal WHERE journal_id = ?
+                    """, JOURNAL);
 
                 execute(connection, """
                     INSERT INTO funds.product_version
@@ -124,6 +128,31 @@ class MigrationUpgradeIT {
                       ON version.product_version_id = account.product_version_id
                     WHERE account.account_id = ?
                     """, CUSTOMER));
+            }
+
+            Flyway throughV006 = flyway(postgres, MigrationVersion.fromVersion("006"));
+            throughV006.migrate();
+            assertEquals(
+                MigrationVersion.fromVersion("006"),
+                throughV006.info().current().getVersion());
+            try (Connection connection = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
+                assertEquals(preservedJournalHash, queryString(connection, """
+                    SELECT canonical_hash FROM funds.journal WHERE journal_id = ?
+                    """, JOURNAL));
+                assertEquals("V004_OPAQUE/V004_V1", queryString(connection, """
+                    SELECT command.request_hash_scheme || '/' || journal.canonical_hash_scheme
+                    FROM funds.idempotency_command command
+                    JOIN funds.journal journal ON journal.command_id = command.command_id
+                    WHERE command.command_id = ?
+                    """, uuid(9)));
+                assertEquals(1, queryLong(connection, """
+                    SELECT count(*)
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = 'funds'
+                      AND procedure.proname = 'rotate_chart_version'
+                    """));
             }
 
             proveMigratedReplayAndReversal(postgres);

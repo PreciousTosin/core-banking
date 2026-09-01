@@ -205,6 +205,9 @@ class MigrationIT {
             assertFalse(queryBoolean(connection, """
                 SELECT has_table_privilege('funds_app', 'funds.accounting_period', 'UPDATE')
                 """));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_table_privilege('funds_app', 'funds.chart_version', 'UPDATE')
+                """));
             assertTrue(queryBoolean(connection, """
                 SELECT has_sequence_privilege(
                     'funds_app', 'funds.journal_journal_sequence_seq', 'USAGE')
@@ -220,6 +223,12 @@ class MigrationIT {
             assertFalse(queryBoolean(connection, """
                 SELECT has_function_privilege(
                     'funds_app', 'funds.reject_ledger_mutation()', 'EXECUTE')
+                """));
+            assertFalse(queryBoolean(connection, """
+                SELECT has_function_privilege(
+                    'funds_app',
+                    'funds.rotate_chart_version(uuid,uuid,uuid,timestamp with time zone)',
+                    'EXECUTE')
                 """));
             assertEquals(5, queryInt(connection, """
                 SELECT count(*)
@@ -237,14 +246,13 @@ class MigrationIT {
                     WHERE namespace.nspname = 'funds'
                       AND has_function_privilege('funds_app', procedure.oid, 'EXECUTE')
                     """));
-            assertEquals(3, queryInt(connection, """
+            assertEquals(2, queryInt(connection, """
                 SELECT count(*)
                 FROM pg_proc procedure
                 JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
                 JOIN pg_language language ON language.oid = procedure.prolang
                 WHERE namespace.nspname = 'funds'
                   AND procedure.proname IN (
-                      'lock_book_chart_for_posting',
                       'lock_period_for_posting',
                       'lock_account_mapping_for_posting')
                   AND procedure.proisstrict
@@ -252,6 +260,17 @@ class MigrationIT {
                   AND language.lanname = 'sql'
                   AND procedure.prosrc ~ '^[[:space:]]*SELECT[[:space:]]'
                   AND position(';' IN procedure.prosrc) = 0
+                """));
+            assertEquals(1, queryInt(connection, """
+                SELECT count(*)
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                JOIN pg_language language ON language.oid = procedure.prolang
+                WHERE namespace.nspname = 'funds'
+                  AND procedure.proname = 'lock_book_chart_for_posting'
+                  AND procedure.proisstrict
+                  AND procedure.prosecdef
+                  AND language.lanname = 'plpgsql'
                 """));
             assertEquals(
                 "aggregate_id,aggregate_version,created_at,event_id,event_type,payload,schema_version",
@@ -286,6 +305,23 @@ class MigrationIT {
                 SELECT has_sequence_privilege(
                     'funds_proof_reader', 'funds.journal_journal_sequence_seq', 'USAGE')
                 """));
+
+            execute(connection, "SET ROLE funds_app");
+            try {
+                assertSqlStateRejected(connection, "42501", """
+                    UPDATE funds.chart_version SET status = 'RETIRED'
+                    WHERE chart_version_id = '00000000-0000-0000-0000-000000000002'
+                    """);
+                assertSqlStateRejected(connection, "42501", """
+                    SELECT funds.rotate_chart_version(
+                        '00000000-0000-0000-0000-000000000001',
+                        '00000000-0000-0000-0000-000000000002',
+                        '00000000-0000-0000-0000-000000000003',
+                        TIMESTAMPTZ '2026-01-10 00:00:00+00')
+                    """);
+            } finally {
+                execute(connection, "RESET ROLE");
+            }
 
             execute(connection, "SET ROLE funds_migrator");
             try {

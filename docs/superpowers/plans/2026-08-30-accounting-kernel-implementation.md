@@ -1318,7 +1318,7 @@ cd services/funds-core
 ./mvnw clean verify
 ```
 
-Expected: all unit, generated-property, PostgreSQL integration, injected-failure and child-process crash tests pass; no skipped accounting tests; Flyway validates the seven migration resources through additive `V005`.
+Expected: all unit, generated-property, PostgreSQL integration, injected-failure and child-process crash tests pass; no skipped accounting tests; Flyway validates the eight migration resources through additive governed-rotation `V006`.
 
 - [ ] **Step 4: Run a clean package and container smoke test**
 
@@ -1360,6 +1360,7 @@ git commit -m "docs(funds-core): complete accounting kernel slice"
 
 **Files:**
 - Create: `services/funds-core/src/main/resources/db/migration/V005__acceptance_hardening.sql`
+- Create: `services/funds-core/src/main/resources/db/migration/V006__governed_chart_rotation.sql`
 - Create/modify: command hashing, posting/reversal governance and persistence classes under `services/funds-core/src/main/java`
 - Create/modify: `AcceptanceHardeningIT`, posting/reversal/concurrency/migration/role/runtime tests
 - Modify: accounting-kernel architecture, README, health and role contracts
@@ -1372,6 +1373,8 @@ git commit -m "docs(funds-core): complete accounting kernel slice"
 
 Prove service and direct-DML rejection for Lagos-midnight booking dates, booking/value-period divergence, wrong-book and closed periods, stale policy/chart versions and incomplete chart mappings. Repeat the posting-versus-period-close lock race five times. Add version rotation and historical-classification fixtures. Prove a partial DRAFT chart cannot activate, a complete chart can rotate safely, and mapping insert/update/delete all reject after activation. Use two-connection repeatable-read races to prove concurrent mapping deletion, open-account creation, or candidate-chart creation makes a waiting governance operation serialize instead of committing a stale completeness decision, even when the candidate did not yet exist in the other transaction's snapshot. Prove direct ACTIVE chart creation and ungoverned open-account onboarding reject.
 
+Prove operational rotation is one atomic owner-governed operation. Race it against candidate mapping insert, update and delete in two PostgreSQL sessions for five repetitions each; require successful rotation or the named serialization/business rejection, never unhandled `40P01`, with lifecycle and completeness invariants intact. Prove direct-journal/posting governance takes chart locks before the stable book lock, and that wrong identities/books/states, non-forward versions, incomplete mappings, future/pre-activation boundaries and a boundary that would invalidate a historical journal all reject without partially retiring the current chart. Prove `funds_app` can neither update chart lifecycle columns nor execute rotation.
+
 For posting and reversal requests, mutate every financially relevant typed field while retaining the supplied hash and require a deterministic conflict before financial work. Prove a completed same-content replay still resolves after its period closes, chart retires or policy advances. Build an authentic V004 upgrade fixture with the exact V004 journal/request semantics, including same-code NGN/USD accounts and historical postings balanced independently in both currencies. After V005, prove distinct currency-qualified mappings, unchanged V004 hash bytes, same-content typed replay, recomputed-mutation conflict and exact reversal into a current period.
 
 Exercise the reversible envelope at 256/257 postings, 32/33 dimensions, 8,192/8,193 persisted dimension bytes and `Long.MIN_VALUE`. Require dimension JSON to be an object whose values are strings, matching the typed command contract, and prove both direct DML and a V004 upgrade containing non-string values reject. Prove generic posting rejects reversal metadata and direct DML cannot create alternate-type, duplicate or inexact reversals; prove an exact maximum-sized reversal succeeds.
@@ -1379,6 +1382,8 @@ Exercise the reversible envelope at 256/257 postings, 32/33 dimensions, 8,192/8,
 - [ ] **Step 2: Implement additive governance and typed hashes**
 
 Use additive `V005` to backfill product kind and finance principle onto immutable product versions, separate stable ledger-account identity from immutable currency-qualified per-chart mappings, pin every journal to one governed chart version, and add commit-time period/chart/reversal guards owned by `funds_migrator`. Require charts to begin in DRAFT, validate complete open-account mappings on activation and freeze mappings afterward. Live account onboarding/reopening after activation is explicitly deferred and rejected until a governed atomic workflow is delivered. Preserve historical classifications during chart and product rotation. Revoke or re-grant application capabilities so `funds_app` cannot bypass the new guards.
+
+Use additive `V006` for operational replacement. Lock every participating current/candidate chart row in canonical UUID order and the stable book row next; then revalidate the same book, current `ACTIVE` state, forward complete `DRAFT` candidate and half-open effective boundary before retiring and activating atomically. Mapping mutation, service posting and direct-journal guards use the same chart-before-book order. Leave the operation ungranted to runtime/proof roles; initial empty-book bootstrap and exceptional repair are trusted migration-owner actions, while every active-chart replacement uses the governed operation rather than two raw lifecycle updates.
 
 Version and domain-separate canonical encodings for posting and reversal typed commands, and persist explicit command/journal hash schemes. Keep migrated V004 bytes tagged and unchanged, verify them with the exact V004 algorithm, and compare migrated completed posting and reversal replays using typed V2 hashes reconstructed from verified journal facts rather than trusting the legacy opaque request hash. Freeze each durable scheme with a golden vector. Re-derive and verify new hashes inside the kernel, resolve completed replays before later governance validation, require a completed command/result cache to identify its own journal ID, sequence and canonical hash, and expose reversal linkage only through the trusted reversal-service path.
 

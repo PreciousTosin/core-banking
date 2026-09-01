@@ -18,6 +18,36 @@ Login roles and passwords are deployment-owned. Provision application and
 proof-reader logins outside Flyway and grant each login exactly the capability
 role it needs. Do not grant either login `funds_migrator`.
 
+## Governed chart rotation
+
+V006 makes operational chart replacement one owner-only database operation.
+The controlled operator assumes `funds_migrator` and executes:
+
+```sql
+BEGIN;
+SET LOCAL ROLE funds_migrator;
+SELECT funds.rotate_chart_version(
+    '<book-id>'::uuid,
+    '<current-active-chart-id>'::uuid,
+    '<complete-draft-chart-id>'::uuid,
+    '<effective-timestamp>'::timestamptz);
+COMMIT;
+```
+
+The operation locks both chart rows in UUID order and the stable book row next,
+then revalidates book ownership, forward lifecycle/version, complete mappings
+and the effective boundary before changing both statuses atomically. Validity is
+half-open: `[activated_at, retired_at)`. The boundary cannot predate activation,
+be in the future, or overlap an existing journal on the retiring chart.
+`funds_app` has neither chart lifecycle `UPDATE` nor operation `EXECUTE`, so the
+runtime cannot reproduce rotation with two raw statements.
+
+Initial empty-book bootstrap and exceptional repair remain trusted migration-
+owner actions. Like every PostgreSQL object owner, `funds_migrator` can alter
+objects or bypass ordinary grants; it is therefore a control-plane trust
+boundary, never an application credential. Once a book has an active chart,
+operators use the governed operation rather than raw lifecycle `UPDATE`.
+
 `funds_proof_reader` is an external, read-only proof-job capability, not the
 service's default datasource role. The in-process posting and proof APIs use the
 `funds_app` datasource; an independently scheduled proof job receives its own

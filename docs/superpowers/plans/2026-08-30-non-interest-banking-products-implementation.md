@@ -26,8 +26,8 @@
 services/funds-core/src/main/java/com/corebanking/funds/domain/noninterest/
 services/funds-core/src/main/java/com/corebanking/funds/application/noninterest/
 services/funds-core/src/main/java/com/corebanking/funds/infrastructure/postgres/JdbcInvestmentPoolRepository.java
-services/funds-core/src/main/resources/db/migration/V008__non_interest_products.sql
-services/funds-core/src/main/resources/db/migration/V009__investment_pool_allocation.sql
+services/funds-core/src/main/resources/db/migration/V009__non_interest_products.sql
+services/funds-core/src/main/resources/db/migration/V010__investment_pool_allocation.sql
 services/txn-orchestrator/internal/workflows/investment_pool.go
 test/acceptance/non_interest_products.sh
 ```
@@ -44,7 +44,7 @@ test/acceptance/non_interest_products.sh
 
 ### Task 2: Persist approved non-interest contracts and pools
 
-- [ ] Create V008 for governance approval, investment pool, pool ledger-account mapping, non-interest contract and immutable version binding.
+- [ ] Create V009 for governance approval, investment pool, pool ledger-account mapping, non-interest contract and immutable version binding.
 - [ ] Test one account belongs to at most one active investment pool for the same contract; pool control/asset/income/expense/reserve accounts cannot be shared with another pool unless an explicit allocation layer exists (excluded here).
 - [ ] Open non-remunerated current/safekeeping accounts without interest scheduling. Open Mudarabah investment accounts with pool membership and disclosed ratio/version.
 - [ ] Reject inactive approval, conventional template, currency mismatch, missing pool and unapproved principal/return guarantee.
@@ -52,7 +52,7 @@ test/acceptance/non_interest_products.sh
 
 ### Task 3: Record immutable participation units
 
-- [ ] Create V009 participation events (`SUBSCRIBE`, `WITHDRAW`, approved adjustment) and daily/cutoff weighted-unit facts with unique event identity.
+- [ ] Create V010 participation events (`SUBSCRIBE`, `WITHDRAW`, approved adjustment) and daily/cutoff weighted-unit facts with unique event identity.
 - [ ] Write state/property tests for mid-period subscriptions/withdrawals, restrictions, duplicate commands, same-time ordering and exact unit conservation.
 - [ ] Calculate weighted participation from immutable event intervals using exact integer/rational arithmetic. Wall-clock job time cannot alter weights.
 - [ ] Page events/contracts by stable key; independently replay unit balances at any cutoff.
