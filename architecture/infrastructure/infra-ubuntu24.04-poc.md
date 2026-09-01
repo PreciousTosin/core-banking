@@ -11,7 +11,7 @@ related_proposals:
 
 # Infrastructure Architecture: Single-VPS PoC on Ubuntu 24.04
 
-Parent document: @architecture/modern-core-banking-comprehensive-design-revised.md
+Parent architecture: [Architecture entry point](../../ARCHITECTURE.md)
 Summary: This document specifies the infrastructure blueprint required to deploy the Modern Core Banking PoC on a single Ubuntu 24.04 VPS. It translates the architecture decisions into concrete host requirements, container topology, storage composition, and operational runbooks that support reproducible PoC validation. Every requirement here is either traced to a section of the parent design or marked explicitly as a local decision.
 
 Governed proposal: [Full single-VM proof-of-concept platform](../proposals/README.md#full-poc-platform). The presence of this document, infrastructure manifests, or scripts is design evidence only; it is not evidence that a deployment exists or that an acceptance profile ran.
@@ -457,7 +457,7 @@ These manifests are not part of the single-VPS PoC evidence path. Nothing in §1
 
 ## 15) References
 
-- Parent design: @architecture/modern-core-banking-comprehensive-design-revised.md
+- Parent architecture: [Architecture entry point](../../ARCHITECTURE.md)
   - §6 system context; §7 service ownership and boundaries; §8.8 bitemporal fields; §8.14 account restrictions
   - §17.1–17.7 security, secrets, data protection, PoC identity minimum
   - §18.1–18.4 telemetry, business metrics, health endpoints, runbooks

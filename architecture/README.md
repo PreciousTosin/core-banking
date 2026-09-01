@@ -36,6 +36,10 @@ Archive material only after its current replacements, decision rationale,
 proposals, plans, or historical status have been reviewed and linked. Archived
 material remains history, never current authority.
 
+## Archive and migration evidence
+
+The [archived comprehensive design](archive/modern-core-banking-comprehensive-design-revised.md), [migration inventory](archive/comprehensive-design-migration-inventory.md), and [independent migration review](archive/comprehensive-design-migration-review.md) preserve source history and cutover evidence. They are non-authoritative; authority for current architecture remains with the [arc42 current-state documents](arc42/01-introduction-and-goals.md) and their sibling sections.
+
 <a id="architecture-review-checklist"></a>
 <!-- migration-source: 25 -->
 ## Architecture review checklist

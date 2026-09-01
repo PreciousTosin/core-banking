@@ -1,6 +1,6 @@
 # funds-core accounting kernel
 
-This Java 25/Quarkus module is the implemented proof-of-concept accounting kernel. It owns exact journal validation, serializable PostgreSQL posting, immutable journals and reference foundations, idempotency, reversals, independent accounting proofs, and transactional outbox rows. The broader service topology and later delivery slices remain described in the [architecture](../../architecture/modern-core-banking-comprehensive-design-revised.md) and [implementation plan](../../docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md).
+This Java 25/Quarkus module is the implemented proof-of-concept accounting kernel. It owns exact journal validation, serializable PostgreSQL posting, immutable journals and reference foundations, idempotency, reversals, independent accounting proofs, and transactional outbox rows. The broader service topology and later delivery slices remain described in the [architecture entry point](../../ARCHITECTURE.md) and [implementation plan](../../docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md).
 
 <a id="journal-posting-model"></a>
 <!-- migration-source: 08.02 -->

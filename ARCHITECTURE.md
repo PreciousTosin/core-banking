@@ -49,6 +49,10 @@ Current architecture is organized in these twelve arc42 views:
 The architecture index, ADR collection, diagrams, and proposals live under
 `architecture/`. Plans describe delivery rather than current system truth.
 
+## Historical source
+
+The [archived comprehensive design](architecture/archive/modern-core-banking-comprehensive-design-revised.md) is non-authoritative. Use the [migration inventory](architecture/archive/comprehensive-design-migration-inventory.md) to find each classified current, proposed, decision, service, plan, or historical destination.
+
 ## Proposed work
 
 Unimplemented designs belong in `architecture/proposals/`. An accepted ADR or

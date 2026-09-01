@@ -12,7 +12,7 @@
 
 **Tech Stack:** Java 25 LTS; Quarkus 3.33.3.1 LTS; Maven 3.9.16 wrapper; PostgreSQL 18.6; JDBC/Agroal; Flyway; JUnit 6 on the Quarkus-managed platform; a deterministic in-repository property-case generator; Testcontainers through Quarkus Dev Services.
 
-**Spec:** `architecture/modern-core-banking-comprehensive-design-revised.md`
+**Spec:** [Core banking architecture](../../../ARCHITECTURE.md)
 
 ## Global Constraints
 
