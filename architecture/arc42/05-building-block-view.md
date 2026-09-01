@@ -14,6 +14,8 @@ code_refs:
 
 # Building-block view
 
+<a id="account-building-block"></a>
+<!-- migration-source: 08.01 -->
 The [domain package](../../services/funds-core/src/main/java/com/corebanking/funds/domain/Money.java)
 contains accounting records and invariants. The
 [application package](../../services/funds-core/src/main/java/com/corebanking/funds/application/PostingService.java)

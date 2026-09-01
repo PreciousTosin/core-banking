@@ -12,6 +12,8 @@ code_refs:
 
 # Quality requirements
 
+<a id="accounting-proofs"></a>
+<!-- migration-source: 08.11 -->
 The implemented acceptance boundary in the
 [funds-core README](../../services/funds-core/README.md) covers exact money,
 balanced journals, serializable accounting updates, exact reversal,

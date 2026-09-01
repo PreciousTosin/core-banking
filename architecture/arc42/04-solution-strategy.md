@@ -12,12 +12,19 @@ code_refs:
 
 # Solution strategy
 
+<a id="financial-facts-and-intent"></a>
+<!-- migration-source: 04.01 -->
 Domain invariants and typed command hashes protect financial facts before
 persistence; PostgreSQL serializable transactions coordinate posting state.
 Flyway migrations establish the authoritative schema, roles, and database
 invariants. Corrections use linked exact reversals rather than rewriting an
 original journal. Independently sourced proofs compare immutable postings with
 materialised balance and control projections.
+
+<a id="closed-period-correction"></a>
+<!-- migration-source: 08.10::02 -->
+Closed-period corrections remain additive: they book in an open period and
+retain their link to the original immutable fact.
 
 Bounded runtime configuration is described in the
 [service README](../../services/funds-core/README.md). This is a kernel

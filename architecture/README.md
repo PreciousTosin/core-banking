@@ -17,6 +17,8 @@ cross-cutting decision. Service-local documentation owns detailed contracts and
 operating instructions, while arc42 retains system responsibilities and
 boundaries.
 
+<a id="architecture-review-checklist"></a>
+<!-- migration-source: 25 -->
 ## Update and review rules
 
 Update architecture artifacts when a change affects a boundary, invariant,

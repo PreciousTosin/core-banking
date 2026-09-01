@@ -17,6 +17,8 @@ not a complete bank. It preserves accounting facts through exact journal
 posting, reversal, balance maintenance, and proof. Its current acceptance
 boundary is the [funds-core README](../../services/funds-core/README.md).
 
+<a id="implemented-claim-boundary"></a>
+<!-- migration-source: 03.02 -->
 The kernel owns exact money, journal validation, posting, reversals, balances,
 chart governance, proofs, database roles, and outbox persistence. Developers
 and operators are the current human stakeholders. This PoC does not claim a

@@ -9,6 +9,7 @@ code_refs:
   - architecture/adr/template.md
 ---
 
+<a id="architecture-decisions-index"></a>
 # Decisions
 
 This is an index placeholder. The [ADR template](../adr/template.md) defines

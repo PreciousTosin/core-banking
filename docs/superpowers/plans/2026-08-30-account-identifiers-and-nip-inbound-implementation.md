@@ -51,6 +51,8 @@ test/acceptance/account_identifiers_and_inbound.sh
 - [ ] Run Java and Go encode/decode/hash tests and Protobuf breaking-change checks.
 - [ ] Commit: `feat(contracts): define account address and inbound evidence`
 
+<a id="account-opening-delivery-detail"></a>
+<!-- migration-source: 13.07.01 -->
 ### Task 2: Implement authoritative identifier lifecycle in Java
 
 **Files:** Create address application classes/repository, V005 and JUnit integration tests.
@@ -62,6 +64,8 @@ test/acceptance/account_identifiers_and_inbound.sh
 - [ ] Run `NubanTest`, migration/constraint tests and lifecycle concurrency tests five times.
 - [ ] Commit: `feat(funds-core): manage account identifier lifecycle`
 
+<a id="account-address-api-delivery-detail"></a>
+<!-- migration-source: 08.01.01::02 -->
 ### Task 3: Expose authoritative resolution and account details
 
 **Files:** Add authenticated gRPC handlers in funds-core; create Go projection and API tests.

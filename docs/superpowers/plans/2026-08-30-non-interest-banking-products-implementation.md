@@ -58,6 +58,8 @@ test/acceptance/non_interest_products.sh
 - [ ] Page events/contracts by stable key; independently replay unit balances at any cutoff.
 - [ ] Commit: `feat(non-interest): track investment participation exactly`
 
+<a id="pool-distribution-delivery-detail"></a>
+<!-- migration-source: 13.07.03 -->
 ### Task 4: Approve and freeze a pool-close result
 
 - [ ] Write tests for incomplete source period, unbalanced pool books, unapproved adjustments, changed evidence hash, cross-pool account and concurrent close commands.

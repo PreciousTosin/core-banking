@@ -55,6 +55,80 @@ class ValidatorTest(unittest.TestCase):
         for name in self.ARC42_FILES:
             self.write_arc42(name)
 
+    def write_inventory(self, rows):
+        return self.write(
+            "architecture/archive/comprehensive-design-migration-inventory.md",
+            "| Source key | Source heading | Covered blocks | Disposition | Destination map | Evidence | Rationale | Resolution |\n"
+            "|---|---|---|---|---|---|---|---|\n"
+            + "\n".join(rows)
+            + "\n",
+        )
+
+    def write_complete_migration_fixture(self):
+        self.write(
+            "architecture/modern-core-banking-comprehensive-design-revised.md",
+            "# Modern Core Banking System\n\n"
+            "## Comprehensive Architecture and Single-VPS Proof-of-Concept Design\n\n"
+            "**Status:** Architecture-review revision for PoC approval\n"
+            "**Version:** 3.1\n"
+            "**Date:** 2026-08-30\n"
+            "**Base currency:** NGN (Naira)\n"
+            "**Audience:** Architects, engineers, and reviewers\n\n---\n\n"
+            + "\n\n".join(
+                (
+                    f"## {section}. Section {section}\n\nCurrent paragraph.\n\nProposed paragraph."
+                    if section == 8
+                    else f"## {section}. Section {section}\n\nMaterial paragraph for section {section}."
+                )
+                for section in range(1, 28)
+            )
+            + "\n",
+        )
+        self.write(
+            "architecture/proposals/README.md",
+            '# Proposals\n<a id="full-poc-platform"></a>\n'
+            "<!-- migration-source: 08::02 -->\n"
+            "[Full PoC platform](full-poc-platform.md)\n",
+        )
+        self.write("architecture/proposals/full-poc-platform.md", "# Full PoC platform\n")
+        self.write("services/funds-core/README.md", "# Funds core\n")
+        rows = [
+            "| 00.document-preamble | Document title, status, version, date, currency, and audience preamble | P01; P02; P03 | historical-only | None | None | The source-document identity and revision metadata describe the archived publication itself; no maintained current or proposed destination is appropriate. | resolved |"
+        ]
+        for section in range(1, 28):
+            if section == 8:
+                self.write(
+                    "architecture/current-08.md",
+                    '# Current\n<a id="block-01"></a>\n<!-- migration-source: 08::01 -->\n',
+                )
+                rows.extend(
+                    [
+                        "| 08::01 | 8. Section 8 | B01 | current | B01=architecture/current-08.md#block-01 | services/funds-core/README.md | B01 is verified current behavior. | resolved |",
+                        "| 08::02 | 8. Section 8 | B02 | proposal | B02=architecture/proposals/README.md#full-poc-platform | None | B02 is an unimplemented design. | resolved |",
+                    ]
+                )
+                continue
+            self.write(
+                f"architecture/destination-{section:02d}.md",
+                f'# Destination {section}\n<a id="source-{section:02d}"></a>\n<!-- migration-source: {section:02d} -->\n',
+            )
+            resolution = "unresolved" if section == 27 else "resolved"
+            rows.append(
+                f"| {section:02d} | {section}. Section {section} | B01 | service-detail | B01=architecture/destination-{section:02d}.md#source-{section:02d} | None | B01 belongs in detailed service documentation. | {resolution} |"
+            )
+        self.write_inventory(rows)
+        return rows
+
+    def reset_migration_fixture(self):
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        return self.write_complete_migration_fixture()
+
+    def assert_migration_error(self, fragment):
+        errors = validator.validate_migration_inventory(self.root)
+        self.assertTrue(any(fragment in error for error in errors), errors)
+
     def test_metadata_requires_exact_arc42_collection(self):
         self.write_complete_arc42()
         self.write("architecture/arc42/unexpected.md", "# Unexpected\n")
@@ -264,6 +338,235 @@ class ValidatorTest(unittest.TestCase):
     def test_front_matter_parses_supported_subset(self):
         path = self.write("architecture/example.md", "---\ntitle: Example\nowners:\n  - architecture\nrelated_adrs: []\n---\n# Example\n")
         self.assertEqual({"title": "Example", "owners": ["architecture"], "related_adrs": []}, validator.parse_front_matter(path))
+
+    def test_migration_inventory_requires_sections_one_through_twenty_seven(self):
+        self.assertIn("migration", validator.CHECKS)
+        self.assertIn("migration", validator.VALIDATORS)
+        rows = self.write_complete_migration_fixture()
+        errors = validator.validate_migration_inventory(self.root)
+        self.assertEqual(1, sum("unresolved migration row" in error for error in errors), errors)
+        self.assertTrue(any("unresolved migration row 27" in error for error in errors), errors)
+        self.assertFalse(any("missing top-level source root" in error for error in errors), errors)
+        self.assertEqual(29, len(rows))
+
+        self.write_inventory([row for row in rows if not row.startswith("| 17 |")])
+        self.assert_migration_error("missing top-level source root 17")
+
+    def test_migration_inventory_enforces_reserved_document_preamble(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "omitted": [row for row in rows if not row.startswith("| 00.document-preamble |")],
+            "missing-token": [rows[0].replace("P01; P02; P03", "P01; P02"), *rows[1:]],
+            "extra-token": [rows[0].replace("P01; P02; P03", "P01; P02; P03; P04"), *rows[1:]],
+            "duplicate-token": [rows[0].replace("P01; P02; P03", "P01; P02; P02; P03"), *rows[1:]],
+            "other-zero-key": [*rows, rows[0].replace("00.document-preamble", "00.other")],
+            "wrong-disposition": [rows[0].replace("| historical-only |", "| current |"), *rows[1:]],
+            "wrong-destination": [rows[0].replace("| None | None |", "| P01=architecture/README.md#architecture | None |"), *rows[1:]],
+        }
+        for name, changed in cases.items():
+            with self.subTest(name=name):
+                if name != "omitted":
+                    self.reset_migration_fixture()
+                self.write_inventory(changed)
+                self.assert_migration_error("document preamble")
+
+    def test_migration_inventory_rejects_duplicate_malformed_and_unsupported_fields(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "duplicate": ([*rows, rows[1]], "duplicate source key 01"),
+            "malformed": ([rows[0], rows[1].replace("| 01 |", "| 1 |"), *rows[2:]], "malformed source key 1"),
+            "disposition": ([rows[0], rows[1].replace("| service-detail |", "| imagined |"), *rows[2:]], "unsupported disposition imagined"),
+            "resolution": ([rows[0], rows[1].replace("| resolved |", "| pending |"), *rows[2:]], "unsupported resolution pending"),
+        }
+        for name, (changed, error) in cases.items():
+            with self.subTest(name=name):
+                if name != "duplicate":
+                    self.reset_migration_fixture()
+                self.write_inventory(changed)
+                self.assert_migration_error(error)
+
+    def test_migration_inventory_requires_existing_destination_anchor_and_current_evidence(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "missing-destination": ([rows[0], rows[1].replace("architecture/destination-01.md", "architecture/missing.md"), *rows[2:]], "destination does not exist"),
+            "missing-anchor": ([rows[0], rows[1].replace("#source-01", "#missing"), *rows[2:]], "destination anchor does not exist"),
+            "missing-evidence": ([*rows[:8], rows[8].replace("services/funds-core/README.md", "services/funds-core/missing.md"), *rows[9:]], "current evidence does not exist"),
+        }
+        for name, (changed, error) in cases.items():
+            with self.subTest(name=name):
+                if name != "missing-destination":
+                    self.reset_migration_fixture()
+                self.write_inventory(changed)
+                self.assert_migration_error(error)
+
+    def test_migration_inventory_maps_every_non_historical_block_exactly_once(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "empty-map": ([rows[0], rows[1].replace("B01=architecture/destination-01.md#source-01", ""), *rows[2:]], "destination map must cover each block exactly once"),
+            "missing-block-map": ([*rows[:8], rows[8].replace("B01=architecture/current-08.md#block-01", "B02=architecture/current-08.md#block-01"), *rows[9:]], "destination map must cover each block exactly once"),
+            "duplicate-block-map": ([rows[0], rows[1].replace("B01=architecture/destination-01.md#source-01", "B01=architecture/destination-01.md#source-01; B01=architecture/destination-02.md#source-02"), *rows[2:]], "destination map must cover each block exactly once"),
+            "wrong-key-marker": (rows, "missing migration marker"),
+            "missing-marker": (rows, "missing migration marker"),
+        }
+        for name, (changed, error) in cases.items():
+            with self.subTest(name=name):
+                self.reset_migration_fixture()
+                if name == "wrong-key-marker":
+                    self.write("architecture/destination-01.md", '# Destination\n<a id="source-01"></a>\n<!-- migration-source: 02 -->\n')
+                elif name == "missing-marker":
+                    self.write("architecture/destination-01.md", '# Destination\n<a id="source-01"></a>\n')
+                else:
+                    self.write_inventory(changed)
+                self.assert_migration_error(error)
+
+        rows = self.reset_migration_fixture()
+        source = (self.root / "architecture/modern-core-banking-comprehensive-design-revised.md").read_text()
+        self.write("architecture/modern-core-banking-comprehensive-design-revised.md", source.replace("Material paragraph for section 7.", "First material block.\n\nSecond material block."))
+        self.write("architecture/destination-07-a.md", '# First\n<a id="first"></a>\n<!-- migration-source: 07 -->\n')
+        self.write("architecture/destination-07-b.md", '# Second\n<a id="second"></a>\n<!-- migration-source: 07 -->\n')
+        rows[7] = "| 07 | 7. Section 7 | B01; B02 | service-detail | B01=architecture/destination-07-a.md#first; B02=architecture/destination-07-b.md#second | None | Both blocks belong in exact service destinations. | resolved |"
+        self.write("architecture/destination-07.md", "# Superseded fixture destination\n")
+        self.write_inventory(rows)
+        errors = validator.validate_migration_inventory(self.root)
+        self.assertFalse(any("07" in error and "unresolved migration row" not in error for error in errors), errors)
+
+    def test_migration_inventory_marker_multiset_is_global_exact_and_code_aware(self):
+        self.write_complete_migration_fixture()
+        self.write(
+            "architecture/code-examples.md",
+            "```markdown\n<a id=\"fake\"></a>\n<!-- migration-source: 99 -->\n```\n"
+            "Inline `<!-- migration-source: 98 -->` syntax is inert.\n",
+        )
+        errors = validator.validate_migration_inventory(self.root)
+        self.assertFalse(any("98" in error or "99" in error for error in errors), errors)
+
+        cases = {
+            "orphan": ("architecture/orphan.md", '# Orphan\n<a id="extra"></a>\n<!-- migration-source: 01 -->\n', "unexpected migration marker"),
+            "duplicate": ("architecture/destination-01.md", '# Destination\n<a id="source-01"></a>\n<!-- migration-source: 01 -->\n<!-- migration-source: 01 -->\n', "duplicate migration marker"),
+            "wrong-anchor": ("architecture/destination-01.md", '# Destination\n<a id="wrong"></a>\n<!-- migration-source: 01 -->\n<a id="source-01"></a>\n', "migration marker mismatch"),
+            "stale-provisional": ("architecture/adr/README.md", '# ADR\n<a id="temporary-01"></a>\n<!-- migration-source: 01 -->\n', "unexpected migration marker"),
+        }
+        for name, (path, text, error) in cases.items():
+            with self.subTest(name=name):
+                self.reset_migration_fixture()
+                self.write(path, text)
+                self.assert_migration_error(error)
+
+    def test_resolved_proposal_destinations_use_stable_registry_identity_and_pointer(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "active-destination": "active or archive proposal record",
+            "archive-destination": "active or archive proposal record",
+            "missing-pointer": "proposal registry pointer",
+            "duplicate-pointer": "proposal registry pointer",
+            "stale-pointer": "proposal registry pointer target does not exist",
+            "wrong-basename": "proposal registry pointer basename",
+            "marker-in-record": "missing migration marker",
+        }
+        for name, error in cases.items():
+            with self.subTest(name=name):
+                rows = self.reset_migration_fixture()
+                if name == "active-destination":
+                    self.write("architecture/proposals/full-poc-platform.md", '# Full\n<a id="design"></a>\n<!-- migration-source: 08::02 -->\n')
+                    rows[9] = rows[9].replace("architecture/proposals/README.md#full-poc-platform", "architecture/proposals/full-poc-platform.md#design")
+                    self.write("architecture/proposals/README.md", "# Proposals\n")
+                elif name == "archive-destination":
+                    self.write("architecture/archive/proposals/full-poc-platform.md", '# Full\n<a id="design"></a>\n<!-- migration-source: 08::02 -->\n')
+                    rows[9] = rows[9].replace("architecture/proposals/README.md#full-poc-platform", "architecture/archive/proposals/full-poc-platform.md#design")
+                    self.write("architecture/proposals/README.md", "# Proposals\n")
+                elif name == "missing-pointer":
+                    self.write("architecture/proposals/README.md", '# Proposals\n<a id="full-poc-platform"></a>\n<!-- migration-source: 08::02 -->\n')
+                elif name == "duplicate-pointer":
+                    self.write("architecture/proposals/README.md", '# Proposals\n<a id="full-poc-platform"></a>\n<!-- migration-source: 08::02 -->\n[One](full-poc-platform.md)\n[Two](full-poc-platform.md)\n')
+                elif name == "stale-pointer":
+                    self.write("architecture/proposals/README.md", '# Proposals\n<a id="full-poc-platform"></a>\n<!-- migration-source: 08::02 -->\n[Missing](../archive/proposals/full-poc-platform.md)\n')
+                elif name == "wrong-basename":
+                    self.write("architecture/proposals/wrong.md", "# Wrong\n")
+                    self.write("architecture/proposals/README.md", '# Proposals\n<a id="full-poc-platform"></a>\n<!-- migration-source: 08::02 -->\n[Wrong](wrong.md)\n')
+                else:
+                    self.write("architecture/proposals/README.md", '# Proposals\n<a id="full-poc-platform"></a>\n[Full](full-poc-platform.md)\n')
+                    self.write("architecture/proposals/full-poc-platform.md", '# Full\n<a id="design"></a>\n<!-- migration-source: 08::02 -->\n')
+                self.write_inventory(rows)
+                self.assert_migration_error(error)
+
+    def test_migration_inventory_requires_blocks_rationale_and_historical_explanation(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "empty-blocks": ([rows[0], rows[1].replace("| B01 |", "|  |"), *rows[2:]], "covered blocks must not be empty"),
+            "empty-rationale": ([rows[0], rows[1].replace("| B01 belongs in detailed service documentation. |", "|  |"), *rows[2:]], "rationale must not be empty"),
+            "historical-explanation": ([rows[0], rows[1].replace("| service-detail | B01=architecture/destination-01.md#source-01 | None | B01 belongs in detailed service documentation.", "| historical-only | None | None | Superseded detail."), *rows[2:]], "historical-only rationale must explain"),
+        }
+        for name, (changed, error) in cases.items():
+            with self.subTest(name=name):
+                if name != "empty-blocks":
+                    self.reset_migration_fixture()
+                self.write_inventory(changed)
+                self.assert_migration_error(error)
+
+    def test_migration_inventory_enforces_block_coverage_and_contiguous_segments(self):
+        rows = self.write_complete_migration_fixture()
+        cases = {
+            "gap": ([*rows[:8], rows[8].replace("B01", "B02"), *rows[9:]], "coverage gap"),
+            "overlap": ([*rows[:9], rows[9].replace("B02", "B01"), *rows[10:]], "coverage overlap"),
+            "segment-gap": ([*rows[:9], rows[9].replace("08::02", "08::03"), *rows[10:]], "contiguous segment suffixes"),
+            "segment-duplicate": ([*rows[:9], rows[9].replace("08::02", "08::01"), *rows[10:]], "duplicate source key 08::01"),
+        }
+        for name, (changed, error) in cases.items():
+            with self.subTest(name=name):
+                if name != "gap":
+                    self.reset_migration_fixture()
+                self.write_inventory(changed)
+                self.assert_migration_error(error)
+
+    def test_migration_source_tokenizer_ignores_section_rules_and_preserves_inline_code_headings(self):
+        headings, _ = validator._material_headings(
+            "## 21. Deployment\n\n"
+            "### 21.9 Java `funds-core` memory controls\n\n"
+            "Material paragraph.\n\n---\n"
+        )
+        self.assertEqual("21.9 Java `funds-core` memory controls", headings["21.09"].heading)
+        self.assertEqual(("B01",), headings["21.09"].blocks)
+
+    def test_migration_inventory_reports_malformed_table_rows(self):
+        rows = self.write_complete_migration_fixture()
+        self.write_inventory(rows)
+        path = self.root / "architecture/archive/comprehensive-design-migration-inventory.md"
+        path.write_text(path.read_text().replace("| 01 | 1. Section 1", "01 | 1. Section 1", 1))
+        self.assert_migration_error("malformed inventory row")
+
+    def test_migration_inventory_covers_nested_numbered_headings_and_13_8_examples(self):
+        rows = self.write_complete_migration_fixture()
+        source_path = self.root / "architecture/modern-core-banking-comprehensive-design-revised.md"
+        source_path.write_text(
+            source_path.read_text().replace(
+                "Material paragraph for section 13.",
+                "Material paragraph for section 13.\n\n"
+                "### 13.8 Worked examples\n\nExample introduction.\n\n"
+                "#### Example A: example inflow\n\nExample material.\n\n"
+                "#### 13.8.1 Numbered detail\n\nNumbered detail material.",
+            )
+        )
+        errors = validator.validate_migration_inventory(self.root)
+        self.assertTrue(any("missing migration row for source heading 13.08" in error for error in errors), errors)
+        self.assertTrue(any("missing migration row for source heading 13.08.example-a" in error for error in errors), errors)
+        self.assertTrue(any("missing migration row for source heading 13.08.01" in error for error in errors), errors)
+
+        additions = (
+            ("13.08", "13.8 Worked examples", "nested-13-08"),
+            ("13.08.example-a", "Example A: example inflow", "example-a"),
+            ("13.08.01", "13.8.1 Numbered detail", "numbered-detail"),
+        )
+        for source_key, heading, anchor in additions:
+            self.write(
+                f"architecture/{anchor}.md",
+                f'# Destination\n<a id="{anchor}"></a>\n<!-- migration-source: {source_key} -->\n',
+            )
+            rows.append(
+                f"| {source_key} | {heading} | B01 | service-detail | B01=architecture/{anchor}.md#{anchor} | None | B01 belongs in a nested destination. | resolved |"
+            )
+        self.write_inventory(rows)
+        errors = validator.validate_migration_inventory(self.root)
+        self.assertFalse(any("missing migration row for source heading 13.08" in error for error in errors), errors)
 
 
 if __name__ == "__main__":

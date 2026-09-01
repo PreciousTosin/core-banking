@@ -13,6 +13,8 @@ code_refs:
 
 # Runtime view
 
+<a id="commit-time-balance-enforcement"></a>
+<!-- migration-source: 09.02 -->
 ## Posting
 
 [PostingService](../../services/funds-core/src/main/java/com/corebanking/funds/application/PostingService.java)

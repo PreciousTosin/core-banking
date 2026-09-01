@@ -52,6 +52,8 @@ test/acceptance/conventional_deposits.sh
 - [ ] Publish `DepositContractOpened` atomically without putting PII/account number in headers.
 - [ ] Commit: `feat(funds-core): open versioned deposit contracts`
 
+<a id="accrual-maturity-delivery-detail"></a>
+<!-- migration-source: 13.07.02 -->
 ### Task 3: Implement exact accrual calculation
 
 - [ ] Write unit/generated tests for daily eligible balance, tiers, minimum-balance rule, leap years and negative/zero balances. Use `BigInteger`/exact fraction as oracle.

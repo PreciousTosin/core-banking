@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from collections import Counter, defaultdict
 import html
 import re
 import sys
@@ -9,7 +10,32 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"links", "metadata", "structure"})
+CHECKS = frozenset({"links", "metadata", "migration", "structure"})
+
+MIGRATION_SOURCE = "architecture/modern-core-banking-comprehensive-design-revised.md"
+MIGRATION_INVENTORY = "architecture/archive/comprehensive-design-migration-inventory.md"
+MIGRATION_HEADER = (
+    "Source key",
+    "Source heading",
+    "Covered blocks",
+    "Disposition",
+    "Destination map",
+    "Evidence",
+    "Rationale",
+    "Resolution",
+)
+MIGRATION_DISPOSITIONS = frozenset({"current", "proposal", "decision", "service-detail", "plan-detail", "historical-only"})
+MIGRATION_RESOLUTIONS = frozenset({"unresolved", "resolved"})
+PREAMBLE_ROW = (
+    "00.document-preamble",
+    "Document title, status, version, date, currency, and audience preamble",
+    "P01; P02; P03",
+    "historical-only",
+    "None",
+    "None",
+    "The source-document identity and revision metadata describe the archived publication itself; no maintained current or proposed destination is appropriate.",
+    "resolved",
+)
 
 ARC42_FILENAMES = frozenset({
     "01-introduction-and-goals.md",
@@ -44,18 +70,29 @@ class MarkdownLink:
     destination: str
     line: int
 
-def _mask(text: str) -> str:
+@dataclass(frozen=True)
+class MigrationRow:
+    source_key: str
+    source_heading: str
+    covered_blocks: str
+    disposition: str
+    destination_map: str
+    evidence: str
+    rationale: str
+    resolution: str
+
+@dataclass(frozen=True)
+class MaterialHeading:
+    source_key: str
+    heading: str
+    blocks: tuple[str, ...]
+
+def _mask_markdown_code(text: str) -> str:
     chars = list(text)
     i = 0
     fence = None
     inline = None
-    comment = False
     while i < len(text):
-        if comment:
-            if text.startswith("-->", i):
-                chars[i:i+3] = "   "; comment = False; i += 3
-            elif text[i] != "\n": chars[i] = " "
-            i += 1; continue
         if fence:
             if text.startswith(fence, i) and (i == 0 or text[i-1] == "\n"):
                 n = len(fence); chars[i:i+n] = " " * n; fence = None; i += n
@@ -66,8 +103,6 @@ def _mask(text: str) -> str:
                 n = len(inline); chars[i:i+n] = " " * n; inline = None; i += n
             elif text[i] != "\n": chars[i] = " "
             i += 1; continue
-        if text.startswith("<!--", i):
-            chars[i:i+4] = "    "; comment = True; i += 4; continue
         if text[i] in "`~" and (i == 0 or text[i-1] == "\n"):
             ch = text[i]; n = 0
             while i+n < len(text) and text[i+n] == ch: n += 1
@@ -77,6 +112,22 @@ def _mask(text: str) -> str:
             n = 1
             while i+n < len(text) and text[i+n] == "`": n += 1
             inline = "`"*n; chars[i:i+n] = " "*n; i += n; continue
+        i += 1
+    return "".join(chars)
+
+def _mask(text: str) -> str:
+    masked = _mask_markdown_code(text)
+    chars = list(masked)
+    i = 0
+    comment = False
+    while i < len(masked):
+        if comment:
+            if masked.startswith("-->", i):
+                chars[i:i+3] = "   "; comment = False; i += 3
+            elif masked[i] != "\n": chars[i] = " "
+            i += 1; continue
+        if masked.startswith("<!--", i):
+            chars[i:i+4] = "    "; comment = True; i += 4; continue
         i += 1
     return "".join(chars)
 
@@ -270,8 +321,417 @@ def validate_metadata(root: Path) -> list[str]:
                 errors.append(_metadata_error(path, root, f"terminal status {status} belongs in architecture/archive/proposals/"))
     return sorted(errors)
 
+def _migration_error(message: str) -> str:
+    return f"{MIGRATION_INVENTORY}: {message}"
+
+def _split_inventory_row(line: str) -> tuple[str, ...] | None:
+    if not line.startswith("|") or not line.endswith("|"):
+        return None
+    cells = tuple(cell.strip() for cell in line[1:-1].split("|"))
+    return cells if len(cells) == len(MIGRATION_HEADER) else None
+
+def _parse_migration_inventory(path: Path) -> tuple[list[MigrationRow], list[str]]:
+    if not path.is_file():
+        return [], [_migration_error("migration inventory is required")]
+    lines = path.read_text().splitlines()
+    errors = []
+    header_index = None
+    for index, line in enumerate(lines):
+        cells = _split_inventory_row(line)
+        if cells == MIGRATION_HEADER:
+            header_index = index
+            break
+    if header_index is None:
+        return [], [_migration_error("exact migration inventory table header is required")]
+    if header_index + 1 >= len(lines) or _split_inventory_row(lines[header_index + 1]) != ("---",) * len(MIGRATION_HEADER):
+        errors.append(_migration_error("exact migration inventory table separator is required"))
+    rows = []
+    for line_number, line in enumerate(lines[header_index + 2:], header_index + 3):
+        if not line.strip():
+            continue
+        if not line.lstrip().startswith("|"):
+            errors.append(_migration_error(f"malformed inventory row on line {line_number}: expected a pipe-delimited row"))
+            continue
+        cells = _split_inventory_row(line)
+        if cells is None:
+            errors.append(_migration_error(f"malformed inventory row on line {line_number}: expected 8 columns"))
+            continue
+        rows.append(MigrationRow(*cells))
+    return rows, errors
+
+def _block_kind(line: str) -> str:
+    if re.match(r"^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$", line):
+        return "rule"
+    if re.match(r"^\s*(?:`{3,}|~{3,})", line):
+        return "fence"
+    if re.match(r"^\s*\|", line):
+        return "table"
+    if re.match(r"^\s{0,3}(?:[-+*]|\d+[.)])\s+", line):
+        return "list"
+    return "prose"
+
+def _material_blocks(lines: list[str]) -> tuple[str, ...]:
+    blocks = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
+            continue
+        kind = _block_kind(lines[index])
+        if kind == "rule":
+            index += 1
+            continue
+        if kind == "fence":
+            opener = re.match(r"^\s*(`{3,}|~{3,})", lines[index]).group(1)
+            fence_char = opener[0]
+            fence_length = len(opener)
+            index += 1
+            while index < len(lines):
+                if re.match(rf"^\s*{re.escape(fence_char)}{{{fence_length},}}\s*$", lines[index]):
+                    index += 1
+                    break
+                index += 1
+        elif kind == "table":
+            index += 1
+            while index < len(lines) and lines[index].strip() and _block_kind(lines[index]) == "table":
+                index += 1
+        elif kind == "list":
+            index += 1
+            while index < len(lines) and lines[index].strip():
+                if _block_kind(lines[index]) in {"table", "fence", "rule"}:
+                    break
+                if _block_kind(lines[index]) == "prose" and not re.match(r"^\s{2,}", lines[index]):
+                    break
+                index += 1
+        else:
+            index += 1
+            while index < len(lines) and lines[index].strip() and _block_kind(lines[index]) == "prose":
+                index += 1
+        blocks.append(f"B{len(blocks) + 1:02d}")
+    return tuple(blocks)
+
+def _numbered_source_key(heading: str) -> str | None:
+    match = re.match(r"^(\d+(?:\.\d+)*)(?:\.)?\s+", heading)
+    if not match:
+        return None
+    return ".".join(f"{int(part):02d}" for part in match.group(1).split("."))
+
+def _material_headings(source_text: str) -> tuple[dict[str, MaterialHeading], set[str]]:
+    lines = source_text.splitlines()
+    masked_lines = _mask(source_text).splitlines()
+    found = []
+    context = None
+    for index, line in enumerate(masked_lines):
+        match = re.match(r"^\s{0,3}(#{2,4})\s+(.+?)\s*#*\s*$", line)
+        if not match:
+            continue
+        raw_match = re.match(r"^\s{0,3}#{2,4}\s+(.+?)\s*#*\s*$", lines[index])
+        heading = raw_match.group(1).strip()
+        key = _numbered_source_key(heading)
+        if key:
+            context = key
+        else:
+            example = re.match(r"^Example\s+([A-J]):", heading)
+            key = f"13.08.example-{example.group(1).lower()}" if example and context == "13.08" else None
+        found.append((index, heading, key))
+    material = {}
+    roots = set()
+    for position, (line_index, heading, key) in enumerate(found):
+        if key is None:
+            continue
+        roots.add(key.split(".", 1)[0])
+        end = found[position + 1][0] if position + 1 < len(found) else len(lines)
+        blocks = _material_blocks(lines[line_index + 1:end])
+        if blocks:
+            material[key] = MaterialHeading(key, heading, blocks)
+    return material, roots
+
+def _validate_source_preamble(source_text: str) -> list[str]:
+    first_numbered = re.search(r"^##\s+1\.\s+", source_text, re.M)
+    if not first_numbered:
+        return [_migration_error("document preamble cannot be delimited because section 1 is missing")]
+    lines = [line.strip() for line in source_text[:first_numbered.start()].splitlines() if line.strip()]
+    expected_prefix = [
+        "# Modern Core Banking System",
+        "## Comprehensive Architecture and Single-VPS Proof-of-Concept Design",
+    ]
+    metadata_labels = ("Status", "Version", "Date", "Base currency", "Audience")
+    valid = len(lines) == 8 and lines[:2] == expected_prefix and lines[-1] == "---"
+    valid = valid and all(re.match(rf"^\*\*{re.escape(label)}:\*\*\s+\S", lines[index + 2]) for index, label in enumerate(metadata_labels))
+    return [] if valid else [_migration_error("document preamble must tokenize independently as exact P01, P02, and P03 material")]
+
+def _explicit_anchor_lines(text: str) -> dict[str, list[int]]:
+    result = defaultdict(list)
+    for index, line in enumerate(_mask_markdown_code(text).splitlines()):
+        match = re.match(r'^\s*<a\s+id=["\']([^"\']+)["\']\s*>\s*</a>\s*$', line, re.I)
+        if match:
+            result[match.group(1)].append(index)
+    return result
+
+def _marker_occurrences(root: Path) -> tuple[Counter, list[str]]:
+    occurrences = Counter()
+    errors = []
+    anchor_re = re.compile(r'^\s*<a\s+id=["\']([^"\']+)["\']\s*>\s*</a>\s*$', re.I)
+    marker_re = re.compile(r"^\s*<!--\s*migration-source:\s*([^\s]+)\s*-->\s*$")
+    for path in iter_governed_markdown(root):
+        rel = path.relative_to(root).as_posix()
+        active_anchor = None
+        for line_number, line in enumerate(_mask_markdown_code(path.read_text()).splitlines(), 1):
+            anchor = anchor_re.match(line)
+            marker = marker_re.match(line)
+            if anchor:
+                active_anchor = anchor.group(1)
+            elif marker:
+                source_key = marker.group(1)
+                if active_anchor is None:
+                    errors.append(f"{rel}:{line_number}: migration marker is not in the contiguous marker block after an explicit anchor")
+                    occurrences[(rel, "", source_key)] += 1
+                else:
+                    occurrences[(rel, active_anchor, source_key)] += 1
+            else:
+                active_anchor = None
+    return occurrences, errors
+
+def _markers_after_anchor(text: str, anchor: str) -> list[str]:
+    lines = _mask_markdown_code(text).splitlines()
+    anchor_lines = _explicit_anchor_lines(text).get(anchor, [])
+    if len(anchor_lines) != 1:
+        return []
+    markers = []
+    index = anchor_lines[0] + 1
+    pattern = re.compile(r"^\s*<!--\s*migration-source:\s*([^\s]+)\s*-->\s*$")
+    while index < len(lines):
+        match = pattern.match(lines[index])
+        if not match:
+            break
+        markers.append(match.group(1))
+        index += 1
+    return markers
+
+def _proposal_registry_pointer(root: Path, anchor: str) -> str | None:
+    registry = root / "architecture/proposals/README.md"
+    if not registry.is_file():
+        return None
+    lines = _mask_markdown_code(registry.read_text()).splitlines()
+    anchor_lines = _explicit_anchor_lines(registry.read_text()).get(anchor, [])
+    if len(anchor_lines) != 1:
+        return None
+    index = anchor_lines[0] + 1
+    marker_re = re.compile(r"^\s*<!--\s*migration-source:\s*[^\s]+\s*-->\s*$")
+    while index < len(lines) and marker_re.match(lines[index]):
+        index += 1
+    if index >= len(lines):
+        return None
+    pointer = re.fullmatch(r"\s*\[[^]]+\]\((?:<([^>]+)>|([^\s)]+))\)\s*", lines[index])
+    if not pointer:
+        return None
+    if index + 1 < len(lines) and re.fullmatch(r"\s*\[[^]]+\]\((?:<([^>]+)>|([^\s)]+))\)\s*", lines[index + 1]):
+        return None
+    return pointer.group(1) or pointer.group(2)
+
+def _parse_destination_map(row: MigrationRow, errors: list[str]) -> list[tuple[str, str]]:
+    if not row.covered_blocks:
+        errors.append(_migration_error(f"covered blocks must not be empty for {row.source_key}"))
+        covered = []
+    else:
+        covered = [value.strip() for value in row.covered_blocks.split(";") if value.strip()]
+    if any(not re.fullmatch(r"B\d{2}", block) for block in covered):
+        errors.append(_migration_error(f"invalid covered block token for {row.source_key}"))
+    if len(covered) != len(set(covered)):
+        errors.append(_migration_error(f"coverage overlap within row {row.source_key}"))
+    if row.disposition == "historical-only":
+        if row.destination_map != "None":
+            errors.append(_migration_error(f"historical-only destination must be literal None for {row.source_key}"))
+        return []
+    mappings = []
+    if row.destination_map and row.destination_map != "None":
+        for item in row.destination_map.split(";"):
+            parts = item.strip().split("=", 1)
+            if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+                errors.append(_migration_error(f"malformed destination map entry for {row.source_key}"))
+                continue
+            mappings.append((parts[0].strip(), parts[1].strip()))
+    if Counter(block for block, _ in mappings) != Counter(covered):
+        errors.append(_migration_error(f"destination map must cover each block exactly once for {row.source_key}"))
+    return mappings
+
+def _validate_destination(root: Path, row: MigrationRow, destination: str, expected: set[tuple[str, str, str]], errors: list[str]) -> None:
+    match = re.fullmatch(r"([^#]+\.md)#([A-Za-z0-9][A-Za-z0-9._:-]*)", destination)
+    if not match or destination.startswith("/") or ".." in Path(match.group(1)).parts:
+        errors.append(_migration_error(f"destination must use repository/path.md#explicit-anchor for {row.source_key}: {destination or 'empty'}"))
+        return
+    path_name, anchor = match.groups()
+    if path_name == MIGRATION_SOURCE:
+        errors.append(_migration_error(f"destination must not point to the comprehensive source for {row.source_key}"))
+        return
+    target = root / path_name
+    if not target.is_file():
+        errors.append(_migration_error(f"destination does not exist for {row.source_key}: {path_name}"))
+        return
+    anchors = _explicit_anchor_lines(target.read_text())
+    if len(anchors.get(anchor, [])) != 1:
+        errors.append(_migration_error(f"destination anchor does not exist exactly once for {row.source_key}: {destination}"))
+        return
+    expected.add((path_name, anchor, row.source_key))
+    if row.source_key not in _markers_after_anchor(target.read_text(), anchor):
+        errors.append(_migration_error(f"missing migration marker for {row.source_key} at {destination}"))
+
+def _validate_resolved_proposal(root: Path, row: MigrationRow, destinations: list[str], errors: list[str]) -> None:
+    for destination in set(destinations):
+        path_name, _, anchor = destination.partition("#")
+        if path_name in {f"architecture/proposals/{anchor}.md", f"architecture/archive/proposals/{anchor}.md"} or re.match(r"^architecture/(?:archive/)?proposals/[^/]+\.md$", path_name) and path_name != "architecture/proposals/README.md":
+            errors.append(_migration_error(f"resolved proposal {row.source_key} must not use an active or archive proposal record as its destination"))
+            continue
+        if path_name != "architecture/proposals/README.md":
+            errors.append(_migration_error(f"resolved proposal {row.source_key} must use a stable architecture/proposals/README.md registry identity"))
+            continue
+        pointer = _proposal_registry_pointer(root, anchor)
+        if pointer is None:
+            errors.append(_migration_error(f"proposal registry pointer must occur exactly once immediately after {anchor}"))
+            continue
+        local = _local_destination(pointer)
+        if local is None:
+            errors.append(_migration_error(f"proposal registry pointer must be local for {anchor}"))
+            continue
+        pointer_path, _ = local
+        target = ((root / "architecture/proposals") / pointer_path).resolve()
+        basename = f"{anchor}.md"
+        if Path(pointer_path).name != basename:
+            errors.append(_migration_error(f"proposal registry pointer basename must be {basename} for {anchor}"))
+            continue
+        if not target.is_file():
+            errors.append(_migration_error(f"proposal registry pointer target does not exist for {anchor}: {pointer}"))
+            continue
+        allowed = {
+            (root / "architecture/proposals" / basename).resolve(),
+            (root / "architecture/archive/proposals" / basename).resolve(),
+        }
+        if target not in allowed:
+            errors.append(_migration_error(f"proposal registry pointer must name the active or archive record for {anchor}"))
+            continue
+        existing = [candidate for candidate in allowed if candidate.is_file()]
+        if existing != [target]:
+            errors.append(_migration_error(f"proposal registry identity {anchor} must have one sole active or archive record"))
+
+def validate_migration_inventory(root: Path) -> list[str]:
+    source = root / MIGRATION_SOURCE
+    if not source.is_file():
+        return [_migration_error(f"source document is required: {MIGRATION_SOURCE}")]
+    source_text = source.read_text()
+    headings, source_roots = _material_headings(source_text)
+    rows, errors = _parse_migration_inventory(root / MIGRATION_INVENTORY)
+    errors.extend(_validate_source_preamble(source_text))
+
+    keys = Counter(row.source_key for row in rows)
+    for key, count in sorted(keys.items()):
+        if count > 1:
+            errors.append(_migration_error(f"duplicate source key {key}"))
+    preamble_rows = [row for row in rows if row.source_key == PREAMBLE_ROW[0]]
+    if len(preamble_rows) != 1:
+        errors.append(_migration_error("document preamble row 00.document-preamble must occur exactly once"))
+    elif tuple(preamble_rows[0].__dict__.values()) != PREAMBLE_ROW:
+        errors.append(_migration_error("document preamble row must use the exact P01, P02, P03 historical-only contract and literal None destination"))
+
+    valid_key = re.compile(r"^(?:00\.document-preamble|\d{2}(?:\.\d{2})*(?:\.example-[a-j])?(?:::\d{2})?)$")
+    grouped = defaultdict(list)
+    row_destinations = defaultdict(list)
+    expected_markers = set()
+    represented_roots = set()
+    for row in rows:
+        if row.source_key.startswith("00.") and row.source_key != "00.document-preamble":
+            errors.append(_migration_error(f"document preamble key is reserved; unsupported key {row.source_key}"))
+            continue
+        if not valid_key.fullmatch(row.source_key):
+            errors.append(_migration_error(f"malformed source key {row.source_key or 'empty'}"))
+            continue
+        if row.source_key == "00.document-preamble":
+            continue
+        base = row.source_key.split("::", 1)[0]
+        grouped[base].append(row)
+        represented_roots.add(base.split(".", 1)[0])
+        if row.disposition not in MIGRATION_DISPOSITIONS:
+            errors.append(_migration_error(f"unsupported disposition {row.disposition or 'empty'} for {row.source_key}"))
+        if row.resolution not in MIGRATION_RESOLUTIONS:
+            errors.append(_migration_error(f"unsupported resolution {row.resolution or 'empty'} for {row.source_key}"))
+        if not row.rationale:
+            errors.append(_migration_error(f"rationale must not be empty for {row.source_key}"))
+        if row.disposition == "historical-only" and not (re.search(r"archiv|histor", row.rationale, re.I) and re.search(r"no maintained[^.]*destination", row.rationale, re.I)):
+            errors.append(_migration_error(f"historical-only rationale must explain archive retention and why no maintained destination exists for {row.source_key}"))
+        mappings = _parse_destination_map(row, errors)
+        if row.disposition != "historical-only":
+            for _, destination in mappings:
+                row_destinations[row.source_key].append(destination)
+                _validate_destination(root, row, destination, expected_markers, errors)
+        if row.disposition == "current":
+            evidence = [value.strip() for value in row.evidence.split(";") if value.strip()] if row.evidence != "None" else []
+            if not evidence:
+                errors.append(_migration_error(f"current evidence is required for {row.source_key}"))
+            for path_name in evidence:
+                if not (root / path_name.split("#", 1)[0]).exists():
+                    errors.append(_migration_error(f"current evidence does not exist for {row.source_key}: {path_name}"))
+        if row.resolution == "unresolved":
+            errors.append(_migration_error(f"unresolved migration row {row.source_key}"))
+
+    for root_number in (f"{number:02d}" for number in range(1, 28)):
+        if root_number not in represented_roots:
+            errors.append(_migration_error(f"missing top-level source root {root_number}"))
+    for root_number in sorted(source_roots - {f"{number:02d}" for number in range(1, 28)}):
+        errors.append(_migration_error(f"source contains unsupported top-level root {root_number}"))
+
+    for base, heading in sorted(headings.items()):
+        heading_rows = grouped.get(base, [])
+        if not heading_rows:
+            errors.append(_migration_error(f"missing migration row for source heading {base}"))
+            continue
+        exact = [row for row in heading_rows if row.source_key == base]
+        segmented = [row for row in heading_rows if "::" in row.source_key]
+        if exact and segmented:
+            errors.append(_migration_error(f"source heading {base} cannot mix an exact key with segment keys"))
+        if segmented:
+            suffixes = sorted(int(row.source_key.rsplit("::", 1)[1]) for row in segmented)
+            if len(segmented) < 2 or suffixes != list(range(1, len(segmented) + 1)):
+                errors.append(_migration_error(f"source heading {base} must use contiguous segment suffixes from ::01"))
+        for row in heading_rows:
+            if row.source_heading != heading.heading:
+                errors.append(_migration_error(f"source heading text mismatch for {row.source_key}: expected {heading.heading}"))
+        covered = []
+        for row in heading_rows:
+            covered.extend(value.strip() for value in row.covered_blocks.split(";") if value.strip())
+        expected = set(heading.blocks)
+        actual = set(covered)
+        for block in sorted(expected - actual):
+            errors.append(_migration_error(f"coverage gap for {base}: {block}"))
+        for block, count in sorted(Counter(covered).items()):
+            if count > 1:
+                errors.append(_migration_error(f"coverage overlap for {base}: {block}"))
+        for block in sorted(actual - expected):
+            errors.append(_migration_error(f"unknown covered block for {base}: {block}"))
+    for base in sorted(set(grouped) - set(headings)):
+        errors.append(_migration_error(f"source key does not map to a material source heading: {base}"))
+
+    for row in rows:
+        if row.disposition == "proposal" and row.resolution == "resolved":
+            _validate_resolved_proposal(root, row, row_destinations[row.source_key], errors)
+
+    actual_markers, marker_errors = _marker_occurrences(root)
+    errors.extend(marker_errors)
+    expected_counter = Counter(expected_markers)
+    if actual_markers != expected_counter:
+        errors.append(_migration_error("migration marker mismatch between governed Markdown and active destination tuples"))
+        for triple in sorted(expected_counter.keys() | actual_markers.keys()):
+            expected_count = expected_counter[triple]
+            actual_count = actual_markers[triple]
+            path_name, anchor, source_key = triple
+            if actual_count < expected_count:
+                errors.append(_migration_error(f"missing migration marker ({path_name}, {anchor}, {source_key})"))
+            elif expected_count and actual_count > expected_count:
+                errors.append(_migration_error(f"duplicate migration marker ({path_name}, {anchor}, {source_key})"))
+            elif not expected_count:
+                errors.append(_migration_error(f"unexpected migration marker ({path_name}, {anchor or 'no-anchor'}, {source_key})"))
+    return sorted(set(errors))
+
 Validator = Callable[[Path], list[str]]
-VALIDATORS: dict[str, Validator] = {"links": validate_links, "metadata": validate_metadata, "structure": validate_structure}
+VALIDATORS: dict[str, Validator] = {"links": validate_links, "metadata": validate_metadata, "migration": validate_migration_inventory, "structure": validate_structure}
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
     errors = []

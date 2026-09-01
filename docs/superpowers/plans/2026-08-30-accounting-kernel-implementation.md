@@ -743,6 +743,8 @@ git commit -m "feat(funds-core): enforce immutable balanced journals"
 
 ---
 
+<a id="posting-command-delivery-detail"></a>
+<!-- migration-source: 09.01 -->
 ### Task 6: Implement the serializable posting transaction and idempotency state machine
 
 **Files:**

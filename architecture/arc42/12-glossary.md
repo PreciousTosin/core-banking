@@ -12,6 +12,8 @@ code_refs:
 
 # Glossary
 
+<a id="bank-accounting-terms"></a>
+<!-- migration-source: 08.09::01 -->
 - **Debit:** Positive signed posting in this kernel.
 - **Credit:** Negative signed posting in this kernel.
 - **Signed posting:** Currency amount expressed in signed integer minor units.

@@ -18,6 +18,8 @@ The target is an 8 GiB single VM resource budget, not evidence that a full
 topology is deployed. Kubernetes and Helm files exist, but do not prove a
 deployed platform.
 
+<a id="poc-exclusions"></a>
+<!-- migration-source: 02.03::01 -->
 Customer channels, providers, NIBSS/NIP, Go services, brokers, workflow
 engines, high availability, regulatory certification, and production
 throughput are outside the implemented current state.

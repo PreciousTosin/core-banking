@@ -18,6 +18,8 @@ infrastructure. Operators run the roles and configuration documented in the
 authoritative store for journals, postings, projections, idempotency, and
 outbox rows.
 
+<a id="modeled-context-boundary"></a>
+<!-- migration-source: 02.03::02 -->
 The Java/Quarkus module processes typed application commands. Customer
 channels, providers, NIBSS/NIP, Go services, brokers, and workflow engines are
 not current interfaces or topology claims.

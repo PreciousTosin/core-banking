@@ -13,6 +13,8 @@ code_refs:
 
 # Risks and technical debt
 
+<a id="empirical-sizing-risk"></a>
+<!-- migration-source: 02.04::02 -->
 The PoC is one accounting kernel, not a complete or production-ready bank. It
 does not claim high availability, regulatory certification, host-loss
 durability, production throughput, a deployed full topology, or a full 8 GiB

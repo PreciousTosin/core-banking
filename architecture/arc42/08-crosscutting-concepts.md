@@ -13,6 +13,8 @@ code_refs:
 
 # Crosscutting concepts
 
+<a id="materialised-balance"></a>
+<!-- migration-source: 08.03::01 -->
 Money is a currency plus signed integer minor units with checked exact
 arithmetic. Balanced journals, typed canonical hashes, idempotency,
 serializable transactions, and immutable facts form the integrity boundary.
