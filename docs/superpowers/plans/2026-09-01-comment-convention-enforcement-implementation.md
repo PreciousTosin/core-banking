@@ -1,5 +1,7 @@
 # Comment Convention Enforcement Implementation Plan
 
+**Retrospective ADR:** [ADR-0009](../../../architecture/adr/0009-adopt-an-enforced-code-comment-convention.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the machine-checkable parts of `docs/conventions/code-comments.md` fail the `services/funds-core` build, so that a public type without a purpose comment, a malformed Javadoc summary, a migration without a header block, or a work item left in source is caught in seconds instead of in review.

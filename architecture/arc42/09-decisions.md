@@ -13,6 +13,7 @@ related_adrs:
   - ADR-0006
   - ADR-0007
   - ADR-0008
+  - ADR-0009
 code_refs:
   - architecture/adr/template.md
 ---
@@ -31,3 +32,4 @@ links decision records without duplicating their rationale.
 - [ADR-0006: Couple idempotency and outbox to ledger commit](../adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md)
 - [ADR-0007: Separate ledger identity from account addresses](../adr/0007-separate-ledger-identity-from-account-addresses.md)
 - [ADR-0008: Target an eight GiB single VM evidence suite](../adr/0008-target-an-eight-gib-single-vm-evidence-suite.md)
+- [ADR-0009: Adopt an enforced code comment convention](../adr/0009-adopt-an-enforced-code-comment-convention.md)
