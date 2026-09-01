@@ -21,6 +21,8 @@
   - **every metadata field except `Status`, `Implementation status`, and the seven relationship fields.** `Scope`, `Deciders`, `Decision date` and `Retrospective` are frozen — editing `Scope` in a follow-up commit fails with `accepted ADR field changed: Scope`. This matters because D4 rests on the exact wording of `Scope`: get it right before committing, because afterwards the only cures are rewriting history or a superseding ADR.
 
   `Compliance and verification` and `Implementation evidence`, like the relationship fields, are append-only rather than frozen: a later commit may add lines but never alter or remove existing ones.
+- **This branch must land on `master` with a true merge commit (`git merge --no-ff`). Never squash, never rebase-merge.** Five of the eight evidence hashes — `b4cf2aa2`, `655ed137`, `dfb8cebf`, `9f56d06b`, `f70e1961` — exist only on this branch; only `24d2b4b4`, `912f4e9f` and `c49c3aaf` are already ancestors of `master`. A merge commit makes all eight reachable from `master` forever. A squash or a rebase rewrites them into new hashes, after which `_validate_evidence` — which runs on **every** plain validation, not only the edge checks — reports `evidence hash does not resolve to a commit` on `master` from then on. That failure is unfixable within the framework's own rules: an `Accepted` record cannot be deleted or renamed, and `Implementation evidence` is append-only, so the broken lines can never be removed. The plan's own checks would not catch it, because they run against this branch, where the commits still exist.
+- **If a squash or rebase merge is ever unavoidable, the evidence must be changed before the ADR is committed**, not after — cite only the three commits already on `master`, or use PR-URL evidence, which survives any merge strategy because it is a URL rather than a hash. Once the record is committed as `Accepted`, that choice is frozen.
 - Evidence hashes are **40 lowercase hex characters**. Uppercase fails the regex.
 - Relationship fields are separated by exactly `"; "` — one semicolon, one space. `;` alone or `;  ` fails.
 - Items in `Related architecture sections` and `Related implementation plans` must be **only** a Markdown link, with no other text in the item.
@@ -389,6 +391,40 @@ The repository validates the PR body itself on `pull_request` events. The descri
 - `Diagrams changed:` None
 - `Verification evidence:` the three validator commands from Task 3 Step 2 and the edge checks from Task 2
 
+## Merging: the strategy is load-bearing
+
+Merge with a true merge commit and verify afterwards. This is the one step that cannot be checked from the branch.
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+git checkout master
+git merge --no-ff worktree-comment-convention-enforcement-plan
+python3 architecture/scripts/validate_architecture.py --root .
+```
+
+Expected: `architecture validation passed`.
+
+If it instead reports `evidence hash does not resolve to a commit`, the merge did not preserve the branch's commits — the merge was squashed or rebased. **Do not push.** Reset `master` back and redo the merge with `--no-ff`; every evidence hash must resolve from `master` before this reaches CI, because after that the failure is permanent.
+
+A useful sanity check before merging, which lists any evidence commit that would not survive:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+git log --format=%H master | sort > /tmp/master-commits
+grep -oE '^- [0-9a-f]{40}' architecture/adr/0009-adopt-an-enforced-code-comment-convention.md \
+  | cut -d' ' -f2 | sort > /tmp/adr-evidence
+comm -23 /tmp/adr-evidence /tmp/master-commits
+```
+
+Before the merge this prints the five branch-only hashes; after a correct `--no-ff` merge it prints nothing.
+
+Both outcomes were simulated on 2026-09-01 in disposable clones, taking a fresh `--single-branch --branch master` checkout afterwards to imitate what CI checks out:
+
+| Merge strategy | Unreachable evidence hashes | Validator on a fresh master-only checkout |
+|---|---|---|
+| `git merge --no-ff` | none | `architecture validation passed` |
+| `git merge --squash` | the five branch-only hashes | five × `evidence hash does not resolve to a commit` |
+
 ## Rollback
 
 Three things reference the record: the ADR file itself, the `related_adrs` entry and bullet in `architecture/arc42/09-decisions.md`, and the backlink in the enforcement plan. Because all three land in one commit, `git revert` of that commit — or an amend before it is pushed — removes them together, and that is the only rollback to use. Do not hand-remove the ADR file alone: the index entry and the backlink would be left dangling, failing both `validate_links` and the reciprocity checks.
@@ -403,6 +439,7 @@ After it is merged, it cannot be deleted or renamed: `Accepted` records are perm
 | A naive structural-only run gives false confidence | Task 2 exists precisely because `validate_architecture.py --root .` alone cannot see the introduction rule |
 | Committing the ADR without one of its two reciprocal registrations | D1 and Task 1 Step 6 keep all three files in one commit; Step 5 catches either mismatch, by name, before any commit exists |
 | Evidence that looks right but is not | All eight lines were checked against the validator's own grammar and against each commit's real diff before this plan was written |
+| A squash or rebase merge silently destroys five of the eight evidence hashes, breaking `master` permanently | The merge-strategy constraint, the `--no-ff` merge and the post-merge validation in "Merging: the strategy is load-bearing", plus the `comm` check that lists unreachable hashes before the merge |
 | An extra heading added for readability | Global Constraints forbid it: extra headings fall outside the mutable-section allowlist and freeze forever |
 
 ## Out of Scope
