@@ -27,6 +27,7 @@ import java.util.UUID;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.postgresql.util.PSQLException;
 
@@ -475,6 +476,90 @@ class AcceptanceHardeningIT {
         assertEquals("DRAFT", queryString(
             "SELECT status FROM funds.chart_version WHERE chart_version_id = ?",
             candidateChart));
+    }
+
+    @RepeatedTest(5)
+    void repeatableReadChartCreationSerializesAgainstAnEarlierOpenAccountInsert()
+        throws Exception {
+        UUID candidateChart = TestPostingStack.uuid(1_190);
+        UUID newAccount = TestPostingStack.uuid(1_191);
+        try (var connection = dataSource.getConnection()) {
+            execute(connection, """
+                UPDATE funds.chart_version
+                SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                WHERE chart_version_id = ?
+                """, TestPostingStack.CHART_VERSION_ID);
+        }
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<SQLException> chartLifecycle = null;
+        try (var accountConnection = dataSource.getConnection();
+             var chartConnection = dataSource.getConnection()) {
+            accountConnection.setAutoCommit(false);
+            execute(accountConnection, """
+                INSERT INTO funds.ledger_account
+                    (account_id, book_id, account_scope, product_version_id,
+                     currency, status, created_at)
+                VALUES (?, ?, 'INTERNAL', NULL, 'NGN', 'OPEN', CURRENT_TIMESTAMP)
+                """, newAccount, TestPostingStack.BOOK_ID);
+
+            chartConnection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            chartConnection.setAutoCommit(false);
+            int chartBackendPid = (int) queryLong(chartConnection, "SELECT pg_backend_pid()");
+            chartLifecycle = executor.submit(() -> {
+                try {
+                    execute(chartConnection, """
+                        INSERT INTO funds.chart_version
+                            (chart_version_id, book_id, version, status, approval_reference)
+                        VALUES (?, ?, 2, 'DRAFT', 'APP-CONCURRENT-CHART')
+                        """, candidateChart, TestPostingStack.BOOK_ID);
+                    execute(chartConnection, """
+                        INSERT INTO funds.ledger_account_chart_mapping
+                            (account_id, book_id, chart_version_id, account_code,
+                             account_currency, account_class, normal_balance,
+                             control_account_code, account_role, currency_policy,
+                             permitted_direction)
+                        SELECT account_id, book_id, ?, account_code, account_currency,
+                               account_class, normal_balance, control_account_code,
+                               account_role, currency_policy, permitted_direction
+                        FROM funds.ledger_account_chart_mapping
+                        WHERE chart_version_id = ?
+                        """, candidateChart, TestPostingStack.CHART_VERSION_ID);
+                    execute(chartConnection, """
+                        UPDATE funds.chart_version
+                        SET status = 'ACTIVE',
+                            activated_at = TIMESTAMPTZ '2026-01-10 00:00:00+00'
+                        WHERE chart_version_id = ?
+                        """, candidateChart);
+                    chartConnection.commit();
+                    return null;
+                } catch (SQLException failure) {
+                    chartConnection.rollback();
+                    return failure;
+                }
+            });
+
+            awaitBackendLockOrCompletion(chartBackendPid, chartLifecycle);
+            accountConnection.commit();
+            SQLException lifecycleFailure = chartLifecycle.get(5, TimeUnit.SECONDS);
+            assertTrue(lifecycleFailure != null,
+                "chart created from a snapshot that omitted the concurrent open account");
+            assertEquals("40001", lifecycleFailure.getSQLState());
+        } finally {
+            if (chartLifecycle != null && !chartLifecycle.isDone()) {
+                chartLifecycle.cancel(true);
+            }
+            executor.shutdownNow();
+        }
+
+        try (var connection = dataSource.getConnection()) {
+            assertEquals(0, queryLong(connection, """
+                SELECT count(*) FROM funds.chart_version WHERE chart_version_id = ?
+                """, candidateChart));
+            assertEquals(1, queryLong(connection, """
+                SELECT count(*) FROM funds.ledger_account WHERE account_id = ?
+                """, newAccount));
+        }
     }
 
     @Test
@@ -1051,6 +1136,26 @@ class AcceptanceHardeningIT {
             Thread.onSpinWait();
         }
         throw new AssertionError("activation did not block on the chart governance row");
+    }
+
+    private void awaitBackendLockOrCompletion(int backendPid, Future<?> operation)
+        throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (operation.isDone()) {
+                return;
+            }
+            try (var connection = dataSource.getConnection()) {
+                if (queryLong(connection, """
+                    SELECT count(*) FROM pg_stat_activity
+                    WHERE pid = ? AND wait_event_type = 'Lock'
+                    """, backendPid) == 1) {
+                    return;
+                }
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("chart lifecycle neither completed nor reached its book lock");
     }
 
     private SQLException raceRepeatableReadActivation(

@@ -137,6 +137,11 @@ FOR EACH ROW
 EXECUTE FUNCTION funds.reject_product_definition_identity_mutation();
 
 -- Govern chart activation and retain an approved, bounded validity history.
+ALTER TABLE funds.book
+    ADD COLUMN chart_governance_revision bigint NOT NULL DEFAULT 0,
+    ADD CONSTRAINT book_chart_governance_revision_check
+        CHECK (chart_governance_revision >= 0);
+
 ALTER TABLE funds.chart_version
     ADD COLUMN approval_reference text,
     ADD COLUMN retired_at timestamptz,
@@ -197,6 +202,15 @@ BEGIN
                   CONSTRAINT = 'chart_version_forward_transition';
     END IF;
 
+    IF OLD.status IS DISTINCT FROM NEW.status THEN
+        -- The stable book row serializes activation with account-universe and
+        -- chart-creation changes even when no candidate chart was visible to
+        -- the concurrent transaction.
+        UPDATE funds.book book
+        SET chart_governance_revision = book.chart_governance_revision + 1
+        WHERE book.book_id = NEW.book_id;
+    END IF;
+
     IF OLD.status = 'DRAFT' AND NEW.status = 'ACTIVE' THEN
         IF EXISTS (
             SELECT 1
@@ -239,6 +253,10 @@ BEGIN
             USING ERRCODE = '23514',
                   CONSTRAINT = 'chart_version_must_start_draft';
     END IF;
+
+    UPDATE funds.book book
+    SET chart_governance_revision = book.chart_governance_revision + 1
+    WHERE book.book_id = NEW.book_id;
     RETURN NEW;
 END
 $function$;
@@ -340,6 +358,19 @@ BEGIN
                   CONSTRAINT = 'ledger_account_chart_mapping_frozen';
     END IF;
 
+    -- Existing chart rows are already locked in canonical order. Lock and
+    -- advance their stable book rows next, also canonically, so activation,
+    -- chart creation and the open-account universe share one write revision.
+    PERFORM 1
+    FROM funds.book book
+    WHERE book.book_id = source_book_id OR book.book_id = target_book_id
+    ORDER BY book.book_id
+    FOR UPDATE OF book;
+
+    UPDATE funds.book book
+    SET chart_governance_revision = book.chart_governance_revision + 1
+    WHERE book.book_id = source_book_id OR book.book_id = target_book_id;
+
     UPDATE funds.chart_version chart
     SET governance_revision = chart.governance_revision + 1
     WHERE ((chart.chart_version_id = source_chart_version_id
@@ -369,27 +400,12 @@ AS $function$
 BEGIN
     IF NEW.status = 'OPEN'
        AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'OPEN') THEN
-        IF EXISTS (
-            SELECT 1 FROM funds.chart_version chart
-            WHERE chart.book_id = NEW.book_id AND chart.status = 'ACTIVE'
-        ) THEN
-            RAISE EXCEPTION 'active-chart account onboarding requires a governed atomic operation'
-                USING ERRCODE = '55000',
-                      CONSTRAINT = 'active_chart_account_onboarding_deferred';
-        END IF;
-
-        -- Advance every candidate chart row before the account becomes visible.
-        -- A waiting snapshot-isolated activation then serializes; under READ
-        -- COMMITTED the post-lock checks observe whichever transaction won.
-        PERFORM 1
-        FROM funds.chart_version chart
-        WHERE chart.book_id = NEW.book_id AND chart.status = 'DRAFT'
-        ORDER BY chart.chart_version_id
-        FOR UPDATE OF chart;
-
-        UPDATE funds.chart_version chart
-        SET governance_revision = chart.governance_revision + 1
-        WHERE chart.book_id = NEW.book_id AND chart.status = 'DRAFT';
+        -- The book exists before either an account or a chart can reference it,
+        -- so it is the stable serialization row even when no DRAFT chart is
+        -- yet visible in this transaction's snapshot.
+        UPDATE funds.book book
+        SET chart_governance_revision = book.chart_governance_revision + 1
+        WHERE book.book_id = NEW.book_id;
 
         IF EXISTS (
             SELECT 1 FROM funds.chart_version chart
