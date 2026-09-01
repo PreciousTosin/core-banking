@@ -231,6 +231,7 @@ public final class ReferenceLedgerModel {
         }
     }
 
+    /** One posting line as the model stores it; the dimension map is copied so a stored journal cannot change afterwards. */
     public record ModelLine(
         UUID postingId,
         UUID accountId,
@@ -255,5 +256,6 @@ public final class ReferenceLedgerModel {
         }
     }
 
+    /** A command the model accepted: the stored hash separates a retry from a conflict, and the stored result is what a same-hash retry must return. */
     public record SuccessfulCommand(PostingCommand command, String requestHash, PostingResult result) {}
 }
