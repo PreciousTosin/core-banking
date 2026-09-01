@@ -28,9 +28,9 @@
 - Do not claim that infrastructure manifests are deployed or verified merely because their files exist.
 - Every task ends with its focused validation and a commit before the next task starts.
 - Before Task 1 changes any file, create the durable local baseline ref `refs/codex/architecture-docs-framework-base`; fail rather than overwrite it if it already exists. Before every cross-task range review, resolve that ref to a 40-lowercase-hex commit, verify the commit exists, and use `<resolved-base>..HEAD`, never `HEAD~N`. Delete only this exact ref after Final Verification succeeds.
-- Markdown links resolve relative to the containing Markdown file after stripping query strings while preserving and validating fragments; the validator supports inline and CommonMark reference-style links, angle-bracket destinations, and backslash-escaped spaces.
-- Link validation scans only these governed Markdown paths from the repository-root filesystem: `ARCHITECTURE.md`; `architecture/**/*.md`; `docs/superpowers/plans/*.md`; `docs/superpowers/specs/*.md`; `services/*/README.md`; `services/*/docs/**/*.md`; and `.github/pull_request_template.md` when present. It includes newly created and untracked files in those paths while pruning `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, every `node_modules/`, Maven/Gradle `target/` and `build/` output, and `architecture/diagrams/generated/`. Unrelated root-level, user, cache, and `.claude/` Markdown is outside the gate and may be reported informationally. Markdown fenced-code blocks and inline-code spans are examples, not link-bearing prose, and are excluded before destinations are parsed.
-- Unrelated untracked, modified, or staged user state, including `.claude/worktrees/`, is reported for awareness but never modified, staged, deleted, ignored, stashed, committed, or treated as a framework failure. Every task declares an exact task-specific path array, such as `task1_paths`, containing each file in that task's `Files` section; stages only that array with `git add --`; compares the sorted task-owned staged names with the sorted array using `git diff --cached --name-only --no-renames`; and commits only that array with Git's `--only` path mode. Disabling rename display makes the comparison account for both sides of a move. A move task lists both the old and new paths so the deletion and addition are committed. The scoped comparison ignores unrelated pre-existing staged paths, which remain untouched and excluded from every task commit.
+- Markdown links resolve relative to the containing Markdown file after stripping query strings while preserving and validating fragments; the validator supports inline and CommonMark reference-style links, angle-bracket destinations, and backslash-escaped spaces. Before parsing links it masks fenced code, inline code, and HTML comments while preserving line numbers. A destination beginning with a valid URI scheme matching `[A-Za-z][A-Za-z0-9+.-]*:` is external and skipped, except that a Windows drive path matching `^[A-Za-z]:[\\/]` remains a local path.
+- Link validation scans only these governed Markdown paths from the repository-root filesystem: `ARCHITECTURE.md`; `architecture/**/*.md`; `docs/superpowers/plans/*.md`; `docs/superpowers/specs/*.md`; `services/*/README.md`; `services/*/docs/**/*.md`; and `.github/pull_request_template.md` when present. It includes newly created and untracked files in those paths while pruning `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, every `node_modules/`, Maven/Gradle `target/` and `build/` output, and `architecture/diagrams/generated/`. Unrelated root-level, user, cache, and `.claude/` Markdown is outside the gate and may be reported informationally. Markdown fenced-code blocks, inline-code spans, and HTML comments are examples, not link-bearing prose, and are excluded before destinations are parsed.
+- Unrelated untracked, modified, or staged user state, including `.claude/worktrees/`, is reported for awareness but never modified, staged, deleted, ignored, stashed, committed, or treated as a framework failure. Before the first write in every task/commit scope, define the exact task-owned path array shown again in that scope's commit block and run its fail-fast preflight. Each preflight passes that matching task-specific array after `--` to `git status --porcelain=v1 --untracked-files=all --ignored=matching` and aborts for coordination when any owned existing path has unstaged, staged, unmerged, untracked, or ignored state; it never stashes, resets, restores, deletes, cleans, or overwrites that state. A path that does not yet exist and has no status entry is clean. Non-owned dirty state remains allowed and is reported separately. Every task stages only its exact array with `git add --`; compares the sorted task-owned staged names with the sorted array using `git diff --cached --name-only --no-renames`; and commits only that array with Git's `--only` path mode. Disabling rename display makes the comparison account for both sides of a move. A move task lists both the old and new paths so the deletion and addition are committed. The scoped comparison ignores unrelated pre-existing staged paths, which remain untouched and excluded from every task commit. Every multi-command acceptance, baseline-ref, preflight, and commit-validation shell block begins with `set -euo pipefail`; therefore baseline-ref deletion occurs only after every preceding Final Verification command succeeds.
 
 ## File Structure
 
@@ -96,6 +96,7 @@
 Run before changing a file:
 
 ```bash
+set -euo pipefail
 base_ref=refs/codex/architecture-docs-framework-base
 if git show-ref --verify --quiet "$base_ref"; then
   echo "$base_ref already exists; inspect and remove it deliberately before restarting" >&2
@@ -112,7 +113,26 @@ git cat-file -e "$recorded_base^{commit}"
 
 Expected: the previously absent local ref resolves to the exact starting commit. Keep it through Final Verification; no task may overwrite or delete it.
 
-- [ ] **Step 2: Write failing validator unit tests**
+- [ ] **Step 2: Preflight the exact Task 1 write scope**
+
+Run before creating or editing either task-owned file:
+
+```bash
+set -euo pipefail
+task1_paths=(
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task1_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 1 owned paths overlap existing work; stop and coordinate without stashing, resetting, restoring, deleting, or cleaning:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Any output is a coordination stop, not permission to discard the overlapping state. The `task1_paths` array is identical to the commit array in Step 7.
+
+- [ ] **Step 3: Write failing validator unit tests**
 
 Create temporary repositories in `unittest.TestCase` methods and cover only the generic primitives owned by this task:
 
@@ -193,9 +213,29 @@ def test_broken_links_inside_fenced_and_inline_code_are_examples(self):
     )
     self.assertEqual([], validator.validate_links(self.root))
 
-def test_destination_extraction_masks_code_but_keeps_prose_links(self):
-    text = "`[inline](missing-inline.md)`\n```md\n[fenced](missing-fenced.md)\n```\n[real](real.md)\n"
+def test_broken_links_inside_html_comments_are_examples(self):
+    self.write(
+        "architecture/examples.md",
+        "<!--\n[commented](missing-commented.md)\n-->\n[real](target.md)\n",
+    )
+    self.write("architecture/target.md", "# Target\n")
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_destination_extraction_masks_code_and_comments_but_keeps_prose_links(self):
+    text = "`[inline](missing-inline.md)`\n```md\n[fenced](missing-fenced.md)\n```\n<!--\n[commented](missing-commented.md)\n-->\n[real](real.md)\n"
     self.assertEqual(["real.md"], validator.extract_markdown_destinations(text))
+
+def test_all_valid_uri_schemes_are_non_local(self):
+    self.write(
+        "architecture/source.md",
+        "[ftp](ftp://example.test/file) [telephone](tel:+2348000000000) [custom](bank+ledger:v1/account)\n",
+    )
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_windows_drive_paths_remain_local_paths(self):
+    self.write("architecture/source.md", "[drive](C:/missing/local.md)\n")
+    errors = validator.validate_links(self.root)
+    self.assertTrue(any("C:/missing/local.md does not exist" in error for error in errors))
 
 def test_link_scan_includes_new_untracked_governed_markdown(self):
     self.write("docs/superpowers/plans/new-task-not-added-to-git.md", "[missing](governed-missing.md)\n")
@@ -236,17 +276,18 @@ related_adrs: []
     )
 ```
 
-- [ ] **Step 3: Run the unit tests to verify they fail**
+- [ ] **Step 4: Run the unit tests to verify they fail**
 
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
 Expected: failure because `validate_architecture` and its validation functions do not exist.
 
-- [ ] **Step 4: Implement the standard-library validator**
+- [ ] **Step 5: Implement the standard-library validator**
 
 Use these constants and public functions exactly; later tasks add check names and validators only when they add the corresponding failing contract test:
 
@@ -271,24 +312,26 @@ Implement the bodies with these exact rules:
 
 - Parse only the repository's YAML subset: scalar `key: value`, `key: []`, and indented `- item` lists between the first two `---` lines.
 - `links` walks only `ARCHITECTURE.md`, `architecture/**/*.md`, `docs/superpowers/plans/*.md`, `docs/superpowers/specs/*.md`, `services/*/README.md`, `services/*/docs/**/*.md`, and `.github/pull_request_template.md` when present, directly from the repository-root filesystem rather than `git ls-files`, so newly created and untracked governed files are included. Implement a single `iter_governed_markdown(root: Path) -> Iterator[Path]` used by link validation and later Markdown-wide checks. Prune the exact repository-relative roots `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, and `architecture/diagrams/generated/`, plus any directory component named `node_modules`, `target`, or `build`; do not follow symlinked directories. Markdown outside the explicit governed patterns, including unrelated root/user Markdown and `.claude/`, cannot fail the gate; an optional informational report must remain non-blocking.
-- Before extracting Markdown links, mask CommonMark fenced code blocks opened by at least three backticks or tildes and inline code spans delimited by matching backtick runs. Preserve line breaks while masking so diagnostics retain correct locations. Parse case-insensitive reference definitions first and exclude definition lines from link-use extraction. Parse inline links next. Parse a full `[text][id]` or collapsed `[text][]` reference as a link and reject it when its normalized label has no definition. Parse shortcut `[text]` as a link only when a matching normalized definition exists; otherwise it is ordinary CommonMark text, including task-list `[ ]`. Reject duplicate normalized definitions deterministically at the later definition line even when no link uses the label. Unwrap angle-bracket destinations, convert Markdown backslash-escaped spaces to literal spaces, strip a query component, retain a decoded fragment, and skip `http`, `https`, and `mailto` destinations.
+- Before extracting Markdown links, mask CommonMark fenced code blocks opened by at least three backticks or tildes, inline code spans delimited by matching backtick runs, and HTML comments from `<!--` through `-->`, including multiline comments. Preserve every line break while masking so diagnostics retain correct locations. Parse case-insensitive reference definitions first and exclude definition lines from link-use extraction. Parse inline links next. Parse a full `[text][id]` or collapsed `[text][]` reference as a link and reject it when its normalized label has no definition. Parse shortcut `[text]` as a link only when a matching normalized definition exists; otherwise it is ordinary CommonMark text, including task-list `[ ]`. Reject duplicate normalized definitions deterministically at the later definition line even when no link uses the label. Unwrap angle-bracket destinations, convert Markdown backslash-escaped spaces to literal spaces, strip a query component, and retain a decoded fragment. Treat any destination beginning with a valid URI scheme matching `[A-Za-z][A-Za-z0-9+.-]*:` as external/non-local and skip it, except that `^[A-Za-z]:[\\/]` is a Windows drive path and must continue through local-path resolution.
 - Resolve file paths against the containing file's parent. For pure fragments validate the containing file; for cross-file fragments validate the resolved Markdown file. Build anchors from explicit HTML `id` attributes and deterministic GitHub-style heading slugs: lowercase, remove formatting and punctuation other than hyphens/underscores, convert spaces to hyphens, and append `-1`, `-2`, and later suffixes to duplicate base slugs in document order. A missing target file and a missing fragment are separate actionable errors.
 - Sort errors by path and message so local and CI output is deterministic.
 - Print each error to stderr and return `1`; print `architecture validation passed` and return `0` when clean.
 
-- [ ] **Step 5: Run validator unit tests**
+- [ ] **Step 6: Run validator unit tests**
 
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
 Expected: all generic primitive tests pass without third-party packages. No arc42, ADR, proposal, diagram, migration, archive, PR-body, workflow, or staleness contract is implemented in this task.
 
-- [ ] **Step 6: Commit the validator**
+- [ ] **Step 7: Commit the validator**
 
 ```bash
+set -euo pipefail
 task1_paths=(
   architecture/scripts/tests/test_validate_architecture.py
   architecture/scripts/validate_architecture.py
@@ -320,6 +363,30 @@ git commit --only -m "test: add architecture documentation validator" -- "${task
 - Consumes: authority, metadata, lifecycle, and review rules from the approved specification.
 - Produces: stable human entry points and templates consumed by every later documentation task.
 
+- [ ] **Step 0: Preflight the exact Task 2 write scope**
+
+```bash
+set -euo pipefail
+task2_paths=(
+  ARCHITECTURE.md
+  architecture/README.md
+  architecture/adr/README.md
+  architecture/adr/template.md
+  architecture/archive/proposals/README.md
+  architecture/diagrams/README.md
+  architecture/proposals/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task2_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 2 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 7.
+
 - [ ] **Step 1: Add failing governance-structure and root-size tests**
 
 Add `test_required_governance_files` to the validator tests. It creates a temporary empty root, calls the new `validate_structure`, and asserts the error list names all seven files above. Add `test_root_architecture_must_be_fewer_than_180_lines`, with a valid 179-line fixture and an invalid 180-line fixture, and assert the latter reports `ARCHITECTURE.md must contain fewer than 180 lines`.
@@ -329,6 +396,7 @@ Add `test_required_governance_files` to the validator tests. It creates a tempor
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest \
   architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_required_governance_files \
   architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_root_architecture_must_be_fewer_than_180_lines \
@@ -391,6 +459,7 @@ Require the Mermaid `title` directive to contain the same `CURRENT` or `PROPOSED
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 python3 architecture/scripts/validate_architecture.py --root . --checks links
 ```
@@ -400,6 +469,7 @@ Expected: unit tests pass; link validation passes because not-yet-created arc42 
 - [ ] **Step 7: Commit governance**
 
 ```bash
+set -euo pipefail
 task2_paths=(
   ARCHITECTURE.md
   architecture/README.md
@@ -444,6 +514,36 @@ git commit --only -m "docs: establish architecture governance" -- "${task2_paths
 - Consumes: implemented evidence in `services/funds-core/`, database migrations `V001` through `V006`, funds-core tests, infrastructure manifests, and the approved authority rules.
 - Produces: the canonical current-state architecture baseline linked from the root entry point.
 
+- [ ] **Step 0: Preflight the exact Task 3 write scope**
+
+```bash
+set -euo pipefail
+task3_paths=(
+  ARCHITECTURE.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task3_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 3 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 8.
+
 - [ ] **Step 1: Add failing current-state lifecycle and metadata tests**
 
 Add tests that call new `validate_metadata` and require exactly the twelve filenames, reject `status: proposed` under `arc42/`, reject absent or empty owners, reject a `code_refs` path that does not exist, and accept only ISO `YYYY-MM-DD` `last_verified` values. Add a deprecated arc42 fixture whose `replacement` field is an existing local Markdown link and negative fixtures for a missing, empty, non-link, missing-target, or self-referential replacement. Add proposal fixtures proving `status: implemented` is rejected under active `architecture/proposals/`, accepted only under `architecture/archive/proposals/`, and rejected there if current-architecture replacement or implementation-evidence traceability is absent. Before production changes these tests must fail because `validate_metadata` is absent.
@@ -453,6 +553,7 @@ Add tests that call new `validate_metadata` and require exactly the twelve filen
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
@@ -496,6 +597,7 @@ For decisions, initially link only the ADR template and state that Task 5 create
 Add links from `ARCHITECTURE.md` to all twelve arc42 files. Run:
 
 ```bash
+set -euo pipefail
 python3 architecture/scripts/validate_architecture.py --root . --checks metadata,links
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
@@ -505,6 +607,7 @@ Expected: metadata, links, and unit tests pass. Full structure validation begins
 - [ ] **Step 8: Commit current-state baseline**
 
 ```bash
+set -euo pipefail
 task3_paths=(
   ARCHITECTURE.md
   architecture/arc42/01-introduction-and-goals.md
@@ -551,6 +654,44 @@ git commit --only -m "docs: add current-state arc42 baseline" -- "${task3_paths[
 **Interfaces:**
 - Consumes: all 27 top-level sections of `architecture/modern-core-banking-comprehensive-design-revised.md`.
 - Produces: a complete classification gate that Task 8 must satisfy before archive cutover.
+
+- [ ] **Step 0: Preflight the exact Task 4 write scope**
+
+```bash
+set -euo pipefail
+task4_paths=(
+  architecture/README.md
+  architecture/adr/README.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/proposals/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md
+  docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md
+  services/funds-core/README.md
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task4_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 4 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 6.
 
 - [ ] **Step 1: Add failing granular migration-inventory tests**
 
@@ -609,6 +750,7 @@ self.write(
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_migration_inventory_requires_sections_one_through_twenty_seven -v
 ```
 
@@ -644,6 +786,7 @@ Add `migration` to `CHECKS` and `VALIDATORS` and implement `validate_migration_i
 Run:
 
 ```bash
+set -euo pipefail
 python3 architecture/scripts/validate_architecture.py --root . --checks migration
 ```
 
@@ -652,6 +795,7 @@ Expected: fail only with one or more `unresolved migration row` diagnostics for 
 - [ ] **Step 6: Commit the classification inventory**
 
 ```bash
+set -euo pipefail
 task4_paths=(
   architecture/README.md
   architecture/adr/README.md
@@ -711,6 +855,45 @@ git commit --only -m "docs: inventory comprehensive architecture migration" -- "
 - Produces: `validate_accepted_adr_edge_range(root: Path, base_ref: str, head_ref: str) -> list[str]`, which enumerates commits in `base..head` oldest-first/topologically and validates every parent-to-child edge for every child in that range, including every parent of merge commits.
 - CLI: `--adr-base-ref REF [--adr-head-ref REF]` retains the endpoint/current-working-tree check; `--adr-edge-base-ref REF --adr-edge-head-ref REF` performs the commit-edge range check. These git-aware checks are additive to ordinary repository checks.
 
+- [ ] **Step 0: Preflight the exact Task 5 write scope**
+
+```bash
+set -euo pipefail
+task5_paths=(
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+  architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
+  architecture/adr/0003-use-signed-integer-minor-units.md
+  architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md
+  architecture/adr/0005-use-immutable-journals-and-additive-corrections.md
+  architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md
+  architecture/adr/0007-separate-ledger-identity-from-account-addresses.md
+  architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md
+  architecture/adr/README.md
+  architecture/arc42/01-introduction-and-goals.md
+  architecture/arc42/02-constraints.md
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/04-solution-strategy.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/arc42/08-crosscutting-concepts.md
+  architecture/arc42/09-decisions.md
+  architecture/arc42/10-quality-requirements.md
+  architecture/arc42/11-risks-and-technical-debt.md
+  architecture/arc42/12-glossary.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task5_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 5 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 7.
+
 - [ ] **Step 1: Add failing ADR contract and reciprocal-traceability tests**
 
 Write tests against a new `validate_adrs` behavior before implementing it. Test contiguous numbering, filename/title agreement, required headings, valid statuses, relationship fields containing either a non-empty value or the literal `None`, retrospective marking, separation of decision from implementation status, evidence syntax, and substantive content. The substantive headings are exactly `## Context`, `## Decision drivers`, `## Considered options`, `## Decision`, `## Consequences`, `### Positive`, `### Negative`, `### Risks`, `## Compliance and verification`, and `## Implementation evidence`; each must contain non-whitespace prose, a list item, or a link before the next heading of the same or higher level. Add one negative test per empty substantive heading. Test that the body of `## Implementation evidence` may be exactly `None` only with `Not started` or `Not applicable`. `Partial` and `Complete` require at least one exact list entry in one of these forms: `- HASH changed: repository/path; repository/path`, `- HASH snapshot: repository/path; repository/path`, or `- https://github.com/OWNER/REPOSITORY/pull/NUMBER`. Require at least one path-bound local entry when local hashes are used; a bare hash and an independently listed path never satisfy the contract.
@@ -750,6 +933,7 @@ Use one legal-append fixture and separate mutation fixtures so a single unrelate
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
@@ -793,6 +977,7 @@ Link each ADR from `09-decisions.md`; update `related_adrs` in every arc42 file 
 Run:
 
 ```bash
+set -euo pipefail
 python3 architecture/scripts/validate_architecture.py --root . --checks metadata,adrs,links
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref HEAD
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
@@ -817,6 +1002,7 @@ diff -u "$expected_report" "$migration_report"
 Expected: ADR, metadata, link, and unit-test checks pass. The expected diagnostic set is frozen from the committed Task 4 inventory before Task 5 edits; the migration command fails only for those exact proposal-disposition rows still marked `unresolved` for Task 7. `diff` is silent, proving there are no new proposal rows and no schema, material-block coverage, destination, evidence, or source-marker diagnostics.
 
 ```bash
+set -euo pipefail
 task5_paths=(
   architecture/adr/0001-manage-architecture-as-versioned-code.md
   architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
@@ -876,6 +1062,36 @@ git commit --only -m "docs: record foundational architecture decisions" -- "${ta
 - Consumes: arc42 sections and ADR IDs from Tasks 3 and 5.
 - Produces: Mermaid sources and `architecture/scripts/render-diagrams.sh [output-directory]`, which renders every `.mmd` file and exits non-zero on the first syntax failure.
 
+- [ ] **Step 0: Preflight the exact Task 6 write scope**
+
+```bash
+set -euo pipefail
+task6_paths=(
+  .gitignore
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/diagrams/containers.mmd
+  architecture/diagrams/context.mmd
+  architecture/diagrams/funds-core-components.mmd
+  architecture/diagrams/posting-sequence.mmd
+  architecture/diagrams/single-vm-deployment.mmd
+  architecture/scripts/render-diagrams.sh
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  architecture/tooling/package-lock.json
+  architecture/tooling/package.json
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task6_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 6 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 8.
+
 - [ ] **Step 1: Add failing diagram metadata tests**
 
 Write tests against a new `validate_diagrams` behavior before implementing it. Test the seven required metadata comments, allowed state values, non-empty `abstraction`, non-empty `question`, existing arc42 path, existing ADR IDs, ISO date, matching state in the Mermaid title, required five filenames, and executable mode on `architecture/scripts/render-diagrams.sh`. Include negative tests for missing abstraction, missing question, missing title state, a `CURRENT` metadata/`PROPOSED` title mismatch, a non-executable render script, and an arc42 section that does not contain a Markdown link back to the diagram source. Include a positive fixture in which each diagram's declared arc42 section links its exact `.mmd` path.
@@ -885,6 +1101,7 @@ Write tests against a new `validate_diagrams` behavior before implementing it. T
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
@@ -915,6 +1132,7 @@ Create `architecture/tooling/package.json` with exact content:
 Run `npm install --package-lock-only --prefix architecture/tooling`, then mechanically verify both manifests pin and resolve Mermaid CLI exactly:
 
 ```bash
+set -euo pipefail
 node -e 'const p=require("./architecture/tooling/package.json"); if(p.devDependencies["@mermaid-js/mermaid-cli"]!=="11.16.0") process.exit(1)'
 node -e 'const l=require("./architecture/tooling/package-lock.json"); if(l.packages["node_modules/@mermaid-js/mermaid-cli"].version!=="11.16.0") process.exit(1)'
 ```
@@ -944,6 +1162,7 @@ The script must begin with `#!/usr/bin/env bash`, use `set -euo pipefail`, resol
 Run:
 
 ```bash
+set -euo pipefail
 npm ci --prefix architecture/tooling
 chmod +x architecture/scripts/render-diagrams.sh
 test -x architecture/scripts/render-diagrams.sh
@@ -958,10 +1177,12 @@ Expected: all five required diagram sources render and metadata/link validation 
 Link each source from its owning arc42 section; do not commit generated SVGs. Verify ignored/generated dependencies are not tracked:
 
 ```bash
+set -euo pipefail
 test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/diagrams/generated/**' 'architecture/diagrams/generated/**/*.svg')"
 ```
 
 ```bash
+set -euo pipefail
 task6_paths=(
   .gitignore
   architecture/arc42/03-context-and-scope.md
@@ -1025,6 +1246,44 @@ Expected: the staged-name comparison is exact for Task 6, and the status command
 - Consumes: unimplemented material from the comprehensive design and existing plans.
 - Produces: explicit proposed-state documents with bidirectional links to decisions and delivery plans.
 
+- [ ] **Step 0: Preflight the exact Task 7 write scope**
+
+```bash
+set -euo pipefail
+task7_paths=(
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+  architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
+  architecture/adr/0003-use-signed-integer-minor-units.md
+  architecture/adr/0004-use-postgresql-as-the-authoritative-ledger.md
+  architecture/adr/0005-use-immutable-journals-and-additive-corrections.md
+  architecture/adr/0006-couple-idempotency-and-outbox-to-ledger-commit.md
+  architecture/adr/0007-separate-ledger-identity-from-account-addresses.md
+  architecture/adr/0008-target-an-eight-gib-single-vm-evidence-suite.md
+  architecture/archive/comprehensive-design-migration-inventory.md
+  architecture/infrastructure/infra-ubuntu24.04-poc.md
+  architecture/proposals/account-identifiers-and-nip-inbound.md
+  architecture/proposals/conventional-deposit-products-and-accrual.md
+  architecture/proposals/full-poc-platform.md
+  architecture/proposals/non-interest-banking-products.md
+  architecture/proposals/production-platform.md
+  architecture/proposals/providers-and-reconciliation.md
+  architecture/proposals/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  docs/superpowers/plans/2026-08-30-account-identifiers-and-nip-inbound-implementation.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  docs/superpowers/plans/2026-08-30-conventional-deposit-products-and-accrual-implementation.md
+  docs/superpowers/plans/2026-08-30-non-interest-banking-products-implementation.md
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task7_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 7 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 8.
+
 - [ ] **Step 1: Add failing bidirectional proposal-traceability tests**
 
 Write tests against new proposal metadata and traceability behavior before implementation. Require all six proposal files; allowed statuses; existing `related_plans` paths; existing `related_adrs` IDs; a `**Proposal:**` backlink in the account-identifier, conventional-deposit, and non-interest plans; reciprocal `Related proposals:` links in every ADR named by a proposal; and reciprocal proposal links in every plan named by a proposal. Reassert that active `architecture/proposals/` rejects `status: implemented` and that an implemented proposal is valid only under `architecture/archive/proposals/` with current-architecture replacement and implementation evidence. For `2026-08-30-accounting-kernel-implementation.md`, require `**Current architecture:**` links to arc42 sections 05, 06, and 08 plus `**Retrospective ADRs:**` links to ADR-0002 through ADR-0006, and explicitly reject a `**Proposal:**` backlink.
@@ -1034,6 +1293,7 @@ Write tests against new proposal metadata and traceability behavior before imple
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
@@ -1066,6 +1326,7 @@ Do not add a proposal backlink to the already-implemented accounting-kernel plan
 Update every proposal-classified inventory row with its exact real proposal anchor and `resolved`; put the exact `<!-- migration-source: SOURCE_KEY -->` marker in the selected proposal section and remove that row's superseded provisional marker from `architecture/proposals/README.md`. The global marker inventory must contain no provisional governance marker after remapping. Run:
 
 ```bash
+set -euo pipefail
 python3 architecture/scripts/validate_architecture.py --root . --checks metadata,links,migration,traceability
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref HEAD
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
@@ -1076,6 +1337,7 @@ Expected: metadata, links, migration inventory, bidirectional traceability, acce
 - [ ] **Step 8: Commit proposal separation**
 
 ```bash
+set -euo pipefail
 task7_paths=(
   architecture/adr/0001-manage-architecture-as-versioned-code.md
   architecture/adr/0002-centralize-financial-invariants-in-funds-core.md
@@ -1136,6 +1398,26 @@ Archive-cutover commit (`task8_cutover_paths`):
 - Produces: a non-authoritative historical document under `archive/` and no stale internal links.
 - Produces: a persistent approval record bound to the reviewed pre-cutover full commit and exact inventory Git blob.
 
+- [ ] **Step 0: Preflight the exact Task 8 review-evidence write scope**
+
+Run before writing archive-state tests, validator code, or the review record:
+
+```bash
+set -euo pipefail
+task8_review_paths=(
+  architecture/archive/comprehensive-design-migration-review.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task8_review_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 8 review paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Non-owned state is allowed. This exact array is repeated unchanged in Step 4's review-evidence commit.
+
 - [ ] **Step 1: Add failing archive-state-machine tests**
 
 Write tests against a new `validate_archive_state` behavior before implementing it. Cover every state explicitly:
@@ -1153,6 +1435,7 @@ Use the complete 27-root, subsection, and material-block fixture from Task 4 rat
 Add `test_archive_review_binds_named_approval_to_committed_inventory`, using a temporary Git repository with a resolved committed inventory. It records a different named reviewer and implementer, `Outcome: APPROVED`, `Unresolved rows: 0`, the 40-hex reviewed commit, and the 40-hex inventory blob; it passes, then fails independently after a nonexistent commit, wrong blob, or post-review inventory commit is introduced. The state check is separate from the inventory's unresolved-row diagnostic: unresolved/pre-cutover is a safe archive state even though the complete migration check still blocks cutover. Run the new tests before implementation:
 
 ```bash
+set -euo pipefail
 python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_archive_state_selects_exactly_one_source_and_rechecks_full_inventory -v
 python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_archive_review_binds_named_approval_to_committed_inventory -v
 ```
@@ -1168,6 +1451,7 @@ Implement `validate_archive_review(root: Path) -> list[str]` and register `archi
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest architecture.scripts.tests.test_validate_architecture.ValidatorTest.test_archive_state_selects_exactly_one_source_and_rechecks_full_inventory -v
 python3 architecture/scripts/validate_architecture.py --root . --checks migration,archive,links
 ```
@@ -1179,6 +1463,7 @@ Expected: the focused archive-state/source-selection tests pass, followed by rep
 After Task 7 is committed and before any source move or inventory edit, resolve the exact review inputs:
 
 ```bash
+set -euo pipefail
 reviewed_commit="$(git rev-parse --verify 'HEAD^{commit}')"
 printf '%s' "$reviewed_commit" | grep -Eq '^[0-9a-f]{40}$'
 git cat-file -e "$reviewed_commit^{commit}"
@@ -1210,6 +1495,7 @@ Create `architecture/archive/comprehensive-design-migration-review.md` with exac
 The descriptive text after `Reviewed commit`, `Reviewer`, `Implementer`, and `Inventory blob` above specifies the required concrete value; the created evidence file contains the concrete value itself. Do not modify the reviewed inventory. Run and commit:
 
 ```bash
+set -euo pipefail
 python3 architecture/scripts/validate_architecture.py --root . --checks migration,archive,archive-review,links
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 task8_review_paths=(
@@ -1230,42 +1516,88 @@ test "$(git rev-parse --verify "$review_commit^")" = "$reviewed_commit"
 python3 architecture/scripts/validate_architecture.py --root . --checks migration,archive,archive-review,links
 ```
 
-- [ ] **Step 5: Move the comprehensive design with Git**
+- [ ] **Step 5: Preflight the exact Task 8 archive-cutover write scope**
+
+Run only after the review-evidence commit succeeds and immediately before any cutover edit or `git mv`:
+
+```bash
+set -euo pipefail
+task8_cutover_paths=(
+  ARCHITECTURE.md
+  architecture/README.md
+  architecture/archive/modern-core-banking-comprehensive-design-revised.md
+  architecture/infrastructure/infra-ubuntu24.04-poc.md
+  architecture/modern-core-banking-comprehensive-design-revised.md
+  docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md
+  services/funds-core/README.md
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task8_cutover_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 8 cutover paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Non-owned state is allowed. This exact array is repeated unchanged in Step 9's archive-cutover commit.
+
+- [ ] **Step 6: Move the comprehensive design with Git**
 
 Run:
 
 ```bash
+set -euo pipefail
 git mv architecture/modern-core-banking-comprehensive-design-revised.md architecture/archive/modern-core-banking-comprehensive-design-revised.md
 ```
 
 Add a banner immediately under its title: `Historical source document — non-authoritative; see /ARCHITECTURE.md and the migration inventory.`
 
-- [ ] **Step 6: Repair every old-path link**
+- [ ] **Step 7: Repair links and add exact historical navigation**
 
 Run:
 
 ```bash
+set -euo pipefail
 rg -n 'architecture/modern-core-banking-comprehensive-design-revised.md|modern-core-banking-comprehensive-design-revised.md' --glob '*.md'
 ```
 
-Update `services/funds-core/README.md`, `architecture/infrastructure/infra-ubuntu24.04-poc.md`, and the accounting-kernel plan to the root entry point or exact arc42/proposal destination. The approved design's repository-tree example and this implementation plan may retain the historical filename as non-link prose. Only the migration inventory may contain a Markdown link to the archived historical source.
+Update `services/funds-core/README.md`, `architecture/infrastructure/infra-ubuntu24.04-poc.md`, and the accounting-kernel plan to the root entry point or exact arc42/proposal destination. The approved design's repository-tree example and this implementation plan may retain the historical filename as non-link prose. Markdown links to the archived historical source are allowed only in the migration inventory and the two deliberate navigation entries below.
 
-- [ ] **Step 7: Run complete documentation validation**
+Make these two task-owned navigation edits explicitly:
+
+- In `ARCHITECTURE.md`, add this concise section and keep the file below 180 physical lines:
+
+```markdown
+## Historical source
+
+The [archived comprehensive design](architecture/archive/modern-core-banking-comprehensive-design-revised.md) is non-authoritative. Use the [migration inventory](architecture/archive/comprehensive-design-migration-inventory.md) to find each classified current, proposed, decision, service, plan, or historical destination.
+```
+
+- In `architecture/README.md`, add this archive/navigation section; its relative links intentionally differ from the root entry point's links:
+
+```markdown
+## Archive and migration evidence
+
+The [archived comprehensive design](archive/modern-core-banking-comprehensive-design-revised.md), [migration inventory](archive/comprehensive-design-migration-inventory.md), and [independent migration review](archive/comprehensive-design-migration-review.md) preserve source history and cutover evidence. They are non-authoritative; authority for current architecture remains with the [arc42 current-state documents](arc42/01-introduction-and-goals.md) and their sibling sections.
+```
+
+- [ ] **Step 8: Run complete documentation validation**
 
 Run:
 
 ```bash
+set -euo pipefail
 python3 architecture/scripts/validate_architecture.py --root .
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 architecture/scripts/render-diagrams.sh
 git diff --check -- ARCHITECTURE.md architecture/README.md architecture/archive/modern-core-banking-comprehensive-design-revised.md architecture/infrastructure/infra-ubuntu24.04-poc.md architecture/modern-core-banking-comprehensive-design-revised.md docs/superpowers/plans/2026-08-30-accounting-kernel-implementation.md services/funds-core/README.md
 ```
 
-Expected: validation, unit tests, Mermaid rendering, and whitespace checks pass.
+Expected: validation, unit tests, Mermaid rendering, and whitespace checks pass. Link validation resolves the root historical-source/archive links, the architecture README's source/inventory/review links, and all repaired old-path references.
 
-- [ ] **Step 8: Commit the archive cutover**
+- [ ] **Step 9: Commit the archive cutover**
 
 ```bash
+set -euo pipefail
 task8_cutover_paths=(
   ARCHITECTURE.md
   architecture/README.md
@@ -1301,6 +1633,24 @@ git commit --only -m "docs: complete architecture documentation migration" -- "$
 - Consumes: arc42 and Mermaid `last_verified` ISO dates plus an explicit reporting date.
 - Produces: `report_stale(root: Path, as_of: date, threshold_days: int = 90) -> list[StaleWarning]` and CLI flags `--report-stale --as-of YYYY-MM-DD`; warnings alone always exit `0`.
 
+- [ ] **Step 0: Preflight the exact Task 9 write scope**
+
+```bash
+set -euo pipefail
+task9_paths=(
+  architecture/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task9_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 9 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 5.
+
 - [ ] **Step 1: Add failing deterministic staleness tests**
 
 Before production changes, test an explicit `as_of=date(2026, 9, 1)` with a 90-calendar-day threshold: age 90 is not stale, age 91 is stale, future dates produce a validation error rather than a stale warning, malformed dates remain blocking metadata/diagram errors, warnings are sorted by repository-relative path, and a warning-only CLI invocation returns `0`. Test local output as `WARNING: <path>: last_verified <date> is 91 days old (threshold: 90)` and GitHub Actions output as `::warning file=<path>::last_verified <date> is 91 days old (threshold: 90)` when `GITHUB_ACTIONS=true`.
@@ -1310,6 +1660,7 @@ Before production changes, test an explicit `as_of=date(2026, 9, 1)` with a 90-c
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
@@ -1324,6 +1675,7 @@ Add an immutable `StaleWarning` dataclass containing `path: Path`, `last_verifie
 Document the 90-day report-only threshold and command in `architecture/README.md`. Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of 2026-09-01
 ```
@@ -1333,6 +1685,7 @@ Expected: tests pass; any stale documents print deterministic warnings and the c
 - [ ] **Step 5: Commit stale reporting**
 
 ```bash
+set -euo pipefail
 task9_paths=(
   architecture/README.md
   architecture/scripts/tests/test_validate_architecture.py
@@ -1361,6 +1714,26 @@ git commit --only -m "feat: report stale architecture verification" -- "${task9_
 - Consumes: complete local validation and render commands.
 - Produces: an architecture-impact declaration for reviewers, a read-only PR-event-body checker, and an automated GitHub Actions gate on every pull request.
 
+- [ ] **Step 0: Preflight the exact Task 10 write scope**
+
+```bash
+set -euo pipefail
+task10_paths=(
+  .github/pull_request_template.md
+  .github/workflows/architecture-docs.yml
+  architecture/README.md
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task10_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 10 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before Step 1 edits; non-owned state is allowed. This exact array is repeated unchanged in Step 7.
+
 - [ ] **Step 1: Add failing PR-body and workflow-contract validation**
 
 Extend `validate_structure` to require these literal prompts:
@@ -1383,7 +1756,7 @@ Add tests before changing production code:
 - `validate_pr_body` accepts exactly one selection; for `Architecture changed`, all five labels have non-empty values, `None` is allowed only for an unaffected artifact field, at least one of ADR/arc42/proposal/diagram is not `None`, and verification evidence is not `None`.
 - `validate_pr_body` parses exactly one canonical `## Architecture impact` section, requires each checkbox prompt and field label exactly once inside that section, and rejects a second canonical section or any duplicate canonical checkbox/field literal elsewhere in prose. Fenced examples, inline-code spans, and HTML comments containing complete fake sections or duplicate labels are masked and do not satisfy or invalidate the real section. Add a bypass fixture containing `` `Related ADRs:` `- [x] No architecture impact` `` outside an otherwise valid canonical section and prove those inline-code literals are ignored rather than counted or accepted.
 - `validate_workflow_contract` requires the explicit pull-request event set `types: [opened, synchronize, reopened, edited, ready_for_review]` with no path filter, `push` to `master`, top-level `permissions: contents: read`, checkout `fetch-depth: 0`, the PR-body step guarded by `github.event_name == 'pull_request'`, unit tests, repository validation, npm install, direct executable diagram rendering, stale reporting with an explicit UTC date, and event-aware diff checking.
-- Workflow validation strips YAML comments outside quoted scalars and uses indentation-aware mapping/sequence parsing for top-level `on` and `permissions`, the validation job, and its ordered step mappings. A comment, block-scalar example, wrong job, or nested similarly named key cannot satisfy a required trigger, permission, guard, checkout input, or run step. Duplicate top-level/job keys and structurally misplaced literals fail.
+- Workflow validation strips YAML comments outside quoted scalars and uses indentation-aware mapping/sequence parsing for top-level `on` and `permissions`, the validation job, and its ordered step mappings. A comment, block-scalar example, wrong job, or same-spelled key nested at the wrong structural location cannot satisfy a required trigger, permission, guard, checkout input, or run step. Duplicate top-level/job keys and structurally misplaced literals fail.
 - A workflow fixture with a missing `edited` event, `pull_request.paths`, `contents: write`, missing PR-body checking, a non-executable render-script contract, bare `git diff --check`, `git diff --check "$base_sha..$head_sha"` without a verified merge base, known-base PR/push logic that omits `--adr-edge-base-ref`/`--adr-edge-head-ref`, a first-parent-only merge walk, or `git diff-tree --check --root "$GITHUB_SHA"` as the unavailable-push-base fallback fails with a focused diagnostic.
 - Add an integration-style unit fixture that initializes a temporary Git repository, commits a Markdown file containing trailing whitespace in the penultimate commit, and makes an unrelated clean tip commit. Assert the tip-only `git diff-tree --check "$tip"` output misses the earlier file, while `empty_tree=$(git hash-object -t tree /dev/null)` followed by `git diff --check "$empty_tree" "$tip"` reports it. This proves the fallback covers the complete current tree of a multi-commit replacement push rather than only the tip commit.
 - Add a behind-base Git fixture: create a common commit, a feature head from it, and then advance the base branch separately. Assert `git merge-base "$base_sha" "$head_sha"` is the common commit, not the newer base tip, and assert the PR range helper validates and returns `merge_base..head_sha`. Include an Accepted ADR mutation on the feature branch and prove the same merge-base/head pair makes the edge-range ADR validator reject it.
@@ -1394,6 +1767,7 @@ Add tests before changing production code:
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 ```
 
@@ -1495,6 +1869,7 @@ Update `architecture/README.md` with the CI workflow path. Leave ADR-0001 implem
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 python3 architecture/scripts/validate_architecture.py --root .
 npm ci --prefix architecture/tooling
@@ -1514,6 +1889,7 @@ Expected: all unit tests pass; repository validation prints `architecture valida
 - [ ] **Step 7: Commit workflow enforcement**
 
 ```bash
+set -euo pipefail
 task10_paths=(
   .github/pull_request_template.md
   .github/workflows/architecture-docs.yml
@@ -1540,11 +1916,28 @@ git commit --only -m "ci: enforce architecture documentation contracts" -- "${ta
 - Consumes: the full commit hash produced by Task 10.
 - Produces: ADR-0001 with `Implementation status: Complete` and immutable local implementation evidence.
 
+- [ ] **Step 0: Preflight the exact Task 11 write scope**
+
+```bash
+set -euo pipefail
+task11_paths=(
+  architecture/adr/0001-manage-architecture-as-versioned-code.md
+)
+owned_state="$(git status --porcelain=v1 --untracked-files=all --ignored=matching -- "${task11_paths[@]}")"
+if [[ -n "$owned_state" ]]; then
+  printf '%s\n' 'Task 11 owned paths overlap existing work; stop and coordinate without altering it:' "$owned_state" >&2
+  exit 1
+fi
+```
+
+Expected: no output. Run this before capturing evidence or editing the ADR; non-owned state is allowed. This exact array is repeated unchanged in Step 4.
+
 - [ ] **Step 1: Capture and validate the Task 10 commit hash**
 
 Run:
 
 ```bash
+set -euo pipefail
 framework_commit="$(git rev-parse HEAD)"
 test "$(printf '%s' "$framework_commit" | wc -c)" -eq 40
 git show --quiet --format='%s' "$framework_commit"
@@ -1557,6 +1950,7 @@ Expected: a 40-character hash and subject `ci: enforce architecture documentatio
 Change only `Implementation status: Partial` to `Implementation status: Complete`. Generate the exact path-bound entry with the captured Task 10 hash:
 
 ```bash
+set -euo pipefail
 printf -- '- %s changed: .github/pull_request_template.md; .github/workflows/architecture-docs.yml; architecture/README.md; architecture/scripts/tests/test_validate_architecture.py; architecture/scripts/validate_architecture.py\n' "$framework_commit"
 ```
 
@@ -1574,6 +1968,7 @@ architecture/scripts/render-diagrams.sh
 Run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 python3 architecture/scripts/validate_architecture.py --root .
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$framework_commit"
@@ -1588,6 +1983,7 @@ Expected: all automated checks pass, the git-aware accepted-ADR check accepts th
 - [ ] **Step 4: Commit evidence finalization**
 
 ```bash
+set -euo pipefail
 task11_paths=(
   architecture/adr/0001-manage-architecture-as-versioned-code.md
 )
@@ -1606,6 +2002,7 @@ git commit --only -m "docs: finalize architecture framework evidence" -- "${task
 From the repository root, run:
 
 ```bash
+set -euo pipefail
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
 python3 architecture/scripts/validate_architecture.py --root .
 python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of 2026-09-01
