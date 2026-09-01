@@ -33,6 +33,8 @@ The short version:
 
 - [ ] New public types have a purpose comment; new migrations have a header.
 - [ ] No comment restates its code; no `TODO`/`FIXME` was added.
+- [ ] `./mvnw checkstyle:check` passes in `services/funds-core` (it also runs
+      inside `validate`, so a violation fails the build before any test does).
 - [ ] If a migration was edited, the tests that read it as text still pass
       (`MigrationIT` asserts on `V004__application_roles.sql`).
 - [ ] `./mvnw clean verify` was run in `services/funds-core` with Docker

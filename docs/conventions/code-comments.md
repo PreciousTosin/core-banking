@@ -153,12 +153,30 @@ A commenting change is verified in three steps:
 
 ## Enforcement
 
-Enforcement is a planned follow-up, not part of the initial adoption:
+The machine-checkable part of this document runs as Checkstyle in the
+`services/funds-core` build, bound to `validate` so it fails before the test
+gate. The ruleset is `services/funds-core/config/checkstyle/checkstyle.xml`:
 
-- Checkstyle with a minimal ruleset (`MissingJavadocType` on public types in
-  `src/main`, `InvalidJavadocPosition`, `JavadocStyle`). Deliberately no
-  `MissingJavadocMethod`, which pushes authors toward restating code.
-- A migration-header check that fails the build if any `V*.sql` lacks a
-  leading `--` block.
+- `MissingJavadocType` (scope `package`, main and test sources) — every type
+  that is not private, including nested ones and package-private test classes,
+  carries a purpose comment.
+- `InvalidJavadocPosition` — a Javadoc block wedged between an annotation and
+  its declaration documents nothing.
+- `SummaryJavadoc`, `JavadocContentLocation`,
+  `JavadocMissingWhitespaceAfterAsterisk`, `NonEmptyAtclauseDescription` — the
+  first sentence is a real summary and ends with a period. These replace
+  `JavadocStyle`, which Checkstyle removed in version 13.
+- `RegexpHeader` on `db/migration/*.sql` — every migration opens with a
+  `-- Vxxx:` header block of at least two lines.
+- `RegexpSingleline` on `.java` and `.sql` — no `TODO`, `FIXME` or `XXX`.
 
-Both would be wired into the module's `verify` phase.
+`MissingJavadocMethod` is deliberately not enabled: requiring Javadoc on every
+method produces comments that restate the signature.
+
+Run it alone with `./mvnw checkstyle:check` from `services/funds-core`. The
+Checkstyle version is pinned in the POM because the plugin's bundled 9.3 cannot
+parse Java 25.
+
+The rest of this document — whether a comment restates its code, whether a
+claim is true, whether the right concept is named — is not mechanizable and
+stays with the reviewer.
