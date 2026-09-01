@@ -2,6 +2,8 @@ import tempfile
 import subprocess
 import unittest
 import os
+import re
+from unittest import mock
 from pathlib import Path
 
 from architecture.scripts import validate_architecture as validator
@@ -699,34 +701,33 @@ class AdrValidatorTest(unittest.TestCase):
             ),
         )
 
+    def replace_section(self, text: str, heading: str, replacement: str) -> str:
+        lines = text.splitlines()
+        start = lines.index(heading)
+        level = len(heading) - len(heading.lstrip("#"))
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            match = re.match(r"^(#{2,3})\s+", lines[index])
+            if match and len(match.group(1)) <= level:
+                end = index
+                break
+        replacement_lines = replacement.splitlines() if replacement else []
+        return "\n".join(lines[: start + 1] + [""] + replacement_lines + [""] + lines[end:]).rstrip() + "\n"
+
     def test_adr_contract_rejects_number_filename_title_fields_and_empty_sections(self):
         self.write("architecture/adr/0001-wrong.md", self.valid_adr(number=2))
         errors = validator.validate_adrs(self.root)
         self.assertTrue(any("filename/title" in error or "ADR-0001" in error for error in errors), errors)
 
-        headings = (
-            "## Context",
-            "## Decision drivers",
-            "## Considered options",
-            "## Decision",
-            "### Positive",
-            "### Negative",
-            "### Risks",
-            "## Compliance and verification",
-            "## Implementation evidence",
-        )
-        for heading in headings:
+        for heading in validator.ADR_SUBSTANTIVE_HEADINGS:
             with self.subTest(heading=heading):
                 self.root.joinpath("architecture/adr/0001-wrong.md").unlink(missing_ok=True)
                 text = self.valid_adr(number=1, title="Manage architecture as versioned code")
-                if heading == "## Consequences":
-                    text = text.replace("## Consequences\n\n", "## Consequences\n", 1)
-                else:
-                    body = validator._section_bodies(text)[heading]
-                    text = text.replace(f"{heading}\n\n{body}", heading, 1)
+                replacement = "### Positive\n\n### Negative\n\n### Risks" if heading == "## Consequences" else ""
+                text = self.replace_section(text, heading, replacement)
                 self.write("architecture/adr/0001-manage-architecture-as-versioned-code.md", text)
                 errors = validator.validate_adrs(self.root)
-                self.assertTrue(any(f"{heading} must not be empty" in error for error in errors), errors)
+                self.assertTrue(any(f"{heading} must contain prose, a list item, or a link" in error for error in errors), errors)
 
         text = self.valid_adr()
         decision = validator._section_bodies(text)["## Decision"]
@@ -737,6 +738,43 @@ class AdrValidatorTest(unittest.TestCase):
         self.write("architecture/adr/0009-test-decision.md", text)
         errors = validator.validate_adrs(self.root)
         self.assertTrue(any("headings must occur once in the required order" in error for error in errors), errors)
+
+    def test_substantive_sections_reject_comment_anchor_and_rule_only_content(self):
+        for name, body in (
+            ("comment", "<!-- comment only -->"),
+            ("anchor", '<a id="anchor-only"></a>'),
+            ("rule", "---"),
+        ):
+            with self.subTest(name=name):
+                text = self.replace_section(self.valid_adr(), "## Context", body)
+                self.write("architecture/adr/0009-test-decision.md", text)
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any("## Context must contain prose, a list item, or a link" in error for error in errors), errors)
+
+    def test_substantive_sections_accept_prose_list_items_and_links(self):
+        for name, body in (
+            ("prose", "A prose statement."),
+            ("list", "- A list item."),
+            ("link", "[A reference](reference.md)"),
+        ):
+            with self.subTest(name=name):
+                text = self.replace_section(self.valid_adr(), "## Context", body)
+                self.write("architecture/adr/0009-test-decision.md", text)
+                errors = validator.validate_adrs(self.root)
+                self.assertFalse(any("## Context must contain" in error for error in errors), errors)
+
+    def test_adr_metadata_fields_are_exact_ordered_and_unique(self):
+        cases = (
+            ("duplicate", "- Status: Proposed", "- Status: Proposed\n- Status: Proposed"),
+            ("reordered", "- Status: Proposed\n- Retrospective: No", "- Retrospective: No\n- Status: Proposed"),
+            ("unexpected", "- Scope: Test scope", "- Scope: Test scope\n- Unexpected: value"),
+            ("unexpected-punctuation", "- Scope: Test scope", "- Scope: Test scope\n- Unexpected-field: value"),
+        )
+        for name, old, new in cases:
+            with self.subTest(name=name):
+                self.write("architecture/adr/0009-test-decision.md", self.valid_adr().replace(old, new, 1))
+                errors = validator.validate_adrs(self.root)
+                self.assertTrue(any("metadata fields must occur exactly once in the required order" in error for error in errors), errors)
 
     def test_adr_contract_rejects_invalid_statuses_relationships_and_unbound_evidence(self):
         cases = (
@@ -779,6 +817,19 @@ class AdrValidatorTest(unittest.TestCase):
                 errors = validator.validate_adrs(self.root)
                 self.assertTrue(any(fragment in error for error in errors), errors)
         self.assertRegex(root_commit, r"^[0-9a-f]{40}$")
+
+    def test_changed_evidence_fails_when_changed_paths_cannot_be_derived(self):
+        self.init_git()
+        self.write("evidence/changed.txt", "v1\n")
+        commit = self.commit_all("evidence")
+        evidence = f"- {commit} changed: evidence/changed.txt"
+        self.write(
+            "architecture/adr/0009-test-decision.md",
+            self.valid_adr(implementation_status="Partial", evidence=evidence),
+        )
+        with mock.patch.object(validator, "_changed_paths", return_value=None):
+            errors = validator.validate_adrs(self.root)
+        self.assertTrue(any(f"could not derive changed paths for {commit}" in error for error in errors), errors)
 
     def test_pull_request_evidence_requires_matching_normalized_github_origin(self):
         for origin in ("git@github.com:Acme/Bank.git", "https://github.com/acme/bank.git"):
@@ -885,13 +936,112 @@ class AdrValidatorTest(unittest.TestCase):
                 errors = validator.validate_accepted_adr_immutability(self.root, base)
                 self.assertTrue(any("new ADR must be Proposed" in error for error in errors), errors)
 
+        invalid_cases = (
+            ("missing", self.valid_adr(status="Accepted", retrospective="Yes", implementation_status="Not started", evidence="None")),
+            ("nonexistent", self.valid_adr(status="Accepted", retrospective="Yes", implementation_status="Partial", evidence=f"- {'0' * 40} snapshot: evidence/history.txt")),
+            ("path-missing", self.valid_adr(status="Accepted", retrospective="Yes", implementation_status="Partial", evidence=f"- {base} snapshot: evidence/missing.txt")),
+            ("mode-invalid", self.valid_adr(status="Accepted", retrospective="Yes", implementation_status="Partial", evidence=f"- {base} observed: evidence/history.txt")),
+        )
+        for name, text in invalid_cases:
+            with self.subTest(name=name):
+                self.write("architecture/adr/0009-test-decision.md", text)
+                errors = validator.validate_accepted_adr_immutability(self.root, base)
+                self.assertTrue(any("new ADR must be Proposed" in error for error in errors), errors)
+
+        self.write("evidence/future.txt", "future\n")
+        future = self.commit_all("future evidence")
+        future_text = self.valid_adr(
+            status="Accepted",
+            retrospective="Yes",
+            implementation_status="Partial",
+            evidence=f"- {future} snapshot: evidence/future.txt",
+        )
+        self.write("architecture/adr/0009-test-decision.md", future_text)
+        future_errors = validator.validate_accepted_adr_immutability(self.root, base)
+        self.assertTrue(any("new ADR must be Proposed" in error for error in future_errors), future_errors)
+        record = validator._parse_adr("architecture/adr/0009-test-decision.md", future_text.encode())
+        self.assertIsNotNone(record)
+        self.assertFalse(validator._qualified_historical_introduction(self.root, record, base, future))
+
+    def test_introduction_protection_starts_after_qualified_child(self):
+        self.init_git()
+        self.write("evidence/history.txt", "historical\n")
+        range_base = self.commit_all("historical evidence")
+        evidence = f"- {range_base} snapshot: evidence/history.txt"
+        path = "architecture/adr/0009-test-decision.md"
+        qualified_text = self.valid_adr(
+            status="Accepted",
+            retrospective="Yes",
+            implementation_status="Partial",
+            evidence=evidence,
+            context="context-v1",
+        )
+        self.write(path, qualified_text)
+        qualified = self.commit_all("qualified retrospective introduction")
+        self.write(path, qualified_text.replace("context-v1", "context-v2", 1))
+        mutated = self.commit_all("mutate qualified introduction")
+        errors = validator.validate_accepted_adr_edge_range(self.root, range_base, mutated)
+        self.assertTrue(any(qualified in error and mutated in error and path in error for error in errors), errors)
+        self.assertFalse(any(range_base in error and qualified in error for error in errors), errors)
+
+        branch = self.git("branch", "--show-current") or "master"
+        self.git("checkout", "-q", "-b", "non-retrospective", range_base)
+        self.write(path, qualified_text.replace("Retrospective: Yes", "Retrospective: No", 1))
+        non_retrospective = self.commit_all("non-retrospective introduction")
+        non_retrospective_errors = validator.validate_accepted_adr_edge_range(self.root, range_base, non_retrospective)
+        self.assertTrue(
+            any(range_base in error and non_retrospective in error and "new ADR must be Proposed" in error for error in non_retrospective_errors),
+            non_retrospective_errors,
+        )
+        self.git("checkout", "-q", branch)
+
     def test_exact_adr_0001_bootstrap_exception_is_bound_to_approved_design(self):
         repository = Path(__file__).resolve().parents[3]
         path = "architecture/adr/0001-manage-architecture-as-versioned-code.md"
-        present_at_head = subprocess.run(["git", "-C", str(repository), "cat-file", "-e", f"HEAD:{path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        base = "HEAD^" if present_at_head else "HEAD"
-        errors = validator.validate_accepted_adr_immutability(repository, base, "HEAD" if present_at_head else None)
+        task_commit = subprocess.run(
+            ["git", "-C", str(repository), "log", "--format=%H", "--fixed-strings", "--grep=docs: record foundational architecture decisions", "-n", "1"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        base = f"{task_commit}^"
+        errors = validator.validate_accepted_adr_immutability(repository, base, task_commit)
         self.assertFalse(any(path in error and "new ADR must be Proposed" in error for error in errors), errors)
+
+        clone = self.root / "repository"
+        subprocess.run(["git", "clone", "-q", "--shared", str(repository), str(clone)], check=True)
+        subprocess.run(["git", "-C", str(clone), "checkout", "-q", base], check=True)
+        original = subprocess.run(
+            ["git", "-C", str(repository), "show", f"{task_commit}:{path}"],
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        original_text = original.decode("utf-8")
+        mutations = (
+            ("title", "# ADR-0001: Manage architecture as versioned code", "# ADR-0001: Manage architecture differently"),
+            ("status-rejected", "- Status: Accepted", "- Status: Rejected"),
+            ("retrospective", "- Retrospective: No", "- Retrospective: Yes"),
+            ("decision-date", "- Decision date: 2026-09-01", "- Decision date: 2026-09-02"),
+            ("scope", f"- Scope: {validator.ADR_BOOTSTRAP_SCOPE}", "- Scope: Different scope"),
+            ("plan", f"- Related implementation plans: {validator.ADR_BOOTSTRAP_PLAN}", "- Related implementation plans: None"),
+            ("evidence-mode", " changed: docs/superpowers/specs/", " snapshot: docs/superpowers/specs/"),
+            ("evidence-hash", validator.ADR_BOOTSTRAP_DESIGN_HASH, "0" * 40),
+            ("evidence-path", validator.ADR_BOOTSTRAP_DESIGN_PATH, "docs/superpowers/specs/missing.md"),
+        )
+        target = clone / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for name, old, new in mutations:
+            with self.subTest(name=name):
+                target.write_text(original_text.replace(old, new, 1))
+                mutation_errors = validator.validate_accepted_adr_immutability(clone, base)
+                self.assertTrue(any(path in error and "new ADR must be Proposed" in error for error in mutation_errors), mutation_errors)
+                target.unlink()
+
+        other_path = "architecture/adr/0002-manage-architecture-as-versioned-code.md"
+        other = clone / other_path
+        other.write_bytes(original)
+        other_errors = validator.validate_accepted_adr_immutability(clone, base)
+        self.assertTrue(any(other_path in error and "new ADR must be Proposed" in error for error in other_errors), other_errors)
 
     def test_accepted_content_status_and_sequences_are_protected_but_legal_appends_pass(self):
         self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
@@ -920,6 +1070,7 @@ class AdrValidatorTest(unittest.TestCase):
             ("Implementation status: Complete", "Implementation status: Not started", "implementation status"),
             ("pull/1", "pull/9", "append-only sequence"),
             ("- Scope: Test scope", "- Scope: Test scope\n- Extra accepted field: changed", "accepted ADR field changed"),
+            ("- Status: Accepted", "- Status: Accepted\n- Status: Accepted", "accepted ADR metadata field layout changed"),
             ("snapshot: evidence/stable.txt", "snapshot: evidence/stable.txt\n- invalid evidence", "Implementation evidence entry is invalid"),
         ):
             original = path.read_text(); path.write_text(original.replace(old, new, 1))
@@ -957,13 +1108,35 @@ class AdrValidatorTest(unittest.TestCase):
                 path.write_text(path.read_text().replace("Related commits: None", "Related commits: terminal-evidence"))
                 appended = self.commit_all("append terminal relationship")
                 self.assertEqual([], validator.validate_accepted_adr_immutability(self.root, terminal_commit, appended))
-                self.write_valid_adr(terminal, "context-v2"); mutated = self.commit_all("mutate terminal")
+                path.write_text(path.read_text().replace("context-v1", "context-v2", 1))
+                mutated = self.commit_all("mutate terminal")
+                edge_errors = validator.validate_accepted_adr_immutability(self.root, appended, mutated)
+                self.assertTrue(any("immutable section changed" in error for error in edge_errors), edge_errors)
+                self.assertFalse(any("append-only sequence" in error for error in edge_errors), edge_errors)
                 errors = validator.validate_accepted_adr_edge_range(self.root, accepted, mutated)
                 self.assertTrue(any(appended in error and mutated in error for error in errors), errors)
 
-    def test_terminal_statuses_cannot_reverse_or_change_laterally(self):
-        pairs = (("Superseded", "Accepted"), ("Superseded", "Deprecated"), ("Deprecated", "Accepted"), ("Deprecated", "Superseded"), ("Rejected", "Accepted"), ("Rejected", "Proposed"))
-        for parent_status, child_status in pairs:
+    def test_terminal_statuses_cannot_reverse(self):
+        statuses = ("Proposed", "Accepted", "Rejected", "Superseded", "Deprecated")
+        allowed = {
+            ("Proposed", "Proposed"),
+            ("Proposed", "Accepted"),
+            ("Proposed", "Rejected"),
+            ("Accepted", "Accepted"),
+            ("Accepted", "Superseded"),
+            ("Accepted", "Deprecated"),
+            ("Rejected", "Rejected"),
+            ("Superseded", "Superseded"),
+            ("Deprecated", "Deprecated"),
+        }
+        forbidden = tuple(
+            (parent_status, child_status)
+            for parent_status in statuses
+            for child_status in statuses
+            if (parent_status, child_status) not in allowed
+        )
+        self.assertEqual(16, len(forbidden))
+        for parent_status, child_status in forbidden:
             with self.subTest(pair=(parent_status, child_status)):
                 self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
                 self.init_git(); self.git("remote", "add", "origin", "https://github.com/acme/bank.git")
@@ -1043,6 +1216,38 @@ class AdrValidatorTest(unittest.TestCase):
     def test_cli_requires_paired_edge_refs(self):
         self.assertEqual(2, validator.main(["--root", str(self.root), "--adr-edge-base-ref", "HEAD"]))
         self.assertEqual(2, validator.main(["--root", str(self.root), "--adr-edge-head-ref", "HEAD"]))
+        self.assertEqual(2, validator.main(["--root", str(self.root), "--adr-head-ref", "HEAD"]))
+
+    def test_cli_git_aware_endpoint_and_range_checks_are_additive(self):
+        self.init_git()
+        self.write("README.md", "ordinary repository remains invalid\n")
+        commit = self.commit_all("base")
+        self.assertEqual(
+            1,
+            validator.main(
+                [
+                    "--root",
+                    str(self.root),
+                    "--adr-base-ref",
+                    commit,
+                    "--adr-head-ref",
+                    commit,
+                ]
+            ),
+        )
+        self.assertEqual(
+            1,
+            validator.main(
+                [
+                    "--root",
+                    str(self.root),
+                    "--adr-edge-base-ref",
+                    commit,
+                    "--adr-edge-head-ref",
+                    commit,
+                ]
+            ),
+        )
 
 
 if __name__ == "__main__":

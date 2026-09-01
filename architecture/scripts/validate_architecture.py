@@ -807,6 +807,7 @@ class AdrRecord:
     title: str
     identifier: str
     number: int
+    field_names: tuple[str, ...]
     fields: dict[str, str]
     sections: dict[str, str]
 
@@ -863,13 +864,35 @@ def _parse_adr(path: str, raw: bytes) -> AdrRecord | None:
     else:
         identifier, number = match.group(1), int(match.group(2))
     fields = {}
+    field_names = []
     for line in lines[1:]:
         if line.startswith("## "):
             break
-        field = re.match(r"^- ([A-Za-z ]+):\s*(.*)$", line)
+        field = re.match(r"^- ([^:]+):\s*(.*)$", line)
         if field:
-            fields[field.group(1)] = field.group(2).strip()
-    return AdrRecord(path, raw, title, identifier, number, fields, _section_bodies(text))
+            field_name = field.group(1).strip()
+            field_names.append(field_name)
+            fields[field_name] = field.group(2).strip()
+    return AdrRecord(path, raw, title, identifier, number, tuple(field_names), fields, _section_bodies(text))
+
+def _has_substantive_content(body: str) -> bool:
+    content = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    content = re.sub(r"<[^>]+>", "", content)
+    if extract_markdown_links(content):
+        return True
+    for line in content.splitlines():
+        stripped = line.strip()
+        if (
+            not stripped
+            or re.match(r"^#{1,6}\s+", stripped)
+            or re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", stripped)
+        ):
+            continue
+        if re.match(r"^(?:[-+*]|[0-9]+[.)])\s+\S", stripped):
+            return True
+        if any(character.isalnum() for character in stripped):
+            return True
+    return False
 
 def _adr_paths_filesystem(root: Path) -> dict[str, bytes]:
     directory = root / "architecture/adr"
@@ -978,6 +1001,8 @@ def _validate_evidence(root: Path, record: AdrRecord) -> list[str]:
             errors.append(_adr_error(record.path, f"evidence hash does not resolve to a commit: {commit}"))
             continue
         changed = _changed_paths(root, commit) if mode == "changed" else None
+        if mode == "changed" and changed is None:
+            errors.append(_adr_error(record.path, f"could not derive changed paths for {commit}"))
         for evidence_path in paths:
             tree = _run_git(root, "cat-file", "-e", f"{commit}:{evidence_path}")
             if tree.returncode:
@@ -1018,6 +1043,8 @@ def validate_adrs(root: Path) -> list[str]:
         match = ADR_PATH_RE.fullmatch(filename)
         if not match or record.number != int(match.group(1)) or not record.identifier or _kebab_title(record.title.split(":", 1)[-1].strip()) != match.group(2):
             errors.append(_adr_error(path, "ADR filename/title must agree on number and kebab-case title"))
+        if record.field_names != ADR_FIELDS:
+            errors.append(_adr_error(path, "ADR metadata fields must occur exactly once in the required order"))
         for field in ADR_FIELDS:
             if field not in record.fields or not record.fields[field]:
                 errors.append(_adr_error(path, f"{field} is required"))
@@ -1037,8 +1064,8 @@ def validate_adrs(root: Path) -> list[str]:
             if value != "None" and not _relationship_sequence(value):
                 errors.append(_adr_error(path, f"{field} must be None or a non-empty ordered sequence"))
         for heading in ADR_SUBSTANTIVE_HEADINGS:
-            if not record.sections.get(heading, "").strip():
-                errors.append(_adr_error(path, f"{heading} must not be empty"))
+            if not _has_substantive_content(record.sections.get(heading, "")):
+                errors.append(_adr_error(path, f"{heading} must contain prose, a list item, or a link"))
         heading_lines = [line.strip() for line in raw.decode("utf-8").splitlines() if line.strip() in ADR_SUBSTANTIVE_HEADINGS]
         if heading_lines != list(ADR_SUBSTANTIVE_HEADINGS):
             errors.append(_adr_error(path, "ADR substantive headings must occur once in the required order"))
@@ -1248,6 +1275,8 @@ def _validate_adr_edge(root: Path, parent_commit: str, child_commit: str | None)
             mutable_fields = set(ADR_RELATIONSHIP_FIELDS) | {"Status", "Implementation status"}
             if parent.title != child.title:
                 errors.append(_adr_error(path, "accepted ADR title changed"))
+            if parent.field_names != child.field_names:
+                errors.append(_adr_error(path, "accepted ADR metadata field layout changed"))
             for field in (set(parent.fields) | set(child.fields)) - mutable_fields:
                 if parent.fields.get(field) != child.fields.get(field):
                     errors.append(_adr_error(path, f"accepted ADR field changed: {field}"))
@@ -1277,9 +1306,10 @@ def _validate_adr_edge(root: Path, parent_commit: str, child_commit: str | None)
         status = child.fields.get("Status")
         if status == "Proposed":
             continue
-        if status in {"Accepted", "Rejected"} and _qualified_historical_introduction(root, child, parent_commit, child_commit):
-            continue
-        if status == "Accepted" and _bootstrap_introduction(root, child, parent_commit, child_commit):
+        if path == ADR_BOOTSTRAP_PATH:
+            if status == "Accepted" and _bootstrap_introduction(root, child, parent_commit, child_commit):
+                continue
+        elif status in {"Accepted", "Rejected"} and _qualified_historical_introduction(root, child, parent_commit, child_commit):
             continue
         errors.append(_adr_error(path, f"new ADR must be Proposed; unqualified direct introduction as {status or 'unknown'} is forbidden"))
     return sorted(set(errors))
@@ -1333,8 +1363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("--adr-edge-base-ref and --adr-edge-head-ref must be provided together", file=sys.stderr); return 2
     if args.adr_head_ref and not args.adr_base_ref:
         print("--adr-head-ref requires --adr-base-ref", file=sys.stderr); return 2
-    git_aware = bool(args.adr_base_ref or args.adr_edge_base_ref)
-    checks = frozenset(args.checks.split(",")) if args.checks else (frozenset() if git_aware else CHECKS)
+    checks = frozenset(args.checks.split(",")) if args.checks else CHECKS
     unknown = sorted(checks - CHECKS)
     if unknown:
         print("unknown validation check(s): " + ", ".join(unknown), file=sys.stderr); return 2
