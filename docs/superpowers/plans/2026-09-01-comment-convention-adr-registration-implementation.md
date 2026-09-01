@@ -58,7 +58,7 @@ Settled before writing. Do not re-open during execution.
 
 ### A note on the ADR threshold
 
-`architecture/adr/README.md` sets the bar at material changes to boundaries, invariants, contracts, or deliberately accepted debt, and explicitly excludes "documentation corrections". A comment convention sits near that line, and this record is being created because the maintainer asked for it. The case for it being above the line: the convention binds every contributor in every language, and its enforcement now **fails the build**, which makes it a repository-wide contract with a verification boundary rather than a documentation preference. The plan states this openly in the ADR's `Context` rather than pretending the threshold question does not arise.
+`architecture/adr/README.md` sets the bar at material changes to boundaries, invariants, contracts, or deliberately accepted debt, and explicitly excludes "documentation corrections". A comment convention sits near that line, and this record is being created because the maintainer asked for it. The case for it being above the line: the convention binds every contributor in every language, and its enforcement now **fails the funds-core build**, which makes it a repository-wide contract with a verification boundary rather than a documentation preference. Note the honest limit of that argument — no CI job runs that build today, so the boundary is real but locally enforced; the ADR's `### Negative` section says so rather than leaving the reader to discover it. The plan states this openly in the ADR's `Context` rather than pretending the threshold question does not arise.
 
 ## File Structure
 
@@ -165,13 +165,17 @@ remain the reviewer's responsibility.
 
 Invariants are documented where they are used rather than in a document a
 reader must know to open. A missing type comment, a malformed summary, a
-migration without a header, or a work item left in source fails the build in
-seconds instead of reaching review. The convention cannot decay silently,
-because the gate is part of the same build that runs the financial test suite.
+migration without a header, or a work item left in source fails the funds-core
+build in seconds. The convention cannot decay unnoticed, because the gate is
+part of the same build that runs the financial test suite.
 
 ### Negative
 
-A new type cannot merge without a purpose comment, including in tests. The
+A new type cannot pass the funds-core build without a purpose comment,
+including in tests. Enforcement reaches only as far as that build: no
+continuous-integration job runs it, so the gate binds whoever runs the build
+and the pre-pull-request checklist, and nothing blocks a merge mechanically
+until such a job exists. The
 Checkstyle version is pinned in the POM because the plugin's bundled 9.3
 cannot parse Java 25, so the toolchain carries a version that must be
 maintained. Enforcement covers Java and SQL in `services/funds-core` only:
@@ -381,6 +385,12 @@ Expected: `BUILD SUCCESS`, `You have 0 Checkstyle violations.` This plan changes
 
 ---
 
+### What the first push actually carries
+
+Worth knowing before pushing: `origin/master` is **45 commits behind** local `master`. Merging this branch and pushing does not publish three files — it publishes the entire architecture-documentation framework, the funds-core comment pass, the Checkstyle enforcement, and this record, and runs the repository's CI across all of it for the first time.
+
+The `Compliance and verification` numbers in the ADR cannot be re-checked by that CI, or by any agent without Docker and a Java 25 toolchain: no job runs the funds-core build, and this plan's Task 3 Step 4 runs `checkstyle:check` only, never the 254-test `clean verify` the record cites. Those numbers come from the enforcement work's own executed run; treat them as a record of what was verified then, not as something the ADR commit re-proves.
+
 ## When the pull request is opened
 
 The repository validates the PR body itself on `pull_request` events. The description must contain exactly one `## Architecture impact` section with exactly one of its two canonical checkboxes ticked. Because this change adds an ADR, tick "Architecture changed; linked below" and fill all five fields, none empty, at least one of the first four not `None`, and `Verification evidence:` never `None`. Use `.github/pull_request_template.md` verbatim as the starting point and fill:
@@ -411,17 +421,23 @@ If `branch --show-current` is not `master`, stop: you are not in the checkout th
 
 If it instead reports `evidence hash does not resolve to a commit`, the merge did not preserve the branch's commits — the merge was squashed or rebased. **Do not push.** Reset `master` back and redo the merge with `--no-ff`; every evidence hash must resolve from `master` before this reaches CI, because after that the failure is permanent.
 
-A useful sanity check before merging, which lists any evidence commit that would not survive:
+### The pre-merge reachability check — run this in the worktree, before merging
+
+This one block runs **in the worktree**, not the main checkout, because it reads the ADR file, which does not exist on `master` until the merge lands. Run it there and it fails loudly; run it in the main checkout beforehand and `grep` finds no file, `comm` compares against an empty list, and the silence looks exactly like success.
 
 ```bash
-cd "$(git rev-parse --show-toplevel)"
-git log --format=%H master | sort > /tmp/master-commits
+cd "$(git rev-parse --show-toplevel)"   # the worktree: the ADR file must exist here
 grep -oE '^- [0-9a-f]{40}' architecture/adr/0009-adopt-an-enforced-code-comment-convention.md \
   | cut -d' ' -f2 | sort > /tmp/adr-evidence
+test "$(wc -l < /tmp/adr-evidence)" -eq 8 \
+  || { echo "FAIL: expected 8 evidence hashes, read $(wc -l < /tmp/adr-evidence) — wrong path or wrong file"; }
+git log --format=%H master | sort > /tmp/master-commits
 comm -23 /tmp/adr-evidence /tmp/master-commits
 ```
 
-Before the merge this prints the five branch-only hashes; after a correct `--no-ff` merge it prints nothing.
+Expected **before** the merge: the count assertion passes, and `comm` prints exactly the five branch-only hashes `655ed137…`, `9f56d06b…`, `b4cf2aa2…`, `dfb8cebf…`, `f70e1961…`. That is the normal, healthy state — it is what the `--no-ff` merge is about to fix. Never treat empty output here as success: without the count assertion, empty means the file was not read.
+
+Re-run the same block from the main checkout **after** the merge, where the ADR file now exists. Then the count assertion still passes and `comm` prints nothing, because every evidence commit has become an ancestor of `master`. That transition — five hashes before, none after, with the count assertion passing both times — is the actual proof.
 
 Both outcomes were simulated on 2026-09-01 in disposable clones, taking a fresh `--single-branch --branch master` checkout afterwards to imitate what CI checks out:
 
@@ -432,9 +448,16 @@ Both outcomes were simulated on 2026-09-01 in disposable clones, taking a fresh 
 
 ## Rollback
 
-Three things reference the record: the ADR file itself, the `related_adrs` entry and bullet in `architecture/arc42/09-decisions.md`, and the backlink in the enforcement plan. Because all three land in one commit, `git revert` of that commit — or an amend before it is pushed — removes them together, and that is the only rollback to use. Do not hand-remove the ADR file alone: the index entry and the backlink would be left dangling, failing both `validate_links` and the reciprocity checks.
+Three things reference the record: the ADR file itself, the `related_adrs` entry and bullet in `architecture/arc42/09-decisions.md`, and the backlink in the enforcement plan. They land in one commit, so they come and go together. Do not hand-remove the ADR file alone: the index entry and the backlink would be left dangling, failing both `validate_links` and the reciprocity checks.
 
-After it is merged, it cannot be deleted or renamed: `Accepted` records are permanent, and the number cannot be reused because numbering must stay contiguous. A reversal is a **new** ADR that supersedes 0009, with `Superseded by` appended to 0009's relationship field — that field is append-only, which the lifecycle permits. Removing the enforcement itself is a separate matter from the record and is covered by the enforcement plan's own rollback section.
+**Do not use `git revert`.** A revert deletes the ADR file, and `_validate_adr_edge` rejects that on every edge it walks with `Accepted ADR was deleted or renamed` — so the revert fails the branch's own edge check, and once pushed it fails CI on `master` for every future run whose merge base predates it. Reverting an `Accepted` record trades a small problem for a permanent one.
+
+The rollback therefore depends entirely on whether the commit has been pushed:
+
+- **Not yet pushed:** drop it. `git reset --hard HEAD~1` on the branch, or `git commit --amend` to correct it in place. This is clean and leaves no trace.
+- **Already on `master`:** there is no rollback. `Accepted` records cannot be deleted or renamed, and the number cannot be reused because numbering must stay contiguous. The only route is a **new** ADR that supersedes 0009, with `Superseded by` appended to 0009's relationship field — appending is permitted, editing is not.
+
+Removing the enforcement itself is a separate matter from the record, and is covered by the enforcement plan's own rollback section.
 
 ## Risks
 
