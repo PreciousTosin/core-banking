@@ -18,10 +18,12 @@ import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
@@ -109,6 +111,55 @@ class PostingServiceTest {
     }
 
     @Test
+    void staleCallerHashConflictsForEveryFinancialCommandField() {
+        var dependencies = new RecordingDependencies();
+        PostingCommand original = command(
+            Instant.parse("2026-01-15T10:00:00.123456Z"), 100, -100);
+        List<NamedMutation> mutations = List.of(
+            mutation("journalId", values -> values.journalId = uuid(101)),
+            mutation("commandId", values -> values.commandId = uuid(102)),
+            mutation("correlationId", values -> values.correlationId = uuid(103)),
+            mutation("businessTransactionId", values -> values.businessTransactionId = uuid(104)),
+            mutation("legalEntityId", values -> values.legalEntityId = uuid(105)),
+            mutation("bookId", values -> values.bookId = uuid(106)),
+            mutation("chartVersionId", values -> values.chartVersionId = uuid(107)),
+            mutation("periodId", values -> values.periodId = uuid(108)),
+            mutation("transactionType", values -> values.transactionType = "CHANGED_TYPE"),
+            mutation("narration", values -> values.narration = "changed narration"),
+            mutation("bookingTime", values -> values.bookingTime = values.bookingTime.plusSeconds(1)),
+            mutation("valueDate", values -> values.valueDate = values.valueDate.plusDays(1)),
+            mutation("reversalOfJournalId", values -> values.reversalOfJournalId = uuid(109)),
+            mutation("policyVersion", values -> values.policyVersion++),
+            mutation("postingId", values -> values.replaceFirstPosting(new PostingLine(
+                uuid(110), values.postings.getFirst().accountId(), NGN, 100, 0, Map.of()))),
+            mutation("postingAccount", values -> values.replaceFirstPosting(new PostingLine(
+                values.postings.getFirst().postingId(), uuid(111), NGN, 100, 0, Map.of()))),
+            mutation("postingCurrency", values -> values.replaceFirstPosting(new PostingLine(
+                values.postings.getFirst().postingId(), values.postings.getFirst().accountId(),
+                CurrencyCode.of("USD"), 100, 0, Map.of()))),
+            mutation("postingAmount", values -> values.replaceFirstPosting(new PostingLine(
+                values.postings.getFirst().postingId(), values.postings.getFirst().accountId(),
+                NGN, 101, 0, Map.of()))),
+            mutation("postingDimensions", values -> values.replaceFirstPosting(new PostingLine(
+                values.postings.getFirst().postingId(), values.postings.getFirst().accountId(),
+                NGN, 100, 0, Map.of("rail", "nibss")))));
+
+        for (NamedMutation mutation : mutations) {
+            DraftValues values = new DraftValues(original.journal());
+            mutation.change().accept(values);
+            JournalDraft changed = values.toDraft();
+            assertThrows(
+                IdempotencyConflictException.class,
+                () -> dependencies.service().post(new PostingCommand(
+                    changed.commandId(), original.requestHash(), changed)),
+                mutation.name());
+        }
+        assertEquals(0, dependencies.dataSource.connections);
+        assertEquals(0, dependencies.repository.preflightCalls);
+        assertEquals(0, dependencies.repository.calls);
+    }
+
+    @Test
     void genericPostingPathRejectsCallerSuppliedReversalMetadata() {
         var dependencies = new RecordingDependencies();
         PostingCommand original = command(
@@ -161,6 +212,59 @@ class PostingServiceTest {
 
     private static UUID uuid(long value) {
         return new UUID(0, value);
+    }
+
+    private static NamedMutation mutation(String name, Consumer<DraftValues> change) {
+        return new NamedMutation(name, change);
+    }
+
+    private record NamedMutation(String name, Consumer<DraftValues> change) {}
+
+    private static final class DraftValues {
+        private UUID journalId;
+        private UUID commandId;
+        private UUID correlationId;
+        private UUID businessTransactionId;
+        private UUID legalEntityId;
+        private UUID bookId;
+        private UUID chartVersionId;
+        private UUID periodId;
+        private String transactionType;
+        private String narration;
+        private Instant bookingTime;
+        private LocalDate valueDate;
+        private UUID reversalOfJournalId;
+        private int policyVersion;
+        private final List<PostingLine> postings;
+
+        private DraftValues(JournalDraft source) {
+            journalId = source.journalId();
+            commandId = source.commandId();
+            correlationId = source.correlationId();
+            businessTransactionId = source.businessTransactionId();
+            legalEntityId = source.legalEntityId();
+            bookId = source.bookId();
+            chartVersionId = source.chartVersionId();
+            periodId = source.periodId();
+            transactionType = source.transactionType();
+            narration = source.narration();
+            bookingTime = source.bookingTime();
+            valueDate = source.valueDate();
+            reversalOfJournalId = source.reversalOfJournalId();
+            policyVersion = source.policyVersion();
+            postings = new ArrayList<>(source.postings());
+        }
+
+        private void replaceFirstPosting(PostingLine replacement) {
+            postings.set(0, replacement);
+        }
+
+        private JournalDraft toDraft() {
+            return new JournalDraft(
+                journalId, commandId, correlationId, businessTransactionId, legalEntityId,
+                bookId, chartVersionId, periodId, transactionType, narration, bookingTime,
+                valueDate, reversalOfJournalId, policyVersion, postings);
+        }
     }
 
     private static final class RecordingDependencies {

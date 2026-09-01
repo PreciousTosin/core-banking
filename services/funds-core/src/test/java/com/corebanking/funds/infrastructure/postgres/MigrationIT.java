@@ -140,6 +140,7 @@ class MigrationIT {
                       procedure.proname IN (
                           'enforce_external_identifier_customer_scope',
                           'enforce_journal_governance',
+                          'enforce_posting_chart_mapping',
                           'enforce_posting_reference_consistency',
                           'reject_posting_to_completed_journal',
                           'enforce_journal_reversibility',
@@ -363,6 +364,65 @@ class MigrationIT {
             assertFalse(migration.contains("pg_auth_members"));
             assertFalse(migration.contains("REVOKE %I FROM %I"));
         }
+    }
+
+    @Test
+    void proofReaderCanRunExactProofsButCannotReadOperationalOrPolicyPayloads()
+        throws Exception {
+        inTransaction(connection -> {
+            execute(connection, "SET ROLE funds_proof_reader");
+            try {
+                assertEquals("0/0", queryString(connection, """
+                    SELECT
+                        coalesce(sum(CASE WHEN posting.signed_minor_units > 0
+                            THEN posting.signed_minor_units::numeric ELSE 0::numeric END), 0)::text
+                        || '/' ||
+                        coalesce(sum(CASE WHEN posting.signed_minor_units < 0
+                            THEN -(posting.signed_minor_units::numeric) ELSE 0::numeric END), 0)::text
+                    FROM funds.posting posting
+                    JOIN funds.journal journal ON journal.journal_id = posting.journal_id
+                    WHERE journal.book_id = '00000000-0000-0000-0000-000000000001'
+                      AND posting.currency = 'NGN'
+                      AND journal.journal_sequence <= 0
+                    """));
+                assertEquals("0/0", queryString(connection, """
+                    WITH mapped AS (
+                        SELECT posting.signed_minor_units, journal.journal_sequence
+                        FROM funds.posting posting
+                        JOIN funds.journal journal ON journal.journal_id = posting.journal_id
+                        JOIN funds.ledger_account_chart_mapping mapping
+                          ON mapping.account_id = posting.account_id
+                         AND mapping.book_id = journal.book_id
+                         AND mapping.chart_version_id = journal.chart_version_id
+                        WHERE journal.book_id = '00000000-0000-0000-0000-000000000001'
+                          AND mapping.control_account_code = 'CUSTOMER-DEPOSITS'
+                          AND posting.currency = 'NGN'
+                    ), source AS (
+                        SELECT coalesce(sum(signed_minor_units::numeric), 0) AS total
+                        FROM mapped
+                    ), projection AS (
+                        SELECT signed_posting_total::numeric AS total
+                        FROM funds.control_account_projection
+                        WHERE book_id = '00000000-0000-0000-0000-000000000001'
+                          AND control_account_code = 'CUSTOMER-DEPOSITS'
+                          AND currency = 'NGN'
+                    )
+                    SELECT source.total::text || '/' || coalesce(projection.total, 0)::text
+                    FROM source LEFT JOIN projection ON true
+                    """));
+
+                assertSqlStateRejected(connection, "42501",
+                    "SELECT normalised_value FROM funds.account_identifier");
+                assertSqlStateRejected(connection, "42501",
+                    "SELECT policy_json FROM funds.product_version");
+                assertSqlStateRejected(connection, "42501",
+                    "SELECT result_json FROM funds.idempotency_command");
+                assertSqlStateRejected(connection, "42501",
+                    "SELECT payload FROM funds.outbox_event");
+            } finally {
+                execute(connection, "RESET ROLE");
+            }
+        });
     }
 
     @Test
@@ -941,7 +1001,24 @@ class MigrationIT {
     private static void assertSqlRejected(Connection connection, String sql) throws SQLException {
         Savepoint beforeViolation = connection.setSavepoint();
         try {
-            assertThrows(SQLException.class, () -> execute(connection, sql));
+            SQLException failure = assertThrows(SQLException.class, () -> execute(connection, sql));
+            assertTrue(Set.of("22001", "23503", "23505", "23514", "23P01", "55000", "55P03")
+                .contains(failure.getSQLState()),
+                () -> "unexpected SQLSTATE " + failure.getSQLState() + " for: " + sql);
+        } finally {
+            connection.rollback(beforeViolation);
+        }
+    }
+
+    private static void assertSqlStateRejected(
+        Connection connection,
+        String expectedSqlState,
+        String sql
+    ) throws SQLException {
+        Savepoint beforeViolation = connection.setSavepoint();
+        try {
+            SQLException failure = assertThrows(SQLException.class, () -> execute(connection, sql));
+            assertEquals(expectedSqlState, failure.getSQLState());
         } finally {
             connection.rollback(beforeViolation);
         }

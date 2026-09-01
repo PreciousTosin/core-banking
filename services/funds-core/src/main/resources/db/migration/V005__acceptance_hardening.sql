@@ -27,6 +27,18 @@ ALTER TABLE funds.product_definition
     DROP COLUMN product_kind,
     DROP COLUMN finance_principle;
 
+CREATE OR REPLACE FUNCTION funds.reject_product_version_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, funds
+AS $function$
+BEGIN
+    RAISE EXCEPTION 'product versions are immutable; create a new version instead'
+        USING ERRCODE = '55000',
+              CONSTRAINT = 'product_version_immutable';
+END
+$function$;
+
 CREATE FUNCTION funds.reject_product_definition_identity_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -71,13 +83,22 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, funds
 AS $function$
 BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'approved chart versions cannot be deleted'
+            USING ERRCODE = '55000',
+                  CONSTRAINT = 'chart_version_identity_immutable';
+    END IF;
+
     IF NEW.chart_version_id IS DISTINCT FROM OLD.chart_version_id
        OR NEW.book_id IS DISTINCT FROM OLD.book_id
        OR NEW.version IS DISTINCT FROM OLD.version
        OR NEW.approval_reference IS DISTINCT FROM OLD.approval_reference
        OR (NEW.activated_at IS DISTINCT FROM OLD.activated_at
            AND NOT (OLD.status = 'DRAFT' AND NEW.status = 'ACTIVE'
-                    AND OLD.activated_at IS NULL AND NEW.activated_at IS NOT NULL)) THEN
+                    AND OLD.activated_at IS NULL AND NEW.activated_at IS NOT NULL))
+       OR (NEW.retired_at IS DISTINCT FROM OLD.retired_at
+           AND NOT (OLD.status = 'ACTIVE' AND NEW.status = 'RETIRED'
+                    AND OLD.retired_at IS NULL AND NEW.retired_at IS NOT NULL)) THEN
         RAISE EXCEPTION 'approved chart identity and activation facts are immutable'
             USING ERRCODE = '55000',
                   CONSTRAINT = 'chart_version_identity_immutable';
@@ -95,7 +116,7 @@ END
 $function$;
 
 CREATE TRIGGER chart_version_forward_transition
-BEFORE UPDATE ON funds.chart_version
+BEFORE UPDATE OR DELETE ON funds.chart_version
 FOR EACH ROW
 EXECUTE FUNCTION funds.enforce_chart_version_transition();
 
@@ -307,6 +328,61 @@ BEFORE INSERT ON funds.journal
 FOR EACH ROW
 EXECUTE FUNCTION funds.enforce_journal_governance();
 
+-- A journal's chart pin is authoritative for every line, including direct
+-- funds_app DML. This independently closes the mixed-version bypass that the
+-- service-side mapping locks already reject.
+CREATE FUNCTION funds.enforce_posting_chart_mapping()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, funds
+AS $function$
+DECLARE
+    governed_direction text;
+BEGIN
+    -- An absent/invisible journal belongs to the earlier finality/FK guards.
+    -- Returning here preserves their stable failure contract while a visible
+    -- journal continues through this chart-specific guard.
+    PERFORM 1
+    FROM funds.journal journal
+    WHERE journal.journal_id = NEW.journal_id
+    FOR SHARE OF journal;
+    IF NOT FOUND THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT mapping.permitted_direction
+    INTO governed_direction
+    FROM funds.journal journal
+    JOIN funds.ledger_account account
+      ON account.account_id = NEW.account_id
+     AND account.book_id = journal.book_id
+     AND account.currency = NEW.currency
+    JOIN funds.ledger_account_chart_mapping mapping
+      ON mapping.account_id = account.account_id
+     AND mapping.book_id = journal.book_id
+     AND mapping.chart_version_id = journal.chart_version_id
+    WHERE journal.journal_id = NEW.journal_id
+    FOR SHARE OF journal, account, mapping;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'posting account does not resolve through the journal chart and currency'
+            USING ERRCODE = '23514', CONSTRAINT = 'posting_chart_mapping';
+    END IF;
+    IF (NEW.signed_minor_units > 0 AND governed_direction = 'CREDIT')
+       OR (NEW.signed_minor_units < 0 AND governed_direction = 'DEBIT') THEN
+        RAISE EXCEPTION 'posting direction is not permitted by the journal chart mapping'
+            USING ERRCODE = '23514', CONSTRAINT = 'posting_permitted_direction';
+    END IF;
+    RETURN NEW;
+END
+$function$;
+
+CREATE TRIGGER posting_chart_mapping
+BEFORE INSERT ON funds.posting
+FOR EACH ROW
+EXECUTE FUNCTION funds.enforce_posting_chart_mapping();
+
 CREATE FUNCTION funds.jsonb_object_size(value jsonb)
 RETURNS integer
 LANGUAGE sql
@@ -327,6 +403,66 @@ ALTER TABLE funds.posting
         CHECK (funds.jsonb_object_size(dimensions) <= 32),
     ADD CONSTRAINT posting_dimensions_bytes_check
         CHECK (octet_length(dimensions::text) <= 8192);
+
+-- CHECK constraints above validate existing lines automatically. Deferred
+-- constraint triggers do not run retroactively, so fail the additive upgrade
+-- if a V004 database already contains a journal outside the new universal
+-- reversible envelope or an inexact linked correction.
+DO $validate_historical_reversibility$
+BEGIN
+    IF EXISTS (
+        SELECT journal.journal_id
+        FROM funds.journal journal
+        LEFT JOIN funds.posting posting ON posting.journal_id = journal.journal_id
+        GROUP BY journal.journal_id
+        HAVING count(posting.posting_id) < 2 OR count(posting.posting_id) > 256
+    ) THEN
+        RAISE EXCEPTION 'V005 cannot accept a historical journal outside the 2..256 posting envelope';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM funds.journal correction
+        JOIN funds.journal original
+          ON original.journal_id = correction.reversal_of_journal_id
+        WHERE original.reversal_of_journal_id IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'V005 cannot accept a historical reversal of a reversal';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM funds.journal correction
+        WHERE correction.reversal_of_journal_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM (
+                  (SELECT posting.account_id, posting.currency,
+                          posting.signed_minor_units::numeric AS amount, posting.dimensions
+                   FROM funds.posting posting
+                   WHERE posting.journal_id = correction.journal_id
+                   EXCEPT ALL
+                   SELECT posting.account_id, posting.currency,
+                          -(posting.signed_minor_units::numeric), posting.dimensions
+                   FROM funds.posting posting
+                   WHERE posting.journal_id = correction.reversal_of_journal_id)
+                  UNION ALL
+                  (SELECT posting.account_id, posting.currency,
+                          -(posting.signed_minor_units::numeric), posting.dimensions
+                   FROM funds.posting posting
+                   WHERE posting.journal_id = correction.reversal_of_journal_id
+                   EXCEPT ALL
+                   SELECT posting.account_id, posting.currency,
+                          posting.signed_minor_units::numeric, posting.dimensions
+                   FROM funds.posting posting
+                   WHERE posting.journal_id = correction.journal_id)
+              ) mismatch
+          )
+    ) THEN
+        RAISE EXCEPTION 'V005 cannot accept a historical inexact reversal';
+    END IF;
+END
+$validate_historical_reversibility$;
 
 CREATE FUNCTION funds.enforce_journal_reversibility()
 RETURNS trigger

@@ -14,6 +14,7 @@ import com.corebanking.funds.domain.ReversalRequest;
 import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
+import com.corebanking.funds.domain.exception.LedgerCapacityException;
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import com.corebanking.funds.infrastructure.postgres.JdbcLedgerRepository;
@@ -146,6 +147,33 @@ class PostingServiceIT {
     }
 
     @Test
+    void completedSameContentReplayWinsBeforeLaterPeriodChartAndPolicyChanges()
+        throws SQLException {
+        PostingCommand command = exampleACommand(COMMAND_ID, JOURNAL_ID);
+        PostingResult stored = postingService.post(command);
+        execute("UPDATE funds.accounting_period SET status = 'CLOSED' WHERE period_id = '"
+            + PERIOD_ID + "'");
+        execute("UPDATE funds.book SET accounting_policy_version = 2 WHERE book_id = '"
+            + BOOK_ID + "'");
+        execute("""
+            UPDATE funds.chart_version
+            SET status = 'RETIRED', retired_at = TIMESTAMPTZ '2026-01-31 23:59:59+00'
+            WHERE chart_version_id = '%s'
+            """.formatted(CHART_VERSION_ID));
+
+        PostingResult replay = postingService.post(command);
+
+        try (var connection = dataSource.getConnection()) {
+            assertAll(
+                () -> assertEquals(stored, replay),
+                () -> assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.journal")),
+                () -> assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting")),
+                () -> assertEquals(1, queryLong(connection,
+                    "SELECT count(*) FROM funds.outbox_event")));
+        }
+    }
+
+    @Test
     void completedCommandWithDifferentHashIsAnIdempotencyConflict() throws SQLException {
         var command = exampleACommand(COMMAND_ID, JOURNAL_ID);
         PostingResult first = postingService.post(command);
@@ -223,6 +251,42 @@ class PostingServiceIT {
                 () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.posting")),
                 () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.control_account_projection")),
                 () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.outbox_event")));
+        }
+    }
+
+    @Test
+    void accountSequenceExhaustionIsCapacityFailureNotMonetaryOverflow()
+        throws SQLException {
+        execute("""
+            INSERT INTO funds.materialised_balance
+                (account_id, signed_posting_total, latest_account_sequence, version)
+            VALUES ('%s', 0, %d, 9)
+            """.formatted(PROVIDER_ASSET, Long.MAX_VALUE));
+
+        assertThrows(LedgerCapacityException.class,
+            () -> postingService.post(exampleACommand(COMMAND_ID, JOURNAL_ID)));
+
+        assertNoCommittedPostingFacts();
+        try (var connection = dataSource.getConnection()) {
+            assertEquals(Long.MAX_VALUE, accountSequence(connection, PROVIDER_ASSET));
+        }
+    }
+
+    @Test
+    void materialisedVersionExhaustionIsCapacityFailureNotMonetaryOverflow()
+        throws SQLException {
+        execute("""
+            INSERT INTO funds.materialised_balance
+                (account_id, signed_posting_total, latest_account_sequence, version)
+            VALUES ('%s', 0, 0, %d)
+            """.formatted(PROVIDER_ASSET, Long.MAX_VALUE));
+
+        assertThrows(LedgerCapacityException.class,
+            () -> postingService.post(exampleACommand(COMMAND_ID, JOURNAL_ID)));
+
+        assertNoCommittedPostingFacts();
+        try (var connection = dataSource.getConnection()) {
+            assertEquals(Long.MAX_VALUE, balanceState(connection, PROVIDER_ASSET).version());
         }
     }
 
@@ -554,6 +618,20 @@ class PostingServiceIT {
                 () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.materialised_balance")),
                 () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.control_account_projection")),
                 () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.outbox_event")));
+        }
+    }
+
+    private void assertNoCommittedPostingFacts() throws SQLException {
+        try (var connection = dataSource.getConnection()) {
+            assertAll(
+                () -> assertEquals(0, queryLong(connection,
+                    "SELECT count(*) FROM funds.idempotency_command")),
+                () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.journal")),
+                () -> assertEquals(0, queryLong(connection, "SELECT count(*) FROM funds.posting")),
+                () -> assertEquals(0, queryLong(connection,
+                    "SELECT count(*) FROM funds.control_account_projection")),
+                () -> assertEquals(0, queryLong(connection,
+                    "SELECT count(*) FROM funds.outbox_event")));
         }
     }
 

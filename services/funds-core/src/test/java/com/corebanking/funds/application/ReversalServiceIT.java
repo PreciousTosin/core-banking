@@ -43,6 +43,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -260,6 +261,54 @@ class ReversalServiceIT {
     }
 
     @Test
+    void staleReversalHashConflictsForEveryFinancialRequestFieldWithoutDatabaseWork()
+        throws SQLException {
+        ReversalRequest baseline = reversalRequest(
+            REVERSAL_COMMAND_ID, ORIGINAL_JOURNAL_ID, "reversal-mutation-baseline");
+        List<ReversalRequest> mutations = List.of(
+            new ReversalRequest(TestPostingStack.uuid(301), baseline.requestHash(),
+                baseline.originalJournalId(), baseline.correlationId(),
+                baseline.businessTransactionId(), baseline.currentPeriodId(),
+                baseline.bookingTime(), baseline.valueDate(), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                TestPostingStack.uuid(302), baseline.correlationId(),
+                baseline.businessTransactionId(), baseline.currentPeriodId(),
+                baseline.bookingTime(), baseline.valueDate(), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                baseline.originalJournalId(), TestPostingStack.uuid(303),
+                baseline.businessTransactionId(), baseline.currentPeriodId(),
+                baseline.bookingTime(), baseline.valueDate(), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                baseline.originalJournalId(), baseline.correlationId(),
+                TestPostingStack.uuid(304), baseline.currentPeriodId(),
+                baseline.bookingTime(), baseline.valueDate(), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                baseline.originalJournalId(), baseline.correlationId(),
+                baseline.businessTransactionId(), TestPostingStack.uuid(305),
+                baseline.bookingTime(), baseline.valueDate(), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                baseline.originalJournalId(), baseline.correlationId(),
+                baseline.businessTransactionId(), baseline.currentPeriodId(),
+                baseline.bookingTime().plusSeconds(1), baseline.valueDate(), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                baseline.originalJournalId(), baseline.correlationId(),
+                baseline.businessTransactionId(), baseline.currentPeriodId(),
+                baseline.bookingTime(), baseline.valueDate().plusDays(1), baseline.reason()),
+            new ReversalRequest(baseline.commandId(), baseline.requestHash(),
+                baseline.originalJournalId(), baseline.correlationId(),
+                baseline.businessTransactionId(), baseline.currentPeriodId(),
+                baseline.bookingTime(), baseline.valueDate(), "changed reversal reason"));
+        DatabaseCounts before = databaseCounts();
+
+        for (ReversalRequest mutation : mutations) {
+            assertThrows(IdempotencyConflictException.class,
+                () -> reversalService.reverse(mutation));
+        }
+
+        assertEquals(before, databaseCounts());
+    }
+
+    @Test
     void originalMustBelongToACompletedCommand() throws SQLException {
         insertIncompleteOriginal();
         closeOriginalAndOpenNextPeriod();
@@ -303,6 +352,44 @@ class ReversalServiceIT {
             () -> postingService.post(command(originalJournal(postings))));
 
         assertEquals(before, databaseCounts());
+    }
+
+    @Test
+    void reversesAJournalAtTheExactTwoHundredFiftySixPostingBoundary()
+        throws SQLException {
+        var postings = new ArrayList<PostingLine>(ReversalService.MAX_POSTINGS_PER_JOURNAL);
+        for (int pair = 0; pair < ReversalService.MAX_POSTINGS_PER_JOURNAL / 2; pair++) {
+            postings.add(new PostingLine(
+                TestPostingStack.uuid(20_000L + pair * 2L),
+                TestPostingStack.PROVIDER_ASSET,
+                NGN,
+                1,
+                0,
+                Map.of()));
+            postings.add(new PostingLine(
+                TestPostingStack.uuid(20_001L + pair * 2L),
+                TestPostingStack.CUSTOMER_LIABILITY,
+                NGN,
+                -1,
+                0,
+                Map.of()));
+        }
+        postingService.post(command(originalJournal(postings)));
+        JournalSnapshot original = journalSnapshot(ORIGINAL_JOURNAL_ID);
+        closeOriginalAndOpenNextPeriod();
+
+        PostingResult result = reversalService.reverse(reversalRequest(
+            REVERSAL_COMMAND_ID, ORIGINAL_JOURNAL_ID, hash("maximum-sized-reversal")));
+        JournalSnapshot reversal = journalSnapshot(result.journalId());
+
+        assertAll(
+            () -> assertEquals(ReversalService.MAX_POSTINGS_PER_JOURNAL,
+                original.postings().size()),
+            () -> assertEquals(ReversalService.MAX_POSTINGS_PER_JOURNAL,
+                reversal.postings().size()),
+            () -> assertExactNegationMultiset(original.postings(), reversal.postings()),
+            () -> assertEquals(2, count("funds.journal")),
+            () -> assertEquals(512, count("funds.posting")));
     }
 
     @Test
@@ -1025,6 +1112,23 @@ class ReversalServiceIT {
         }
     }
 
+    private static void assertExactNegationMultiset(
+        List<PostingSnapshot> original,
+        List<PostingSnapshot> reversal
+    ) {
+        Map<ReversalFact, Long> expected = original.stream().collect(Collectors.groupingBy(
+            posting -> new ReversalFact(
+                posting.accountId(), posting.currency(),
+                Math.negateExact(posting.signedMinorUnits()), posting.dimensionsJson()),
+            Collectors.counting()));
+        Map<ReversalFact, Long> actual = reversal.stream().collect(Collectors.groupingBy(
+            posting -> new ReversalFact(
+                posting.accountId(), posting.currency(),
+                posting.signedMinorUnits(), posting.dimensionsJson()),
+            Collectors.counting()));
+        assertEquals(expected, actual);
+    }
+
     private JournalSnapshot journalSnapshot(UUID journalId) throws SQLException {
         try (var connection = dataSource.getConnection();
              var statement = connection.prepareStatement("""
@@ -1163,6 +1267,12 @@ class ReversalServiceIT {
         String currency,
         long signedMinorUnits,
         long accountSequence,
+        String dimensionsJson) {}
+
+    private record ReversalFact(
+        UUID accountId,
+        String currency,
+        long signedMinorUnits,
         String dimensionsJson) {}
 
     private record DatabaseCounts(long commands, long journals, long postings, long outboxEvents) {}

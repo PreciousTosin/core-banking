@@ -44,10 +44,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
 @QuarkusTest
@@ -116,6 +118,9 @@ class PostingConcurrencyIT {
             () -> assertEquals(1, failures.size()),
             () -> assertInstanceOf(IdempotencyConflictException.class, failures.getFirst().failure()));
         PostingResult winner = successes.getFirst().result();
+        PostingCommand winningCommand = winner.journalId().equals(left.journal().journalId())
+            ? left
+            : right;
         try (var connection = dataSource.getConnection()) {
             PersistedWinner persisted = persistedWinner(connection, commandId);
             assertAll(
@@ -123,11 +128,83 @@ class PostingConcurrencyIT {
                 () -> assertEquals(2, queryLong(connection, "SELECT count(*) FROM funds.posting")),
                 () -> assertEquals(1, queryLong(connection, "SELECT count(*) FROM funds.outbox_event")),
                 () -> assertEquals(winner.journalId(), persisted.journalId()),
-                () -> assertEquals(winner.canonicalHash(), persisted.requestHash()),
+                () -> assertEquals(winningCommand.requestHash(), persisted.requestHash()),
                 () -> assertEquals(winner.canonicalHash(), persisted.canonicalHash()),
                 () -> assertTrue(
                     Set.of(left.requestHash(), right.requestHash()).contains(persisted.requestHash()),
                     "persisted hash must belong to one of the racing requests"));
+        }
+    }
+
+    @RepeatedTest(5)
+    void periodCloseWaitsForTheInFlightPostingBeforeItCanCommit() throws Exception {
+        var postingGate = new BeforeCommitGate();
+        PostingService service = postingService(dataSource, postingGate);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        List<Future<?>> futures = new ArrayList<>(2);
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        AtomicInteger closingBackendPid = new AtomicInteger();
+        Throwable primaryFailure = null;
+
+        try {
+            Future<PostingResult> posting = executor.submit(() -> service.post(command(
+                journal(uuid(300), 310, 17, false))));
+            futures.add(posting);
+            assertTrue(postingGate.awaitBeforeCommit(), "posting did not reach its commit gate");
+
+            Future<Void> closing = executor.submit(() -> {
+                try (var connection = dataSource.getConnection()) {
+                    connection.setAutoCommit(false);
+                    try {
+                        try (var statement = connection.createStatement();
+                             var rows = statement.executeQuery("SELECT pg_backend_pid()")) {
+                            rows.next();
+                            closingBackendPid.set(rows.getInt(1));
+                        }
+                        closeStarted.countDown();
+                        execute(connection, "SET LOCAL lock_timeout = '5s'");
+                        execute(connection, """
+                            UPDATE funds.accounting_period
+                            SET status = 'CLOSED'
+                            WHERE period_id = ?
+                            """, PERIOD_ID);
+                        connection.commit();
+                        return null;
+                    } catch (Throwable failure) {
+                        connection.rollback();
+                        throw failure;
+                    }
+                }
+            });
+            futures.add(closing);
+            assertTrue(closeStarted.await(5, SECONDS), "period close did not start");
+            awaitBackendLockWait(closingBackendPid.get());
+            assertAll(
+                () -> assertFalse(posting.isDone(), "posting must remain in-flight at its gate"),
+                () -> assertFalse(closing.isDone(), "period close must wait for posting's shared lock"));
+
+            postingGate.release();
+            PostingResult result = posting.get(10, SECONDS);
+            closing.get(10, SECONDS);
+            try (var connection = dataSource.getConnection()) {
+                assertAll(
+                    () -> assertEquals(result.journalId(), persistedWinner(
+                        connection, uuid(300)).journalId()),
+                    () -> assertEquals(1, queryLong(connection,
+                        "SELECT count(*) FROM funds.journal")),
+                    () -> assertEquals("CLOSED", queryString(connection, """
+                        SELECT status FROM funds.accounting_period WHERE period_id = ?
+                        """, PERIOD_ID)));
+            }
+        } catch (Exception failure) {
+            primaryFailure = failure;
+            throw failure;
+        } catch (Error failure) {
+            primaryFailure = failure;
+            throw failure;
+        } finally {
+            postingGate.release();
+            shutdownExecutor(executor, futures, "period-close executor", primaryFailure);
         }
     }
 
@@ -402,6 +479,26 @@ class PostingConcurrencyIT {
         throw new AssertionError("no PostgreSQL lock waiter observed for backends " + backendPids);
     }
 
+    private void awaitBackendLockWait(int backendPid) throws SQLException {
+        long deadline = System.nanoTime() + SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            try (var connection = dataSource.getConnection(); var statement = connection.prepareStatement("""
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE pid = ? AND wait_event_type = 'Lock'
+                """)) {
+                statement.setInt(1, backendPid);
+                try (var rows = statement.executeQuery()) {
+                    if (rows.next()) {
+                        return;
+                    }
+                }
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("period-close backend did not wait on the posting lock: " + backendPid);
+    }
+
     private static PostingResult postAfterStart(
         PostingService service,
         PostingCommand command,
@@ -626,6 +723,19 @@ class PostingConcurrencyIT {
         }
     }
 
+    private static String queryString(Connection connection, String sql, Object... values)
+        throws SQLException {
+        try (var statement = connection.prepareStatement(sql)) {
+            for (int index = 0; index < values.length; index++) {
+                statement.setObject(index + 1, values[index]);
+            }
+            try (var rows = statement.executeQuery()) {
+                rows.next();
+                return rows.getString(1);
+            }
+        }
+    }
+
     private static void assertCanonicalPrefix(List<UUID> actual, List<UUID> canonical) {
         assertTrue(actual.size() <= canonical.size(), () -> "too many lock operations: " + actual);
         assertEquals(canonical.subList(0, actual.size()), actual);
@@ -678,6 +788,25 @@ class PostingConcurrencyIT {
 
         private void releaseWinner() {
             winnerRelease.countDown();
+        }
+    }
+
+    private static final class BeforeCommitGate implements PostingTransactionObserver {
+        private final CountDownLatch beforeCommit = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        @Override
+        public void beforeCommit(UUID commandId) {
+            beforeCommit.countDown();
+            await(release, "period-close posting release gate");
+        }
+
+        private boolean awaitBeforeCommit() throws InterruptedException {
+            return beforeCommit.await(5, SECONDS);
+        }
+
+        private void release() {
+            release.countDown();
         }
     }
 
@@ -840,7 +969,7 @@ class PostingConcurrencyIT {
         abstract void record(ConnectionTrace trace, UUID accountId);
 
         private static LockKind from(String sql) {
-            if (sql.contains("FROM funds.lock_account_for_posting(")) {
+            if (sql.contains("FROM funds.lock_account_mapping_for_posting(")) {
                 return ACCOUNT;
             }
             if (sql.contains("FROM funds.materialised_balance") && sql.contains("FOR UPDATE")) {

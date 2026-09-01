@@ -12,6 +12,7 @@ import com.corebanking.funds.domain.PostingLine;
 import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
+import com.corebanking.funds.domain.exception.LedgerCapacityException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -403,7 +404,8 @@ public class JdbcLedgerRepository implements LedgerRepository {
         accounts.forEach((accountId, account) -> latestSequences.put(accountId, account.latestAccountSequence()));
         var assignedPostings = new ArrayList<PostingLine>(journal.postings().size());
         for (var posting : journal.postings()) {
-            long sequence = addExact(latestSequences.get(posting.accountId()), 1);
+            long sequence = addCapacityExact(
+                latestSequences.get(posting.accountId()), 1, "account sequence");
             latestSequences.put(posting.accountId(), sequence);
             assignedPostings.add(new PostingLine(
                 posting.postingId(),
@@ -501,7 +503,9 @@ public class JdbcLedgerRepository implements LedgerRepository {
         Map<UUID, Integer> postingCounts = new HashMap<>();
         Map<UUID, Long> latestSequences = new HashMap<>();
         for (var posting : journal.postings()) {
-            deltas.merge(posting.accountId(), posting.signedMinorUnits(), JdbcLedgerRepository::addExact);
+            deltas.merge(
+                posting.accountId(), posting.signedMinorUnits(),
+                JdbcLedgerRepository::addMoneyExact);
             postingCounts.merge(posting.accountId(), 1, Math::addExact);
             latestSequences.put(posting.accountId(), posting.accountSequence());
         }
@@ -513,8 +517,9 @@ public class JdbcLedgerRepository implements LedgerRepository {
             """)) {
             for (UUID accountId : canonicalAccountIds(journal)) {
                 AccountState account = accounts.get(accountId);
-                long newTotal = addExact(account.signedPostingTotal(), deltas.get(accountId));
-                long newVersion = addExact(account.version(), postingCounts.get(accountId));
+                long newTotal = addMoneyExact(account.signedPostingTotal(), deltas.get(accountId));
+                long newVersion = addCapacityExact(
+                    account.version(), postingCounts.get(accountId), "materialised version");
                 statement.setLong(1, newTotal);
                 statement.setLong(2, latestSequences.get(accountId));
                 statement.setLong(3, newVersion);
@@ -540,14 +545,14 @@ public class JdbcLedgerRepository implements LedgerRepository {
         for (var posting : journal.postings()) {
             AccountState account = accounts.get(posting.accountId());
             var key = new ControlKey(account.controlAccountCode(), account.currency());
-            deltas.merge(key, posting.signedMinorUnits(), JdbcLedgerRepository::addExact);
+            deltas.merge(key, posting.signedMinorUnits(), JdbcLedgerRepository::addMoneyExact);
         }
 
         try {
             for (var entry : deltas.entrySet()) {
                 ensureControlProjection(connection, journal.bookId(), entry.getKey());
                 long currentTotal = lockControlProjection(connection, journal.bookId(), entry.getKey());
-                long newTotal = addExact(currentTotal, entry.getValue());
+                long newTotal = addMoneyExact(currentTotal, entry.getValue());
                 updateControlProjection(
                     connection,
                     journal.bookId(),
@@ -666,11 +671,19 @@ public class JdbcLedgerRepository implements LedgerRepository {
         }
     }
 
-    private static long addExact(long left, long right) {
+    private static long addMoneyExact(long left, long right) {
         try {
             return Math.addExact(left, right);
         } catch (ArithmeticException overflow) {
             throw new MonetaryOverflowException(overflow);
+        }
+    }
+
+    private static long addCapacityExact(long left, long right, String coordinate) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException overflow) {
+            throw new LedgerCapacityException(coordinate, overflow);
         }
     }
 

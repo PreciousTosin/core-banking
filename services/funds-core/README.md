@@ -15,7 +15,7 @@ For example, a customer deposits NGN 10,000.00 (1,000,000 minor units):
 
 The postings sum to zero. A NGN 25.00 transfer between two customer liabilities debits the sender `+2,500` (reducing its credit-normal natural balance) and credits the recipient `-2,500` (increasing its credit-normal natural balance). This is why the storage convention cannot be inferred from the customer UI's plus/minus display.
 
-`Money` stores an ISO currency plus signed integer minor units in a Java `long`; it never uses binary floating point. Addition, subtraction, negation, journal totals, balance updates and projection totals use checked exact arithmetic. A value outside the signed 64-bit range fails with `MonetaryOverflowException`, and the database transaction rolls back—there is no wrapping, saturation or rounding fallback. Currency conversion, rates and decimal rounding are outside this slice.
+`Money` stores a required ISO currency plus signed integer minor units in a Java `long`; it never uses binary floating point. Addition, subtraction, negation, journal totals, balance updates and projection totals use checked exact arithmetic. A value outside the signed 64-bit range fails with `MonetaryOverflowException`, and exhaustion of a monotonic account-sequence or materialised-version coordinate fails with `LedgerCapacityException`; the database transaction rolls back—there is no wrapping, saturation or rounding fallback. Because exact reversal must negate every amount, `Long.MIN_VALUE` is rejected at posting admission. Currency conversion, rates and decimal rounding are outside this slice.
 
 ## Identity and product foundations
 
@@ -65,17 +65,17 @@ To refresh, explicitly pull the Java 25 JRE tag for the target platform, inspect
 
 | Acceptance | Implemented evidence in this slice | Boundary |
 |---|---|---|
-| ACC-01 | Unbalanced and mixed-currency journals reject atomically. | Implemented. |
+| ACC-01 | Unbalanced and mixed-currency journals reject atomically; book-local booking/value dates, period ownership/open status, current policy, effective chart and complete per-line mappings are independently guarded at commit. The posting/close lock race passes five repeated runs. | Implemented kernel governance. |
 | ACC-02 | Serializable concurrent accounting updates, canonical locks, persisted postings and materialised/replayed balance invariants. | Accounting portion only; no deployed multi-replica profile or complete funds-availability scenario. |
 | ACC-19 | Per-book/per-currency trial balance and independently sourced control-account proofs, including corruption detection. | Implemented kernel proof. |
-| ACC-20 | Closed-period rejection and immutable linked exact reversal/correction into an open period. | Kernel accounting portion; approval workflow is later work. |
-| ACC-24 | Application-role denial of direct ledger mutation, trigger disabling and privileged functions. | Direct-mutation/privilege portion only; maker-checker and audit UI are excluded. |
-| ACC-25 | Bounded JVM, HTTP and JDBC configuration inputs plus a constrained image smoke command. | Configuration inputs only; no full 8 GiB overlay or mixed-load soak. |
-| ACC-29 | Java integer-money, enum, presence/hash fixtures and canonical journal hash prerequisites. | Java fixture prerequisites only; Go/generated contracts and cross-language golden binaries are excluded. |
-| ACC-32 | Same-key same/different-hash races, abandoned pre-commit owner recovery, and stored-result recovery after owner termination immediately before and after commit. | Implemented with real PostgreSQL and child JVM termination. |
+| ACC-20 | Closed-period rejection; generic-path reversal-link denial; exact linked reversal into an open period; and matching service/database limits of 256 postings, 32 dimensions, 8,192 persisted dimension bytes and the reversible signed-amount domain. | Kernel accounting portion; approval workflow is later work. |
+| ACC-24 | Application-role denial of direct ledger mutation, trigger disabling and privileged functions; an actual external proof-reader session can run only the exact trial/current-control proof columns and is denied identifiers, policy, idempotency results and outbox payloads. | Direct-mutation/privilege portion only; maker-checker and audit UI are excluded. |
+| ACC-25 | Bounded JVM, HTTP and JDBC inputs, a 2–8/32 worker/queue boundary with deterministic rejection, transaction-local 1s/3s/5s database deadlines and a constrained image smoke command. | Configuration and deterministic component evidence only; no full 8 GiB overlay or mixed-load soak. |
+| ACC-29 | Java integer-money, enum, presence fixtures, versioned typed posting/reversal command hashes covering every financial field, and canonical journal hash prerequisites. | Java fixture prerequisites only; Go/generated contracts and cross-language golden binaries are excluded. |
+| ACC-32 | Same-key same/different-hash races, all-field stale-hash mutation matrices, same-content replay before changed governance validation, abandoned pre-commit owner recovery, and stored-result recovery after owner termination immediately before and after commit. | Implemented with real PostgreSQL and child JVM termination. |
 | ACC-38 | NUBAN check digits, scoped alias cardinality, primary uniqueness, immutable mappings and simulator-only fixture constraints. | Foundation/constraint portion only; issuance, resolution, replacement and concurrent allocation APIs are excluded. |
-| ACC-40 | Immutable product-version binding to customer accounts. | Version foundation only; product-specific lifecycle behavior is excluded. |
-| ACC-42 | Immutable finance-principle classification and approval-reference foundations. | Constraint foundation only; complete template/rate/account guards and allocation behavior are excluded. |
+| ACC-40 | Product kind lives immutably on each product version; existing customer accounts retain their historical classification when a new family version is added. | Version foundation only; product-specific lifecycle behavior is excluded. |
+| ACC-42 | Finance principle lives immutably on each product version with approval-reference foundations; later versions cannot reclassify historical accounts. | Constraint foundation only; complete template/rate/account guards and allocation behavior are excluded. |
 
 ## Explicit exclusions
 

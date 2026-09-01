@@ -1232,7 +1232,7 @@ Connect as the application role and prove it can select/insert through the requi
 - update an accounting period to `CLOSED` directly;
 - mutate a completed idempotency result.
 
-Connect as proof-reader and prove it has read-only access and cannot insert.
+Connect as the external proof-job role and prove the exact trial/control queries succeed while reads of account-address identifiers, product policy JSON, idempotency results and outbox payloads fail. Prove it cannot insert or mutate any row.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1242,7 +1242,7 @@ Expected: FAIL because the roles/grants do not exist.
 
 - [ ] **Step 3: Implement V004 privileges**
 
-Create `funds_migrator`, `funds_app` and `funds_proof_reader` as `NOLOGIN` roles; deployment-specific login roles inherit them. Revoke public schema/function/table privileges. Grant `funds_app` only required DML and sequence usage. Do not grant trigger, DDL or function ownership. Grant proof reader `SELECT` only. Period close is exposed through a subsequent privileged command plan, so `funds_app` cannot update period status in this slice.
+Create `funds_migrator`, `funds_app` and `funds_proof_reader` as `NOLOGIN` roles; deployment-specific login roles inherit them. Revoke public schema/function/table privileges. Grant `funds_app` only required DML and sequence usage. Do not grant trigger, DDL or function ownership. Treat `funds_proof_reader` as an external proof-job capability, not the service datasource: grant column-level `SELECT` only for immutable journal/posting facts, governed control mappings and projection totals. Do not expose account identifiers, product policy, idempotency result JSON or outbox payloads. The control projection is current-state-only, so the plan claims only a current-cutoff control proof until projection history exists. Period close is exposed through a subsequent privileged command plan, so `funds_app` cannot update period status in this slice.
 
 - [ ] **Step 4: Run privilege and invariant tests**
 
@@ -1285,9 +1285,13 @@ quarkus.datasource.jdbc.leak-detection-interval=30S
 quarkus.flyway.migrate-at-start=false
 quarkus.http.limits.max-body-size=128K
 quarkus.micrometer.export.prometheus.enabled=true
+quarkus.thread-pool.core-threads=2
+quarkus.thread-pool.max-threads=8
+quarkus.thread-pool.queue-size=32
+quarkus.thread-pool.growth-resistance=0
 ```
 
-The migration job runs separately with `funds_migrator`; replicas use `funds_app`. No application cache stores balances or journals.
+The migration job runs separately with `funds_migrator`; replicas use `funds_app`. The finite worker pool rejects a full queue before accepting more work. Every posting/reversal transaction sets local one-second lock, three-second statement and five-second idle-in-transaction deadlines before lock or statement work. Deadline outcomes are typed consistently and do not broaden the bounded serialization/deadlock retry policy. No application cache stores balances or journals.
 
 - [ ] **Step 2: Create the JVM container**
 
@@ -1314,7 +1318,7 @@ cd services/funds-core
 ./mvnw clean verify
 ```
 
-Expected: all unit, generated-property, PostgreSQL integration, injected-failure and child-process crash tests pass; no skipped accounting tests; Flyway validates all four migrations.
+Expected: all unit, generated-property, PostgreSQL integration, injected-failure and child-process crash tests pass; no skipped accounting tests; Flyway validates the seven migration resources through additive `V005`.
 
 - [ ] **Step 4: Run a clean package and container smoke test**
 
@@ -1349,6 +1353,48 @@ Expected: build succeeds; container reports Java 25 and stays within the declare
 git add services/funds-core
 git commit -m "docs(funds-core): complete accounting kernel slice"
 ```
+
+---
+
+### Task 14: Harden governed acceptance invariants
+
+**Files:**
+- Create: `services/funds-core/src/main/resources/db/migration/V005__acceptance_hardening.sql`
+- Create/modify: command hashing, posting/reversal governance and persistence classes under `services/funds-core/src/main/java`
+- Create/modify: `AcceptanceHardeningIT`, posting/reversal/concurrency/migration/role/runtime tests
+- Modify: accounting-kernel architecture, README, health and role contracts
+
+**Interfaces:**
+- Consumes: the complete accounting-kernel slice and independent review findings.
+- Produces: independently enforced period/chart/product/reversal invariants, trusted typed-command idempotency, finite runtime admission and exact proof-reader access.
+
+- [ ] **Step 1: Add acceptance tests before implementation**
+
+Prove service and direct-DML rejection for Lagos-midnight booking dates, booking/value-period divergence, wrong-book and closed periods, stale policy/chart versions and incomplete chart mappings. Repeat the posting-versus-period-close lock race five times. Add version rotation and historical-classification fixtures.
+
+For posting and reversal requests, mutate every financially relevant typed field while retaining the supplied hash and require a deterministic conflict before financial work. Prove a completed same-content replay still resolves after its period closes, chart retires or policy advances.
+
+Exercise the reversible envelope at 256/257 postings, 32/33 dimensions, 8,192/8,193 persisted dimension bytes and `Long.MIN_VALUE`. Prove generic posting rejects reversal metadata and direct DML cannot create alternate-type, duplicate or inexact reversals; prove an exact maximum-sized reversal succeeds.
+
+- [ ] **Step 2: Implement additive governance and typed hashes**
+
+Use additive `V005` to backfill product kind and finance principle onto immutable product versions, separate stable ledger-account identity from immutable per-chart mappings, pin every journal to one governed chart version, and add commit-time period/chart/reversal guards owned by `funds_migrator`. Preserve historical classifications during chart and product rotation. Revoke or re-grant application capabilities so `funds_app` cannot bypass the new guards.
+
+Version and domain-separate canonical encodings for posting and reversal typed commands. Re-derive and verify hashes inside the kernel, resolve completed replays before later governance validation, and expose reversal linkage only through the trusted reversal-service path.
+
+- [ ] **Step 3: Bound runtime and independent proof access**
+
+Configure a 2–8 thread worker pool with a queue of 32 and deterministic rejection. Apply transaction-local 1s lock, 3s statement and 5s idle-in-transaction deadlines before database work. Map deadline outcomes without adding retry classes.
+
+Replace schema-wide proof grants with the exact table columns needed by the external proof job. Prove trial and current-cutoff control queries succeed while sensitive identifier, policy, idempotency and outbox columns are denied.
+
+- [ ] **Step 4: Run focused and complete gates**
+
+Run the combined acceptance-hardening integration gate, all concurrency cases five times where applicable, migration/role and packaging contracts, then Java 25/PostgreSQL 18.6 `./mvnw clean verify`. Require zero failures, errors, skips and warnings attributable to the accounting kernel; finish with `git diff --check` and a clean worktree.
+
+- [ ] **Step 5: Commit thematic checkpoints**
+
+Commit governance/hash/reversal/product/chart work separately from runtime/proof hardening when each gate is independently green. Never commit `.superpowers/sdd` evidence artifacts.
 
 ---
 
