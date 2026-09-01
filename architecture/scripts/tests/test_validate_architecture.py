@@ -5,7 +5,7 @@ from pathlib import Path
 from architecture.scripts import validate_architecture as validator
 
 
-class ValidatorTests(unittest.TestCase):
+class ValidatorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -18,6 +18,42 @@ class ValidatorTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
         return path
+
+    def test_required_governance_files(self):
+        errors = validator.validate_structure(self.root)
+        self.assertEqual(
+            [
+                "ARCHITECTURE.md is required",
+                "architecture/README.md is required",
+                "architecture/adr/README.md is required",
+                "architecture/adr/template.md is required",
+                "architecture/archive/proposals/README.md is required",
+                "architecture/diagrams/README.md is required",
+                "architecture/proposals/README.md is required",
+            ],
+            errors,
+        )
+
+    def test_root_architecture_must_be_fewer_than_180_lines(self):
+        required_files = [
+            "architecture/README.md",
+            "architecture/adr/README.md",
+            "architecture/adr/template.md",
+            "architecture/archive/proposals/README.md",
+            "architecture/diagrams/README.md",
+            "architecture/proposals/README.md",
+        ]
+        for path in required_files:
+            self.write(path, "\n")
+
+        self.write("ARCHITECTURE.md", "line\n" * 179)
+        self.assertEqual([], validator.validate_structure(self.root))
+
+        self.write("ARCHITECTURE.md", "line\n" * 180)
+        self.assertEqual(
+            ["ARCHITECTURE.md must contain fewer than 180 lines"],
+            validator.validate_structure(self.root),
+        )
 
     def test_relative_link_rejects_a_missing_target(self):
         self.write("ARCHITECTURE.md", "[missing](architecture/missing.md)\n")

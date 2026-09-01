@@ -8,7 +8,17 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"links"})
+CHECKS = frozenset({"links", "structure"})
+
+REQUIRED_GOVERNANCE_FILES = (
+    "ARCHITECTURE.md",
+    "architecture/README.md",
+    "architecture/adr/README.md",
+    "architecture/adr/template.md",
+    "architecture/archive/proposals/README.md",
+    "architecture/diagrams/README.md",
+    "architecture/proposals/README.md",
+)
 
 @dataclass(frozen=True)
 class MarkdownLink:
@@ -146,8 +156,15 @@ def validate_links(root: Path) -> list[str]:
                 errors.append(f"{target_name}#{fragment} does not exist (linked from {rel}:{link.line})")
     return sorted(errors)
 
+def validate_structure(root: Path) -> list[str]:
+    errors = [f"{path} is required" for path in REQUIRED_GOVERNANCE_FILES if not (root / path).is_file()]
+    architecture = root / "ARCHITECTURE.md"
+    if architecture.is_file() and len(architecture.read_text().splitlines()) >= 180:
+        errors.append("ARCHITECTURE.md must contain fewer than 180 lines")
+    return sorted(errors)
+
 Validator = Callable[[Path], list[str]]
-VALIDATORS: dict[str, Validator] = {"links": validate_links}
+VALIDATORS: dict[str, Validator] = {"links": validate_links, "structure": validate_structure}
 
 def validate_repository(root: Path, checks: frozenset[str] = CHECKS) -> list[str]:
     errors = []
