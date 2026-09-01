@@ -5,7 +5,8 @@ import java.util.Objects;
 
 /**
  * Three-letter ISO 4217 currency code, upper-cased on construction. The database stores the
- * same shape (char(3) with an ^[A-Z]{3}$ CHECK) on book, ledger account and posting rows.
+ * same shape (char(3) with an ^[A-Z]{3}$ CHECK) on book and ledger account rows; a posting
+ * row carries char(3) and must match its account's currency.
  */
 public record CurrencyCode(String value) {
     public CurrencyCode {
