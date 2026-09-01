@@ -19,6 +19,13 @@ import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Deterministic generated-property test for the ACC-01 balance invariant: for every generated
+ * amount an equal debit and credit validates, and a one-minor-unit difference on either side is
+ * rejected. Cases come from PropertyCases.positiveMinorUnits with a fixed seed, so a failing amount
+ * reproduces from the printed label rather than from a lost random state. Catches a validator that
+ * tolerates an off-by-one imbalance anywhere in the supported amount range.
+ */
 class JournalProperties {
     private static final long SEED = 0xCB20260830L;
     private static final int RANDOM_CASES = 2_000;
@@ -42,6 +49,8 @@ class JournalProperties {
     @Test
     void changingOneSideByOneMinorUnitAlwaysFails() {
         PropertyCases.positiveMinorUnits(SEED, RANDOM_CASES).forEach(amount -> {
+            // -1 + 1 is a zero posting, which PostingLine rejects at construction; the validator
+            // never sees it, so the expected failure type differs from the other cases.
             if (amount == 1) {
                 assertThrows(
                     IllegalArgumentException.class,
@@ -67,6 +76,7 @@ class JournalProperties {
         var first = PropertyCases.positiveMinorUnits(SEED, RANDOM_CASES).toArray();
         var second = PropertyCases.positiveMinorUnits(SEED, RANDOM_CASES).toArray();
 
+        // Seven fixed boundaries followed by RANDOM_CASES seeded draws.
         assertEquals(2_007, first.length);
         assertArrayEquals(new long[] {
             1,

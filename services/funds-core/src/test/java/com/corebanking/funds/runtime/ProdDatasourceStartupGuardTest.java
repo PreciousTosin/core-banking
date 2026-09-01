@@ -7,6 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the fail-closed startup rule from the README ("Database roles and startup"): a missing or
+ * blank production datasource input is rejected before readiness can be UP, and the diagnostic
+ * names only the offending Quarkus property, never its value. Catches a guard that accepts a blank
+ * credential or that leaks a JDBC URL or password into a startup log.
+ */
 class ProdDatasourceStartupGuardTest {
     @Test
     void rejectsEachMissingOrBlankDatasourceFieldWithoutEchoingValues() {

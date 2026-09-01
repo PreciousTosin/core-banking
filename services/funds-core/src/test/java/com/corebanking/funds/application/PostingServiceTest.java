@@ -29,6 +29,15 @@ import java.util.logging.Logger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 
+/**
+ * Proves the ordering of PostingService's admission checks without PostgreSQL: a stale caller hash
+ * conflicts before any connection is opened (ACC-32 stale-hash mutation matrix), a completed
+ * same-content replay resolves before journal validation (ACC-32), invalid journals fail inside
+ * the retried transaction after the idempotency preflight, and the generic path refuses
+ * caller-supplied reversal metadata (ACC-20). Catches a reordering that would let a stale hash
+ * authorise changed content or let a reversal link bypass ReversalService. Recording fakes count
+ * connections, retry executions and repository calls so the ordering is observable.
+ */
 class PostingServiceTest {
     private static final CurrencyCode NGN = CurrencyCode.of("NGN");
 
@@ -220,6 +229,7 @@ class PostingServiceTest {
 
     private record NamedMutation(String name, Consumer<DraftValues> change) {}
 
+    /** Mutable copy of a JournalDraft so the matrix can change exactly one field per case. */
     private static final class DraftValues {
         private UUID journalId;
         private UUID commandId;
@@ -277,6 +287,10 @@ class PostingServiceTest {
         }
     }
 
+    /**
+     * Runs the real retry loop with a no-op pause and counts entries. executions == 0 proves a
+     * failure happened before the retried transaction; executions == 1 proves it happened inside.
+     */
     private static final class RecordingRetryPolicy extends PostgresRetryPolicy {
         private int executions;
 
@@ -291,6 +305,7 @@ class PostingServiceTest {
         }
     }
 
+    /** Counts preflight and post calls; {@code completed} simulates a stored result for replays. */
     private static final class RecordingRepository implements LedgerRepository {
         private int calls;
         private int preflightCalls;
@@ -312,6 +327,11 @@ class PostingServiceTest {
         }
     }
 
+    /**
+     * Counts connections and hands out dynamic proxies that answer only what PostingService's
+     * transaction bookkeeping and PostingTransactionTimeouts.apply touch (prepareStatement/execute
+     * for the SET LOCAL deadlines, autocommit, isClosed); every other JDBC call returns null.
+     */
     private static final class RecordingDataSource implements DataSource {
         private int connections;
 

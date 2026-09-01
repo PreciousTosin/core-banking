@@ -18,7 +18,16 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
-/** An in-memory accounting oracle that has no database or production-service dependency. */
+/**
+ * An in-memory accounting oracle that has no database or production-service dependency. It models
+ * only what AccountingStateMachineIT compares against PostgreSQL: per-currency balance, per-account
+ * and per-control signed totals in BigInteger (so a long overflow is predicted rather than
+ * suffered), same-hash versus different-hash command replay, which journals are still reversible,
+ * and the deterministic outbox identity of each journal. It deliberately does not model periods,
+ * chart governance, account sequences, transaction deadlines or the database's exact-negation and
+ * one-reversal constraints; the generator only proposes reversals this model says are eligible, and
+ * anything the kernel rejects beyond that is a test failure, not a predicted outcome.
+ */
 public final class ReferenceLedgerModel {
     private static final BigInteger LONG_MIN = BigInteger.valueOf(Long.MIN_VALUE);
     private static final BigInteger LONG_MAX = BigInteger.valueOf(Long.MAX_VALUE);
@@ -30,11 +39,20 @@ public final class ReferenceLedgerModel {
     private final Map<UUID, StoredJournal> journals = new LinkedHashMap<>();
     private final Set<UUID> expectedOutboxIds = new LinkedHashSet<>();
 
+    /**
+     * Fixes the account universe and each account's control code. An account not in this map is
+     * treated as unpostable, so predictions never depend on database lookups.
+     */
     public ReferenceLedgerModel(Map<UUID, String> accountControls) {
         this.accountControls = Map.copyOf(Objects.requireNonNull(accountControls, "accountControls"));
         this.accountControls.forEach((accountId, control) -> accountTotals.put(accountId, BigInteger.ZERO));
     }
 
+    /**
+     * Predicts the kernel's outcome without mutating the model. Order matters and mirrors the
+     * service: idempotency (same or different hash) is decided first, then per-currency balance,
+     * then whether any resulting account or control total would leave the signed 64-bit range.
+     */
     public ExpectedOutcome predict(PostingCommand command) {
         SuccessfulCommand previous = successfulCommands.get(command.commandId());
         if (previous != null) {
@@ -68,7 +86,11 @@ public final class ReferenceLedgerModel {
             : ExpectedOutcome.NEW_SUCCESS;
     }
 
-    /** Mutates the oracle only after a real command has returned successfully. */
+    /**
+     * Mutates the oracle only after a real command has returned successfully. A same-hash retry
+     * must return the stored result unchanged and leaves the model untouched; a success the model
+     * did not predict is an oracle/kernel disagreement and fails immediately.
+     */
     public void apply(PostingCommand command, PostingResult result) {
         ExpectedOutcome prediction = predict(command);
         if (prediction == ExpectedOutcome.SUCCESSFUL_RETRY) {
@@ -114,7 +136,11 @@ public final class ReferenceLedgerModel {
         return List.copyOf(journals.keySet());
     }
 
-    /** Journals eligible for their first exact reversal under the database-wide correction rule. */
+    /**
+     * Journals eligible for their first exact reversal under the database-wide correction rule:
+     * originals only (a reversal is never itself reversed) that no stored reversal already links
+     * to, matching one_reversal_per_original_idx.
+     */
     public List<UUID> reversibleJournalIds() {
         Set<UUID> alreadyReversed = new LinkedHashSet<>();
         journals.values().stream()
@@ -168,6 +194,7 @@ public final class ReferenceLedgerModel {
         return journals.values().stream().mapToInt(journal -> journal.lines().size()).sum();
     }
 
+    /** The exception the kernel must throw for a rejected outcome; null for the success cases. */
     public static Class<? extends RuntimeException> exceptionType(ExpectedOutcome outcome) {
         return switch (outcome) {
             case INVALID_JOURNAL -> InvalidJournalException.class;
@@ -177,6 +204,8 @@ public final class ReferenceLedgerModel {
         };
     }
 
+    // Independently re-derives the outbox event id the way JdbcLedgerRepository does, so the
+    // test proves the id is a pure function of the journal rather than reading it back.
     private static UUID outboxId(UUID journalId) {
         return UUID.nameUUIDFromBytes(("JournalPosted:" + journalId).getBytes(StandardCharsets.UTF_8));
     }
@@ -185,6 +214,7 @@ public final class ReferenceLedgerModel {
         return value.compareTo(LONG_MIN) < 0 || value.compareTo(LONG_MAX) > 0;
     }
 
+    /** The five kernel responses the oracle can predict; see exceptionType for the mapping. */
     public enum ExpectedOutcome {
         NEW_SUCCESS,
         SUCCESSFUL_RETRY,
@@ -193,6 +223,7 @@ public final class ReferenceLedgerModel {
         MONETARY_OVERFLOW
     }
 
+    /** Control totals are per control code and currency, as in control_account_projection. */
     public record ControlKey(String controlAccountCode, CurrencyCode currency) {
         public ControlKey {
             Objects.requireNonNull(controlAccountCode, "controlAccountCode");
@@ -212,6 +243,7 @@ public final class ReferenceLedgerModel {
         }
     }
 
+    /** What the model keeps of a committed journal: enough to build its exact reversal later. */
     public record StoredJournal(
         UUID journalId,
         UUID reversalOfJournalId,

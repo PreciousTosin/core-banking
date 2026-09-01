@@ -30,6 +30,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.w3c.dom.Element;
 
+/**
+ * ACC-25 configuration evidence: reads pom.xml, application.properties, Dockerfile.jvm, the README,
+ * the health contract and the smoke script as text and asserts the bounded-runtime contract they
+ * jointly state (JVM flags and non-root user, the 2-8 JDBC pool with 5s acquisition, the 2-8/32
+ * worker pool, 1s/3s/5s transaction deadlines, 128 KiB bodies, env-supplied prod datasource, the
+ * pinned base-image digest, one Quarkus build goal). Catches a limit drifting in one file while
+ * the documentation still claims the old value. The first half of the class guards the reader
+ * itself: every input must be the exact Git-tracked file under services/funds-core, reached
+ * through a symlink-free path, so a decoy module or override property cannot make the contract
+ * pass against different files.
+ */
 class PackagingContractTest {
     private static final String MODULE_REPOSITORY_PATH = "services/funds-core";
     private static final Set<String> CONTRACT_INPUTS = Set.of(
@@ -39,7 +50,12 @@ class PackagingContractTest {
         "README.md",
         "docs/health-contract.md",
         "scripts/prod-runtime-smoke.sh");
+    // Resolved from this class's own code source, never from a system property or working
+    // directory, so the module under test is the one that compiled the test.
     private static final Path MODULE = resolveModuleRoot(actualCodeSource());
+    // The README "Memory boundary" and ACC-25 bounds. Each key must appear exactly once in the
+    // properties file: java.util.Properties keeps the last assignment, so a duplicate could
+    // silently widen a limit while this map still matched the final value.
     private static final Map<String, String> CONTROLLED_PROPERTIES = Map.ofEntries(
         Map.entry("quarkus.datasource.db-kind", "postgresql"),
         Map.entry("quarkus.datasource.jdbc.min-size", "2"),
@@ -62,11 +78,15 @@ class PackagingContractTest {
         Map.entry("%prod.quarkus.datasource.username", "${FUNDS_APP_DB_USER}"),
         Map.entry("%prod.quarkus.datasource.password", "${FUNDS_APP_DB_PASSWORD}"));
 
+    // --- Module and input trust: the contract must be read from the real tracked files ---
+
     @Test
     void modulePathMatchesAnIndependentTrackedGitAnchor() throws Exception {
         assertEquals(independentExpectedModule(), resolveModuleRoot(actualCodeSource()));
     }
 
+    // funds.core.basedir is not read anywhere; this pins that a future convenience override cannot
+    // redirect the contract to another directory.
     @Test
     void modulePathIgnoresCallerSuppliedBasedirOverride(@TempDir Path temp) throws Exception {
         Path expected = independentExpectedModule();
@@ -275,6 +295,10 @@ class PackagingContractTest {
         assertTrue(failure.getMessage().contains("com.corebanking:funds-core"), failure::getMessage);
     }
 
+    // --- Runtime bounds: application.properties, pom.xml, Dockerfile.jvm ---
+
+    // Also proves no JDBC endpoint is baked into the image: production takes it from
+    // FUNDS_DB_JDBC_URL only (README "Database roles and startup").
     @Test
     void productionConfigurationHasOneEffectiveAssignmentForEveryBound() throws Exception {
         String source = read(MODULE, "src/main/resources/application.properties");
@@ -290,6 +314,8 @@ class PackagingContractTest {
             "production JDBC endpoint must not be embedded");
     }
 
+    // Guards the counter itself: a textual grep would miss a duplicate key spelled with a unicode
+    // escape or a backslash line continuation, which Properties still decodes to the same key.
     @Test
     void semanticAssignmentCountingDetectsEscapedAndContinuedDuplicateKeys() throws IOException {
         String source = read(MODULE, "src/main/resources/application.properties");
@@ -300,6 +326,8 @@ class PackagingContractTest {
         assertEquals(2, assignmentCounts(continuedDuplicate).get("quarkus.datasource.jdbc.max-size"));
     }
 
+    // Exactly one bound quarkus:build execution produces the target/quarkus-app layout the
+    // Dockerfile copies; a second binding could package a different artifact than the one tested.
     @Test
     void pomBindsExactlyOneQuarkusBuildGoal() throws Exception {
         assertPomContract(read(MODULE, "pom.xml"));
@@ -337,6 +365,13 @@ class PackagingContractTest {
         assertEquals("build", goal.getFirst().getTextContent().trim());
     }
 
+    /**
+     * The whole directive list is compared, not searched, so nothing can be added to the image
+     * unreviewed. The digest is the reviewed base image from the README "Base-image review and
+     * refresh" section, USER 10001 keeps the runtime non-root, JAVA_TOOL_OPTIONS is the "Memory
+     * boundary" flag set, and HeapDumpOnOutOfMemoryError stays absent because heap dumps are
+     * opt-in through the encrypted diagnostic workflow.
+     */
     @Test
     void dockerfileIsTheCompletePinnedNonRootRuntimeContract() throws IOException {
         List<String> directives = read(MODULE, "Dockerfile.jvm").lines()
@@ -356,6 +391,9 @@ class PackagingContractTest {
             "ENTRYPOINT [\"java\",\"-jar\",\"/work/quarkus-run.jar\"]"), directives);
         assertFalse(directives.stream().anyMatch(line -> line.contains("HeapDumpOnOutOfMemoryError")));
     }
+
+    // --- Documentation: the README and health contract must keep the sections other tests and
+    // --- reviewers cite, one acceptance row per ACC code, and the same digest as the Dockerfile.
 
     @Test
     void documentationHasUniqueRequiredSectionsCoverageAndExclusions() throws IOException {
@@ -393,6 +431,8 @@ class PackagingContractTest {
             .filter(line -> line.equals("./scripts/prod-runtime-smoke.sh core-banking/funds-core:accounting-kernel"))
             .count());
     }
+
+    // --- Helpers ---
 
     private static Map<String, Integer> assignmentCounts(String source) throws IOException {
         var properties = new CountingProperties();
@@ -464,6 +504,13 @@ class PackagingContractTest {
         return Files.isExecutable(resolveContractInput(module, relativePath));
     }
 
+    /**
+     * The trust chain every contract read goes through: the path must be one of the fixed
+     * CONTRACT_INPUTS spelled exactly, the module must be its own canonical directory, no segment
+     * from module to file may be a symlink, the canonical file must stay beneath the module, and
+     * Git must list it at services/funds-core/&lt;path&gt;. Each check throws IllegalStateException
+     * with a distinct message so the trust tests can assert which layer rejected a decoy.
+     */
     private static Path resolveContractInput(Path module, String relativePath) {
         if (!CONTRACT_INPUTS.contains(relativePath)) {
             throw new IllegalStateException("Contract input must use its exact repository-relative spelling");
@@ -532,6 +579,11 @@ class PackagingContractTest {
         }
     }
 
+    /**
+     * Second opinion on the module location that shares no code with resolveModuleRoot: asks Git
+     * for the top level and the two tracked sentinels directly, so the two resolvers can only
+     * agree if the module really is the tracked services/funds-core.
+     */
     private static Path independentExpectedModule() throws IOException {
         Path codeSource = Path.of(actualCodeSource()).toRealPath();
         String repositoryOutput = runBoundedGit(codeSource, "rev-parse", "--show-toplevel");
@@ -554,6 +606,11 @@ class PackagingContractTest {
         return expected;
     }
 
+    /**
+     * Runs git with a five-second deadline, a 16 KiB output cap and every GIT_* variable removed
+     * from the child environment, so a caller's GIT_DIR or GIT_WORK_TREE cannot point the trust
+     * check at a different repository and a wedged git cannot hang the build.
+     */
     private static String runBoundedGit(Path context, String... arguments) throws IOException {
         var command = new ArrayList<String>();
         command.add("git");
@@ -639,6 +696,10 @@ class PackagingContractTest {
         runBoundedGit(repository, arguments.toArray(String[]::new));
     }
 
+    /**
+     * Walks target/test-classes up to the module directory, then requires both sentinels to pass
+     * the full contract-input trust chain and the pom to identify com.corebanking:funds-core.
+     */
     private static Path resolveModuleRoot(URI codeSource) {
         Path testClasses;
         try {
@@ -698,6 +759,8 @@ class PackagingContractTest {
         }
     }
 
+    // Hardened parser (no DOCTYPE, no external entities) because the pom is treated as untrusted
+    // input here; exactly one direct groupId and artifactId child defeats a decoy with duplicates.
     private static void requireFundsCorePomIdentity(Path pom) {
         try (var reader = Files.newBufferedReader(pom, StandardCharsets.UTF_8)) {
             var factory = DocumentBuilderFactory.newInstance();
@@ -741,6 +804,10 @@ class PackagingContractTest {
         }
     }
 
+    /**
+     * Counts assignments per key as Properties.load decodes them. Hooking put sees every
+     * assignment after escape and continuation processing, which a line-based scan cannot.
+     */
     private static final class CountingProperties extends Properties {
         private final Map<String, Integer> counts = new HashMap<>();
 
