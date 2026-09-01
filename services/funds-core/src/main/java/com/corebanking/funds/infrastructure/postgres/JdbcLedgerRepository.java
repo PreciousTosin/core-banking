@@ -209,6 +209,7 @@ public class JdbcLedgerRepository implements LedgerRepository {
 
     private static void validateBookAndPeriod(Connection connection, JournalDraft journal)
         throws SQLException {
+        LocalDate localBookingDate;
         try (var statement = connection.prepareStatement("""
             SELECT legal_entity_id, accounting_policy_version, timezone,
                    chart_status, chart_activated_at
@@ -243,10 +244,13 @@ public class JdbcLedgerRepository implements LedgerRepository {
                 } catch (RuntimeException invalidTimezone) {
                     throw new InvalidJournalException("book has an invalid timezone");
                 }
-                LocalDate localBookingDate = journal.bookingTime().atZone(timezone).toLocalDate();
-                validatePeriod(connection, journal, localBookingDate);
+                localBookingDate = journal.bookingTime().atZone(timezone).toLocalDate();
             }
         }
+        // Close the chart-governance result before opening the period query.
+        // This keeps one cancellable JDBC statement live at a time on the
+        // bounded posting connection while both row locks remain held.
+        validatePeriod(connection, journal, localBookingDate);
     }
 
     private static void validatePeriod(

@@ -801,7 +801,9 @@ class PostingCrashRecoveryIT {
     ) {
         assertAll(
             () -> assertEquals(CrashPostingWorker.JOURNAL_ID, result.journalId()),
-            () -> assertEquals(command.requestHash(), result.canonicalHash()),
+            () -> assertEquals(
+                new CanonicalJournalHasher().sha256(command.journal()),
+                result.canonicalHash()),
             () -> assertEquals(1, after.idempotency().size()),
             () -> assertEquals(command.commandId(), after.idempotency().getFirst().commandId()),
             () -> assertEquals("COMPLETED", after.idempotency().getFirst().state()),
@@ -809,7 +811,8 @@ class PostingCrashRecoveryIT {
             () -> assertEquals(result.journalId(), after.idempotency().getFirst().journalId()),
             () -> assertNotNull(after.idempotency().getFirst().resultJson()),
             () -> assertTrue(after.idempotency().getFirst().resultJson().contains(result.journalId().toString())),
-            () -> assertTrue(after.idempotency().getFirst().resultJson().contains(command.requestHash())),
+            () -> assertTrue(after.idempotency().getFirst().resultJson().contains(
+                result.canonicalHash())),
             () -> assertNotNull(after.idempotency().getFirst().createdAt()),
             () -> assertNotNull(after.idempotency().getFirst().completedAt()),
             () -> assertEquals(1, after.journals().size()),
@@ -831,7 +834,7 @@ class PostingCrashRecoveryIT {
             () -> assertEquals(command.journal().valueDate(), after.journals().getFirst().valueDate()),
             () -> assertNull(after.journals().getFirst().reversalOfJournalId()),
             () -> assertEquals(command.journal().policyVersion(), after.journals().getFirst().policyVersion()),
-            () -> assertEquals(command.requestHash(), after.journals().getFirst().canonicalHash()),
+            () -> assertEquals(result.canonicalHash(), after.journals().getFirst().canonicalHash()),
             () -> assertEquals(
                 List.of(
                     new PostingState(
@@ -897,7 +900,7 @@ class PostingCrashRecoveryIT {
             () -> assertEquals("JournalPosted", after.outbox().getFirst().eventType()),
             () -> assertEquals(1, after.outbox().getFirst().schemaVersion()),
             () -> assertTrue(after.outbox().getFirst().payload().contains(result.journalId().toString())),
-            () -> assertTrue(after.outbox().getFirst().payload().contains(command.requestHash())),
+            () -> assertTrue(after.outbox().getFirst().payload().contains(result.canonicalHash())),
             () -> assertNotNull(after.outbox().getFirst().createdAt()),
             () -> assertNull(after.outbox().getFirst().publishedAt()),
             () -> assertEquals(0, after.outbox().getFirst().publishAttempts()));
@@ -2721,7 +2724,7 @@ class PostingCrashRecoveryIT {
         }
 
         private PreparedStatement observedStatement(PreparedStatement statement, String sql) {
-            boolean blocksOnFixture = sql.contains("FROM funds.lock_account_for_posting(");
+            boolean blocksOnFixture = sql.contains("FROM funds.lock_account_mapping_for_posting(");
             return (PreparedStatement) Proxy.newProxyInstance(
                 PreparedStatement.class.getClassLoader(),
                 new Class<?>[]{PreparedStatement.class},

@@ -144,10 +144,8 @@ class MigrationIT {
                           'enforce_posting_reference_consistency',
                           'reject_posting_to_completed_journal',
                           'enforce_journal_reversibility',
-                          'lock_book_for_posting',
                           'lock_book_chart_for_posting',
                           'lock_period_for_posting',
-                          'lock_account_for_posting',
                           'lock_account_mapping_for_posting'))
                 """));
             assertEquals(0, queryInt(connection, """

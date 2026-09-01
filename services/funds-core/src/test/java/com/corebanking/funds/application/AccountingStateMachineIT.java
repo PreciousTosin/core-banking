@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
+import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.testsupport.GeneratedLedgerOperation;
 import com.corebanking.funds.testsupport.PropertyCases;
 import com.corebanking.funds.testsupport.ReferenceLedgerModel;
@@ -32,6 +33,7 @@ import java.util.UUID;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.util.PSQLException;
 
 @QuarkusTest
 class AccountingStateMachineIT {
@@ -64,7 +66,7 @@ class AccountingStateMachineIT {
     }
 
     @Test
-    void reversalComparisonRejectsDimensionMismatch() throws SQLException {
+    void databaseReversalComparisonRejectsDimensionMismatch() throws SQLException {
         long seed = BASE_SEED;
         Fixture fixture = seedFixture(seed);
         seedFixture(fixture, 0);
@@ -97,14 +99,12 @@ class AccountingStateMachineIT {
             first.accountSequence(),
             Map.of("operation", "dimension-mismatch", "seed", Long.toUnsignedString(seed))));
         PostingCommand alteredReversal = command(copyWithPostings(validReversal.journal(), alteredLines));
-        model.apply(alteredReversal, service.post(alteredReversal));
+        LedgerPersistenceException mismatch = assertThrows(
+            LedgerPersistenceException.class,
+            () -> service.postTrustedReversal(alteredReversal));
 
-        AssertionError mismatch = assertThrows(AssertionError.class, () -> {
-            try (Connection connection = dataSource.getConnection()) {
-                assertReversalsAndHashes(connection, model);
-            }
-        });
-        assertTrue(mismatch.getMessage().contains("dimensions"), mismatch::getMessage);
+        assertTrue(hasConstraint(mismatch, "reversal_exact_negation"));
+        assertAllInvariants(fixture, model);
     }
 
     @Test
@@ -227,14 +227,14 @@ class AccountingStateMachineIT {
         DatabaseCounts before = databaseCounts();
 
         if (expected == ExpectedOutcome.NEW_SUCCESS || expected == ExpectedOutcome.SUCCESSFUL_RETRY) {
-            PostingResult result = service.post(command);
+            PostingResult result = postThroughKernelPath(service, command);
             model.apply(command, result);
             if (expected == ExpectedOutcome.NEW_SUCCESS) {
                 totals.recordNewJournal(command.journal().postings().size());
             }
         } else {
             Class<? extends RuntimeException> exceptionType = ReferenceLedgerModel.exceptionType(expected);
-            assertThrows(exceptionType, () -> service.post(command));
+            assertThrows(exceptionType, () -> postThroughKernelPath(service, command));
         }
 
         DatabaseCounts after = databaseCounts();
@@ -629,14 +629,17 @@ class AccountingStateMachineIT {
     ) throws SQLException {
         Map<ReferenceLedgerModel.ControlKey, BigInteger> independent = new LinkedHashMap<>();
         try (PreparedStatement statement = connection.prepareStatement("""
-            SELECT account.control_account_code, posting.currency,
+            SELECT mapping.control_account_code, posting.currency,
                    sum(posting.signed_minor_units::numeric) AS independent_total
             FROM funds.posting posting
             JOIN funds.journal journal ON journal.journal_id = posting.journal_id
-            JOIN funds.ledger_account account ON account.account_id = posting.account_id
+            JOIN funds.ledger_account_chart_mapping mapping
+              ON mapping.account_id = posting.account_id
+             AND mapping.book_id = journal.book_id
+             AND mapping.chart_version_id = journal.chart_version_id
             WHERE journal.book_id = ?
-            GROUP BY account.control_account_code, posting.currency
-            ORDER BY account.control_account_code, posting.currency
+            GROUP BY mapping.control_account_code, posting.currency
+            ORDER BY mapping.control_account_code, posting.currency
             """)) {
             statement.setObject(1, fixture.bookId());
             try (ResultSet rows = statement.executeQuery()) {
@@ -689,6 +692,27 @@ class AccountingStateMachineIT {
             }
         }
         return java.util.Set.copyOf(ids);
+    }
+
+    private static PostingResult postThroughKernelPath(
+        PostingService service,
+        PostingCommand command
+    ) {
+        if (command.journal().reversalOfJournalId() != null) {
+            return service.postTrustedReversal(command);
+        }
+        return service.post(command);
+    }
+
+    private static boolean hasConstraint(Throwable failure, String expected) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof PSQLException postgresFailure
+                && postgresFailure.getServerErrorMessage() != null
+                && expected.equals(postgresFailure.getServerErrorMessage().getConstraint())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void assertReversalsAndHashes(Connection connection, ReferenceLedgerModel model)

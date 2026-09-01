@@ -72,14 +72,16 @@ class PostingAtomicityIT {
 
         assertAll(
             () -> assertEquals(CrashPostingWorker.JOURNAL_ID, recovered.journalId()),
-            () -> assertEquals(command.requestHash(), recovered.canonicalHash()),
+            () -> assertEquals(
+                new CanonicalJournalHasher().sha256(command.journal()),
+                recovered.canonicalHash()),
             () -> assertEquals(1, after.journals().size()),
             () -> assertEquals(
                 new JournalFact(
                     CrashPostingWorker.JOURNAL_ID,
                     recovered.journalSequence(),
                     COMMAND_ID,
-                    command.requestHash()),
+                    recovered.canonicalHash()),
                 after.journals().getFirst()),
             () -> assertEquals(
                 List.of(
@@ -138,7 +140,8 @@ class PostingAtomicityIT {
             () -> assertEquals(1, completedIdempotencyCount(after)),
             () -> assertEquals(CrashPostingWorker.JOURNAL_ID, after.idempotency().getFirst().journalId()),
             () -> assertNotNull(after.idempotency().getFirst().resultJson()),
-            () -> assertTrue(after.idempotency().getFirst().resultJson().contains(command.requestHash())),
+            () -> assertTrue(after.idempotency().getFirst().resultJson().contains(
+                recovered.canonicalHash())),
             () -> assertEquals(1, after.outbox().size()),
             () -> assertEquals(CrashPostingWorker.JOURNAL_ID, after.outbox().getFirst().aggregateId()),
             () -> assertEquals(recovered.journalSequence(), after.outbox().getFirst().aggregateVersion()),

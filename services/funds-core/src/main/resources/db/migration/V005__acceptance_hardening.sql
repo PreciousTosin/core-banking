@@ -624,7 +624,7 @@ GRANT INSERT (chart_version_id) ON funds.journal TO funds_app;
 GRANT EXECUTE ON FUNCTION funds.lock_book_chart_for_posting(uuid, uuid) TO funds_app;
 GRANT EXECUTE ON FUNCTION funds.lock_account_mapping_for_posting(uuid, uuid) TO funds_app;
 GRANT EXECUTE ON FUNCTION funds.jsonb_object_size(jsonb) TO funds_app;
-REVOKE EXECUTE ON FUNCTION funds.lock_book_for_posting(uuid) FROM funds_app;
-REVOKE EXECUTE ON FUNCTION funds.lock_account_for_posting(uuid) FROM funds_app;
+DROP FUNCTION funds.lock_book_for_posting(uuid);
+DROP FUNCTION funds.lock_account_for_posting(uuid);
 
 RESET ROLE;
