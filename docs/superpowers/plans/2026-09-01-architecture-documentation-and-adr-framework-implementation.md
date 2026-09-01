@@ -28,8 +28,8 @@
 - Do not claim that infrastructure manifests are deployed or verified merely because their files exist.
 - Every task ends with its focused validation and a commit before the next task starts.
 - Before Task 1 changes any file, create the durable local baseline ref `refs/codex/architecture-docs-framework-base`; fail rather than overwrite it if it already exists. Before every cross-task range review, resolve that ref to a 40-lowercase-hex commit, verify the commit exists, and use `<resolved-base>..HEAD`, never `HEAD~N`. Delete only this exact ref after Final Verification succeeds.
-- Markdown links resolve relative to the containing Markdown file after stripping query strings while preserving and validating fragments; the validator supports inline and reference-style links, angle-bracket destinations, and backslash-escaped spaces.
-- Link validation scans governed repository Markdown from the filesystem, including newly created and untracked task files, while pruning `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, every `node_modules/`, Maven/Gradle `target/` and `build/` output, and `architecture/diagrams/generated/`. Markdown fenced-code blocks and inline-code spans are examples, not link-bearing prose, and are excluded before destinations are parsed.
+- Markdown links resolve relative to the containing Markdown file after stripping query strings while preserving and validating fragments; the validator supports inline and CommonMark reference-style links, angle-bracket destinations, and backslash-escaped spaces.
+- Link validation scans only these governed Markdown paths from the repository-root filesystem: `ARCHITECTURE.md`; `architecture/**/*.md`; `docs/superpowers/plans/*.md`; `docs/superpowers/specs/*.md`; `services/*/README.md`; `services/*/docs/**/*.md`; and `.github/pull_request_template.md` when present. It includes newly created and untracked files in those paths while pruning `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, every `node_modules/`, Maven/Gradle `target/` and `build/` output, and `architecture/diagrams/generated/`. Unrelated root-level, user, cache, and `.claude/` Markdown is outside the gate and may be reported informationally. Markdown fenced-code blocks and inline-code spans are examples, not link-bearing prose, and are excluded before destinations are parsed.
 - Unrelated untracked or modified user state, including `.claude/worktrees/`, is reported for awareness but never modified, staged, deleted, ignored, or treated as a framework failure. Task cleanliness assertions use `git diff --quiet`, `git diff --cached --quiet`, and `git status --short --` followed by the explicit paths owned by the current task.
 
 ## File Structure
@@ -154,14 +154,41 @@ def test_reference_style_link_and_definition_are_resolved(self):
     self.write("architecture/source.md", "[target][architecture target]\n\n[architecture target]: <target.md#stable-section> \"Title\"\n")
     self.assertEqual([], validator.validate_links(self.root))
 
-def test_undefined_reference_link_fails(self):
+def test_task_list_checkbox_and_ordinary_brackets_are_not_references(self):
+    self.write("architecture/source.md", "- [ ] pending\n\nOrdinary [text] remains prose.\n")
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_shortcut_reference_resolves_only_with_a_definition(self):
+    self.write("architecture/target.md", "# Stable section\n")
+    self.write("architecture/source.md", "See [target].\n\n[target]: target.md#stable-section\n")
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_undefined_full_reference_link_fails(self):
     self.write("architecture/source.md", "[target][missing definition]\n")
     errors = validator.validate_links(self.root)
     self.assertTrue(any("undefined reference: missing definition" in error for error in errors))
 
+def test_undefined_collapsed_reference_link_fails(self):
+    self.write("architecture/source.md", "[target][]\n")
+    errors = validator.validate_links(self.root)
+    self.assertTrue(any("undefined reference: target" in error for error in errors))
+
+def test_duplicate_reference_definitions_fail_deterministically(self):
+    self.write("architecture/first.md", "# First\n")
+    self.write("architecture/second.md", "# Second\n")
+    self.write(
+        "architecture/source.md",
+        "[target][id]\n\n[id]: first.md\n[ID]: second.md\n",
+    )
+    errors = validator.validate_links(self.root)
+    self.assertEqual(
+        ["architecture/source.md:4: duplicate reference definition: id (first defined on line 3)"],
+        errors,
+    )
+
 def test_broken_links_inside_fenced_and_inline_code_are_examples(self):
     self.write(
-        "docs/examples.md",
+        "architecture/examples.md",
         "`[inline](missing-inline.md)`\n\n```markdown\n[fenced](missing-fenced.md)\n```\n",
     )
     self.assertEqual([], validator.validate_links(self.root))
@@ -170,12 +197,17 @@ def test_destination_extraction_masks_code_but_keeps_prose_links(self):
     text = "`[inline](missing-inline.md)`\n```md\n[fenced](missing-fenced.md)\n```\n[real](real.md)\n"
     self.assertEqual(["real.md"], validator.extract_markdown_destinations(text))
 
-def test_link_scan_includes_new_untracked_markdown(self):
-    self.write("new-task-not-added-to-git.md", "[missing](governed-missing.md)\n")
+def test_link_scan_includes_new_untracked_governed_markdown(self):
+    self.write("docs/superpowers/plans/new-task-not-added-to-git.md", "[missing](governed-missing.md)\n")
     errors = validator.validate_links(self.root)
     self.assertTrue(any("governed-missing.md does not exist" in error for error in errors))
 
-def test_link_scan_prunes_non_governed_trees(self):
+def test_link_scan_ignores_unrelated_untracked_markdown(self):
+    for path in ("NOTES.md", ".claude/scratch.md", "user-notes/draft.md"):
+        self.write(path, "[ignored](missing.md)\n")
+    self.assertEqual([], validator.validate_links(self.root))
+
+def test_link_scan_prunes_build_worktree_and_cache_trees(self):
     for path in (
         ".git/objects/example.md",
         ".worktrees/feature/example.md",
@@ -183,7 +215,7 @@ def test_link_scan_prunes_non_governed_trees(self):
         "graft/cache/example.md",
         "architecture/tooling/node_modules/pkg/example.md",
         "services/funds-core/target/site/example.md",
-        "module/build/reports/example.md",
+        "services/funds-core/docs/build/reports/example.md",
         "architecture/diagrams/generated/example.md",
     ):
         self.write(path, "[ignored](missing.md)\n")
@@ -238,8 +270,8 @@ Define immutable `MarkdownLink(destination: str, line: int)`, `parse_front_matte
 Implement the bodies with these exact rules:
 
 - Parse only the repository's YAML subset: scalar `key: value`, `key: []`, and indented `- item` lists between the first two `---` lines.
-- `links` walks Markdown files from the repository-root filesystem rather than `git ls-files`, so newly created and untracked task files are governed. Prune the exact repository-relative roots `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, and `architecture/diagrams/generated/`, plus any directory component named `node_modules`, `target`, or `build`; do not follow symlinked directories, which can be worktree or cache mirrors.
-- Before extracting Markdown links, mask CommonMark fenced code blocks opened by at least three backticks or tildes and inline code spans delimited by matching backtick runs. Preserve line breaks while masking so diagnostics retain correct locations. Parse inline links, full/collapsed/shortcut reference links, and case-insensitive reference definitions; reject every used reference without exactly one definition. Unwrap angle-bracket destinations, convert Markdown backslash-escaped spaces to literal spaces, strip a query component, retain a decoded fragment, and skip `http`, `https`, and `mailto` destinations.
+- `links` walks only `ARCHITECTURE.md`, `architecture/**/*.md`, `docs/superpowers/plans/*.md`, `docs/superpowers/specs/*.md`, `services/*/README.md`, `services/*/docs/**/*.md`, and `.github/pull_request_template.md` when present, directly from the repository-root filesystem rather than `git ls-files`, so newly created and untracked governed files are included. Implement a single `iter_governed_markdown(root: Path) -> Iterator[Path]` used by link validation and later Markdown-wide checks. Prune the exact repository-relative roots `.git/`, `.worktrees/`, `.claude/worktrees/`, `graft/`, and `architecture/diagrams/generated/`, plus any directory component named `node_modules`, `target`, or `build`; do not follow symlinked directories. Markdown outside the explicit governed patterns, including unrelated root/user Markdown and `.claude/`, cannot fail the gate; an optional informational report must remain non-blocking.
+- Before extracting Markdown links, mask CommonMark fenced code blocks opened by at least three backticks or tildes and inline code spans delimited by matching backtick runs. Preserve line breaks while masking so diagnostics retain correct locations. Parse case-insensitive reference definitions first and exclude definition lines from link-use extraction. Parse inline links next. Parse a full `[text][id]` or collapsed `[text][]` reference as a link and reject it when its normalized label has no definition. Parse shortcut `[text]` as a link only when a matching normalized definition exists; otherwise it is ordinary CommonMark text, including task-list `[ ]`. Reject duplicate normalized definitions deterministically at the later definition line even when no link uses the label. Unwrap angle-bracket destinations, convert Markdown backslash-escaped spaces to literal spaces, strip a query component, retain a decoded fragment, and skip `http`, `https`, and `mailto` destinations.
 - Resolve file paths against the containing file's parent. For pure fragments validate the containing file; for cross-file fragments validate the resolved Markdown file. Build anchors from explicit HTML `id` attributes and deterministic GitHub-style heading slugs: lowercase, remove formatting and punctuation other than hyphens/underscores, convert spaces to hyphens, and append `-1`, `-2`, and later suffixes to duplicate base slugs in document order. A missing target file and a missing fragment are separate actionable errors.
 - Sort errors by path and message so local and CI output is deterministic.
 - Print each error to stderr and return `1`; print `architecture validation passed` and return `0` when clean.
@@ -549,7 +581,7 @@ For every maintained destination chosen in this task, add a stable explicit HTML
 
 - [ ] **Step 4: Implement the migration contract**
 
-Add `migration` to `CHECKS` and `VALIDATORS` and implement `validate_migration_inventory(root: Path) -> list[str]` with the exact schema, source-key grammar, allowed values, top-level and subsection coverage, uniqueness, material-block tokenization and exact-once coverage, non-empty per-row rationale, historical-only rationale, contiguous mixed-segment suffix, exact destination-block mapping, destination-file and anchor existence, exact source-marker backlink, current-evidence, and unresolved-row rules above. Parse numbered `##`/`###`/`####` headings from the comprehensive source, plus unnumbered `#### Example A` through `#### Example J` under section 13.8, and require each derived material heading key to have either one exact inventory key or one or more segment keys with that key plus `::NN`; reject inventory keys that do not map back to a source heading. Table parsing must report malformed rows rather than silently skipping them.
+Add `migration` to `CHECKS` and `VALIDATORS` and implement `validate_migration_inventory(root: Path) -> list[str]` with the exact schema, source-key grammar, allowed values, top-level and subsection coverage, uniqueness, material-block tokenization and exact-once coverage, non-empty per-row rationale, historical-only rationale, contiguous mixed-segment suffix, exact destination-block mapping, destination-file and anchor existence, exact source-marker backlink, current-evidence, and unresolved-row rules above. Parse numbered `##`/`###`/`####` headings from the comprehensive source, plus unnumbered `#### Example A` through `#### Example J` under section 13.8, and require each derived material heading key to have either one exact inventory key or one or more segment keys with that key plus `::NN`; reject inventory keys that do not map back to a source heading. Table parsing must report malformed rows rather than silently skipping them. Emit each unresolved row exactly as `architecture/archive/comprehensive-design-migration-inventory.md: unresolved migration row <SOURCE_KEY>` so interim gates can compare the complete diagnostic set mechanically.
 
 - [ ] **Step 5: Validate the inventory's deliberate interim state**
 
@@ -588,7 +620,8 @@ git commit -m "docs: inventory comprehensive architecture migration"
 - Consumes: approved ADR template and implementation evidence.
 - Produces: a contiguous decision history and stable IDs used by diagrams, proposals, and arc42 metadata.
 - Produces: `validate_accepted_adr_immutability(root: Path, base_ref: str, head_ref: str | None = None) -> list[str]`; `head_ref=None` compares the base commit with the current working tree, while a supplied head compares two Git trees.
-- CLI: `--adr-base-ref REF [--adr-head-ref REF]`; this git-aware check is additive to ordinary repository checks and ignores ADR paths absent at the base.
+- Produces: `validate_accepted_adr_edge_range(root: Path, base_ref: str, head_ref: str) -> list[str]`, which enumerates commits in `base..head` oldest-first/topologically and validates every parent-to-child edge for every child in that range, including every parent of merge commits.
+- CLI: `--adr-base-ref REF [--adr-head-ref REF]` retains the endpoint/current-working-tree check; `--adr-edge-base-ref REF --adr-edge-head-ref REF` performs the commit-edge range check. These git-aware checks are additive to ordinary repository checks.
 
 - [ ] **Step 1: Add failing ADR contract and reciprocal-traceability tests**
 
@@ -603,7 +636,23 @@ Add repository-backed lifecycle/evidence fixtures in temporary Git repositories:
 - an ADR Accepted at the base rejects mutations to `Context`, `Decision drivers`, `Considered options`, `Decision`, or the complete `Consequences` subtree including `Positive`, `Negative`, and `Risks`;
 - an Accepted-at-base ADR accepts only `Accepted -> Superseded` or `Accepted -> Deprecated`, rejects every reverse or lateral decision-status change, and enforces implementation status monotonically as `Not started -> Partial -> Complete`; `Not applicable` may remain unchanged but cannot transition to or from another implementation status;
 - relationship/evidence sequences are append-only: legal suffix additions to `Related pull requests`, `Related commits`, `Related architecture sections`, `Related proposals`, `Supersedes`, `Superseded by`, `Compliance and verification`, and `Implementation evidence` pass, while rewriting, removal, insertion before an existing item, or reordering fails;
-- a brand-new ADR absent from the base is not compared for accepted-record immutability, but ordinary ADR structure/lifecycle validation still applies.
+- an ADR introduced as `Accepted` is exempt only on its introduction edge, then a rationale mutation in the next commit fails;
+- an ADR introduced as `Proposed`, accepted in a later commit, and mutated in a third commit fails on the accepted-to-mutated edge even though an endpoint-only comparison from the range base would not protect it;
+- an ADR that is `Proposed` at the range base, accepted in the first ranged commit, and mutated in the next commit fails;
+- a merge fixture mutates an Accepted ADR relative to only the second parent and proves all-parent merge semantics catches it; first-parent-only behavior is forbidden.
+
+Build each range fixture with exact commits in a temporary repository and invoke `validate_accepted_adr_edge_range(root, range_base, range_head)`. Assert the returned diagnostic names both exact parent and child hashes and the ADR path. Also assert the Proposed-at-base endpoint call returns no immutability error while the edge-range call rejects the later mutation; this proves why endpoint validation remains supplementary rather than sufficient.
+
+Use test helpers `write_valid_adr(status: str, context: str) -> None` and `commit_all(message: str) -> str`, where `commit_all` returns the verified 40-hex commit. Construct these exact fixtures:
+
+| Test | Committed history after `range_base` | Required result |
+|---|---|---|
+| `test_edge_range_protects_newly_accepted_adr_after_introduction` | `Proposed/context-v1` -> `Accepted/context-v1` -> `Accepted/context-v2` | Fail only on the second-to-third edge and name `context-v2` as an immutable-section change. |
+| `test_edge_range_protects_proposed_adr_accepted_after_base` | Base already contains `Proposed/context-v1`; range commits `Accepted/context-v1` -> `Accepted/context-v2` | Endpoint base/head comparison has no accepted-base error; edge range fails on the first-to-second ranged-commit edge. |
+| `test_introduction_exemption_ends_after_accepted_child` | `Accepted/context-v1` -> `Accepted/context-v2` | Introduction edge passes; second edge fails. |
+| `test_merge_checks_every_parent` | Base contains `Accepted/context-v1`; first-parent branch makes only an unrelated file commit; second-parent branch commits `Accepted/context-v2`; merge with `--no-commit` restores `context-v1` before committing | Base/head endpoint and first-parent/merge comparison pass; second-parent/merge comparison and the edge range fail with the second-parent and merge hashes. |
+
+For the first fixture, use the commit immediately before ADR introduction as `range_base`. For the merge fixture, retain both parent hashes from `git show -s --format=%P <merge>` and assert the merge has exactly two parents in first-parent, second-parent order before validating it.
 
 Use one legal-append fixture and separate mutation fixtures so a single unrelated error cannot mask the behavior under test.
 
@@ -623,7 +672,9 @@ Add `adrs` to `CHECKS` and `VALIDATORS`. Implement the exact numbering, filename
 
 Resolve every `Supersedes` and `Superseded by` ADR ID. Reject missing targets, self-reference, non-reciprocal declarations, and cycles in the directed predecessor-to-successor graph. Every predecessor with `Superseded by: ADR-NNNN` must be `Superseded`, every named successor must be `Accepted`, and the successor's `Supersedes` field must name the predecessor; `Deprecated` records do not claim a superseding ADR. Reject multiple successors for one predecessor.
 
-Implement `validate_accepted_adr_immutability` with `git rev-parse --verify REF^{commit}`, `git show COMMIT:PATH`, and current filesystem reads when `head_ref` is omitted. For every ADR present with `Status: Accepted` at the base, compare parsed records and require byte-stable normalized content for `Context`, `Decision drivers`, `Considered options`, `Decision`, and the entire `Consequences` section including its three required subsections. Allow decision status to remain `Accepted` or transition once to `Superseded`/`Deprecated`; enforce the implementation-status ordering and fixed `Not applicable` rule from Step 1. Treat each mutable relationship/evidence area as an ordered sequence, interpret the literal `None` as an empty sequence, and require the base sequence to be an exact prefix of the head/current sequence. Reject edits to all other accepted-record fields. Do not compare an ADR absent at base. Extend `main` with `--adr-base-ref` and optional `--adr-head-ref`; emit deterministic errors and return non-zero on a comparison failure.
+Implement `validate_accepted_adr_immutability` with `git rev-parse --verify REF^{commit}`, `git show COMMIT:PATH`, and current filesystem reads when `head_ref` is omitted. For every ADR present with `Status: Accepted` at the base, compare parsed records and require byte-stable normalized content for `Context`, `Decision drivers`, `Considered options`, `Decision`, and the entire `Consequences` section including its three required subsections. Allow decision status to remain `Accepted` or transition once to `Superseded`/`Deprecated`; enforce the implementation-status ordering and fixed `Not applicable` rule from Step 1. Treat each mutable relationship/evidence area as an ordered sequence, interpret the literal `None` as an empty sequence, and require the base sequence to be an exact prefix of the head/current sequence. Reject edits to all other accepted-record fields. An ADR absent from an edge's parent is exempt on that introduction edge only; if it is Accepted in that child, every later child edge protects it.
+
+Implement `validate_accepted_adr_edge_range` by resolving both refs to verified commits, requiring the base to be an ancestor of the head, and reading `git rev-list --reverse --topo-order --parents <base>..<head>`. For each emitted child, validate `parent -> child` against every listed parent, including parents outside `<base>..<head>` and every parent of a merge commit, by calling the two-tree immutability primitive. Prefix deterministic diagnostics with `<parent> -> <child>`. A root child has no edge and is skipped. This all-parent rule validates changes introduced by either side of a merge and must not be reduced to first-parent traversal. Extend `main` with `--adr-base-ref` and optional `--adr-head-ref`, plus the paired `--adr-edge-base-ref` and `--adr-edge-head-ref`; reject a lone edge flag, emit deterministic errors, and return non-zero on comparison failure.
 
 - [ ] **Step 4: Write ADR-0001 through ADR-0004**
 
@@ -656,9 +707,25 @@ Run:
 python3 architecture/scripts/validate_architecture.py --root . --checks metadata,adrs,links
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref HEAD
 python3 -m unittest discover -s architecture/scripts/tests -p 'test_*.py' -v
+migration_report="$(mktemp)"
+expected_report="$(mktemp)"
+trap 'rm -f "$migration_report" "$expected_report"' EXIT
+if python3 architecture/scripts/validate_architecture.py --root . --checks migration 2>"$migration_report"; then
+  echo "migration unexpectedly has no deferred proposal rows" >&2
+  exit 1
+fi
+git show HEAD:architecture/archive/comprehensive-design-migration-inventory.md | awk -F'|' '
+  function trim(value) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); return value }
+  /^\|/ && trim($5) == "proposal" && trim($9) == "unresolved" {
+    print "architecture/archive/comprehensive-design-migration-inventory.md: unresolved migration row " trim($2)
+  }
+' | LC_ALL=C sort >"$expected_report"
+test -s "$expected_report"
+LC_ALL=C sort -o "$migration_report" "$migration_report"
+diff -u "$expected_report" "$migration_report"
 ```
 
-Expected: ADR, metadata, link, and unit-test checks pass.
+Expected: ADR, metadata, link, and unit-test checks pass. The expected diagnostic set is frozen from the committed Task 4 inventory before Task 5 edits; the migration command fails only for those exact proposal-disposition rows still marked `unresolved` for Task 7. `diff` is silent, proving there are no new proposal rows and no schema, material-block coverage, destination, evidence, or source-marker diagnostics.
 
 ```bash
 git add architecture/adr architecture/arc42 architecture/archive/comprehensive-design-migration-inventory.md architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py
@@ -770,14 +837,41 @@ Expected: all five required diagram sources render and metadata/link validation 
 Link each source from its owning arc42 section; do not commit generated SVGs. Verify ignored/generated dependencies are not tracked:
 
 ```bash
-test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/diagrams/generated/**' '*.svg')"
+test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/diagrams/generated/**' 'architecture/diagrams/generated/**/*.svg')"
 ```
 
 ```bash
-git add .gitignore architecture/diagrams architecture/scripts/render-diagrams.sh architecture/scripts/validate_architecture.py architecture/scripts/tests/test_validate_architecture.py architecture/tooling architecture/arc42
+task6_paths=(
+  .gitignore
+  architecture/arc42/03-context-and-scope.md
+  architecture/arc42/05-building-block-view.md
+  architecture/arc42/06-runtime-view.md
+  architecture/arc42/07-deployment-view.md
+  architecture/diagrams/containers.mmd
+  architecture/diagrams/context.mmd
+  architecture/diagrams/funds-core-components.mmd
+  architecture/diagrams/posting-sequence.mmd
+  architecture/diagrams/single-vm-deployment.mmd
+  architecture/scripts/render-diagrams.sh
+  architecture/scripts/tests/test_validate_architecture.py
+  architecture/scripts/validate_architecture.py
+  architecture/tooling/package-lock.json
+  architecture/tooling/package.json
+)
+git add "${task6_paths[@]}"
 test "$(git ls-files -s architecture/scripts/render-diagrams.sh | awk '{print $1}')" = 100755
-git commit -m "docs: add architecture diagrams as code"
+expected_staged="$(mktemp)"
+actual_staged="$(mktemp)"
+trap 'rm -f "$expected_staged" "$actual_staged"' EXIT
+printf '%s\n' "${task6_paths[@]}" | LC_ALL=C sort >"$expected_staged"
+git diff --cached --name-only -- "${task6_paths[@]}" | LC_ALL=C sort >"$actual_staged"
+diff -u "$expected_staged" "$actual_staged"
+git diff --cached --name-status -- "${task6_paths[@]}"
+git status --short -- architecture/arc42
+git commit --only -m "docs: add architecture diagrams as code" -- "${task6_paths[@]}"
 ```
+
+Expected: the staged-name comparison is exact for Task 6, and the status command reports any other arc42 state without staging or failing on it. `git commit --only` commits only `task6_paths`, so unrelated pre-existing staged files or edits to any other arc42 path remain untouched and cannot enter the Task 6 commit.
 
 ### Task 7: Separate proposed capabilities and add plan traceability
 
@@ -1086,12 +1180,13 @@ Add tests before changing production code:
 
 - `validate_pr_body` rejects no selected box, both selected boxes, a missing required label, and `Architecture changed` when all four artifact fields are `None` or verification evidence is `None`/empty.
 - `validate_pr_body` accepts exactly one selection; for `Architecture changed`, all five labels have non-empty values, `None` is allowed only for an unaffected artifact field, at least one of ADR/arc42/proposal/diagram is not `None`, and verification evidence is not `None`.
-- `validate_pr_body` parses exactly one canonical `## Architecture impact` section, requires each checkbox prompt and field label exactly once inside that section, and rejects a second canonical section or any duplicate canonical checkbox/field literal elsewhere in prose. Fenced examples and HTML comments containing complete fake sections or duplicate labels are masked and do not satisfy or invalidate the real section.
+- `validate_pr_body` parses exactly one canonical `## Architecture impact` section, requires each checkbox prompt and field label exactly once inside that section, and rejects a second canonical section or any duplicate canonical checkbox/field literal elsewhere in prose. Fenced examples, inline-code spans, and HTML comments containing complete fake sections or duplicate labels are masked and do not satisfy or invalidate the real section. Add a bypass fixture containing `` `Related ADRs:` `- [x] No architecture impact` `` outside an otherwise valid canonical section and prove those inline-code literals are ignored rather than counted or accepted.
 - `validate_workflow_contract` requires the explicit pull-request event set `types: [opened, synchronize, reopened, edited, ready_for_review]` with no path filter, `push` to `master`, top-level `permissions: contents: read`, checkout `fetch-depth: 0`, the PR-body step guarded by `github.event_name == 'pull_request'`, unit tests, repository validation, npm install, direct executable diagram rendering, stale reporting with an explicit UTC date, and event-aware diff checking.
 - Workflow validation strips YAML comments outside quoted scalars and uses indentation-aware mapping/sequence parsing for top-level `on` and `permissions`, the validation job, and its ordered step mappings. A comment, block-scalar example, wrong job, or nested similarly named key cannot satisfy a required trigger, permission, guard, checkout input, or run step. Duplicate top-level/job keys and structurally misplaced literals fail.
-- A workflow fixture with a missing `edited` event, `pull_request.paths`, `contents: write`, missing PR-body checking, a non-executable render-script contract, bare `git diff --check`, `git diff --check "$base_sha..$head_sha"` without a verified merge base, or `git diff-tree --check --root "$GITHUB_SHA"` as the unavailable-push-base fallback fails with a focused diagnostic.
+- A workflow fixture with a missing `edited` event, `pull_request.paths`, `contents: write`, missing PR-body checking, a non-executable render-script contract, bare `git diff --check`, `git diff --check "$base_sha..$head_sha"` without a verified merge base, known-base PR/push logic that omits `--adr-edge-base-ref`/`--adr-edge-head-ref`, a first-parent-only merge walk, or `git diff-tree --check --root "$GITHUB_SHA"` as the unavailable-push-base fallback fails with a focused diagnostic.
 - Add an integration-style unit fixture that initializes a temporary Git repository, commits a Markdown file containing trailing whitespace in the penultimate commit, and makes an unrelated clean tip commit. Assert the tip-only `git diff-tree --check "$tip"` output misses the earlier file, while `empty_tree=$(git hash-object -t tree /dev/null)` followed by `git diff --check "$empty_tree" "$tip"` reports it. This proves the fallback covers the complete current tree of a multi-commit replacement push rather than only the tip commit.
-- Add a behind-base Git fixture: create a common commit, a feature head from it, and then advance the base branch separately. Assert `git merge-base "$base_sha" "$head_sha"` is the common commit, not the newer base tip, and assert the PR range helper validates and returns `merge_base..head_sha`. Include an Accepted ADR mutation on the feature branch and prove the same merge-base/head pair makes the git-aware ADR validator reject it.
+- Add a behind-base Git fixture: create a common commit, a feature head from it, and then advance the base branch separately. Assert `git merge-base "$base_sha" "$head_sha"` is the common commit, not the newer base tip, and assert the PR range helper validates and returns `merge_base..head_sha`. Include an Accepted ADR mutation on the feature branch and prove the same merge-base/head pair makes the edge-range ADR validator reject it.
+- Add CI-range fixtures for both PR and push ranges with exact histories: `(base) -> (introduce Proposed) -> (Accept) -> (mutate rationale)`, and `(base containing Proposed) -> (Accept) -> (mutate rationale)`. Assert `--adr-edge-base-ref <base> --adr-edge-head-ref <head>` rejects the exact accepted-to-mutated edge even when `--adr-base-ref <base> --adr-head-ref <head>` cannot detect it. Add `(base) -> (introduce Accepted) -> (mutate rationale)` and assert only the introduction edge is exempt. Add a merge whose Accepted ADR differs only from its second parent and assert the range rejects that second-parent edge, proving all-parent rather than first-parent semantics.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -1105,7 +1200,7 @@ Expected: fail because `validate_pr_body`, `validate_workflow_contract`, and the
 
 - [ ] **Step 3: Implement template, PR-body, and workflow contracts**
 
-Extend `validate_structure` with the literal template prompts. Implement `validate_pr_body(body: str) -> list[str]` by first masking fenced code and HTML comments while preserving lines, then locating level-two headings and parsing only the single canonical `## Architecture impact` section through the next level-one/two heading or EOF. Require each canonical checkbox prompt and field label exactly once inside it; scan remaining unmasked prose and reject canonical literals outside it. Apply the exact selection and value rules from Step 1. Extend `main` with `--pr-event PATH`: load the standard GitHub event JSON using `json`, read `pull_request.body` as an empty string when null, print deterministic errors, and return non-zero on violations.
+Extend `validate_structure` with the literal template prompts. Implement `validate_pr_body(body: str) -> list[str]` by first masking fenced code, inline-code spans delimited by matching backtick runs, and HTML comments while preserving lines, then locating level-two headings and parsing only the single canonical `## Architecture impact` section through the next level-one/two heading or EOF. Require each canonical checkbox prompt and field label exactly once inside it; scan remaining unmasked prose and reject canonical literals outside it. Apply the exact selection and value rules from Step 1. Extend `main` with `--pr-event PATH`: load the standard GitHub event JSON using `json`, read `pull_request.body` as an empty string when null, print deterministic errors, and return non-zero on violations.
 
 Implement a small standard-library, indentation-aware workflow structure reader for the repository's workflow subset. It must remove YAML comments only outside quoted values, distinguish mappings, sequences, and block-scalar contents by indentation, reject duplicate keys in governed mappings, and return the exact top-level trigger/permission mappings plus ordered mappings for the architecture validation job's steps. Implement `validate_workflow_contract(root: Path) -> list[str]`, register `workflow`, and verify required values at their structural locations; never satisfy a contract by global literal search.
 
@@ -1141,9 +1236,9 @@ Run these steps in order:
     python3 architecture/scripts/validate_architecture.py --root . --report-stale --as-of "$(date -u +%F)" | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
-The final workflow step must be an event-aware shell block. On pull requests, read `.pull_request.base.sha` and `.pull_request.head.sha` from `$GITHUB_EVENT_PATH` with `jq -r`, verify both are 40-lowercase-hex existing commits, compute `merge_base="$(git merge-base "$base_sha" "$head_sha")"`, verify the merge base is a 40-lowercase-hex existing commit, run `git diff --check "$merge_base..$head_sha"`, and run the ADR immutability CLI with that same base/head pair. This prevents a head branch behind the current base from validating the wrong range.
+The final workflow step must be an event-aware shell block. On pull requests, read `.pull_request.base.sha` and `.pull_request.head.sha` from `$GITHUB_EVENT_PATH` with `jq -r`, verify both are 40-lowercase-hex existing commits, compute `merge_base="$(git merge-base "$base_sha" "$head_sha")"`, verify the merge base is a 40-lowercase-hex existing commit, run `git diff --check "$merge_base..$head_sha"`, retain the useful endpoint ADR comparison, and invoke the edge-range CLI over `merge_base..head_sha`. The validator enumerates each child commit in deterministic oldest-first/topological order and compares it with every parent, including every parent of merge commits. This prevents a head branch behind the current base from validating the wrong range and catches ADR acceptance followed by mutation within one PR.
 
-On pushes, read `.before`; when it is a non-zero 40-lowercase-hex existing commit, run whitespace and ADR immutability checks over `before_sha..GITHUB_SHA`. When `.before` is missing, null, all zeroes, malformed, or unavailable, compute the canonical empty tree and run the complete-current-tree whitespace check. Because the event supplies no trustworthy historical base in that case, walk every parent-to-child commit edge reachable from `GITHUB_SHA` in deterministic topological order and run accepted-ADR immutability for each edge; root commits have no accepted base record and are skipped. This catches an ADR accepted and then rewritten within a replacement push. A tip-only `git diff-tree --check --root "$GITHUB_SHA"` is forbidden. Checkout uses `fetch-depth: 0`, and a bare working-tree-only `git diff --check` is not the CI contract.
+On pushes, read `.before`; when it is a non-zero 40-lowercase-hex existing commit and an ancestor of `GITHUB_SHA`, run whitespace over `before_sha..GITHUB_SHA`, retain the endpoint ADR comparison, and invoke the edge-range CLI over that same range. Thus a known-base push also catches an ADR introduced Proposed or Accepted and mutated later within the push. When `.before` is missing, null, all zeroes, malformed, unavailable, or not an ancestor, compute the canonical empty tree and run the complete-current-tree whitespace check. Because the event supplies no trustworthy historical base in that case, walk every parent-to-child commit edge reachable from `GITHUB_SHA` in deterministic oldest-first/topological order and validate every parent of each merge; root commits have no edge and are skipped. A new ADR is exempt only on the edge where it is absent from the parent; once its child version is Accepted, subsequent edges enforce immutability. A tip-only `git diff-tree --check --root "$GITHUB_SHA"` is forbidden. Checkout uses `fetch-depth: 0`, and a bare working-tree-only `git diff --check` is not the CI contract.
 
 Use this exact step:
 
@@ -1165,24 +1260,30 @@ Use this exact step:
       git cat-file -e "$merge_base^{commit}"
       git diff --check "$merge_base..$head_sha"
       python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$merge_base" --adr-head-ref "$head_sha"
+      python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$merge_base" --adr-edge-head-ref "$head_sha"
       exit 0
     fi
     [[ "$GITHUB_SHA" =~ $sha_pattern ]]
     git cat-file -e "$GITHUB_SHA^{commit}"
     before_sha="$(jq -r '.before // empty' "$GITHUB_EVENT_PATH")"
     zero_sha=0000000000000000000000000000000000000000
-    if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null; then
+    if [[ "$before_sha" =~ $sha_pattern ]] && [[ "$before_sha" != "$zero_sha" ]] && git cat-file -e "$before_sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$before_sha" "$GITHUB_SHA"; then
       git diff --check "$before_sha..$GITHUB_SHA"
       python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$before_sha" --adr-head-ref "$GITHUB_SHA"
+      python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$before_sha" --adr-edge-head-ref "$GITHUB_SHA"
     else
       empty_tree="$(git hash-object -t tree /dev/null)"
       [[ "$empty_tree" =~ $sha_pattern ]]
       git diff --check "$empty_tree" "$GITHUB_SHA"
-      while read -r child parent; do
+      while read -r commit_and_parents; do
+        read -r -a edge_parts <<<"$commit_and_parents"
+        child="${edge_parts[0]}"
         [[ "$child" =~ $sha_pattern ]]
-        [[ "$parent" =~ $sha_pattern ]]
-        python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
-      done < <(git rev-list --reverse --topo-order --parents "$GITHUB_SHA" | awk 'NF > 1 { child=$1; for (i=2; i<=NF; i++) print child, $i }')
+        for parent in "${edge_parts[@]:1}"; do
+          [[ "$parent" =~ $sha_pattern ]]
+          python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$parent" --adr-head-ref "$child"
+        done
+      done < <(git rev-list --reverse --topo-order --parents "$GITHUB_SHA")
     fi
 ```
 
@@ -1284,13 +1385,14 @@ architecture/scripts/render-diagrams.sh
 node -e 'const l=require("./architecture/tooling/package-lock.json"); if(l.packages["node_modules/@mermaid-js/mermaid-cli"].version!=="11.16.0") process.exit(1)'
 test -x architecture/scripts/render-diagrams.sh
 test "$(git ls-files -s architecture/scripts/render-diagrams.sh | awk '{print $1}')" = 100755
-test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/diagrams/generated/**' '*.svg')"
+test -z "$(git ls-files 'architecture/tooling/node_modules/**' 'architecture/diagrams/generated/**' 'architecture/diagrams/generated/**/*.svg')"
 test "$(wc -l < ARCHITECTURE.md)" -lt 180
 base_ref=refs/codex/architecture-docs-framework-base
 architecture_base="$(git rev-parse --verify "$base_ref^{commit}")"
 printf '%s' "$architecture_base" | grep -Eq '^[0-9a-f]{40}$'
 git cat-file -e "$architecture_base^{commit}"
 git diff --check "$architecture_base..HEAD"
+python3 architecture/scripts/validate_architecture.py --root . --adr-edge-base-ref "$architecture_base" --adr-edge-head-ref HEAD
 task10_commit="$(git rev-parse --verify 'HEAD^')"
 python3 architecture/scripts/validate_architecture.py --root . --adr-base-ref "$task10_commit" --adr-head-ref HEAD
 git diff --quiet
@@ -1309,7 +1411,7 @@ Expected results:
 - Stale verification is reported at a 90-day threshold and warnings alone exit zero.
 - All five required Mermaid sources render successfully into a temporary directory; any additional governed sources also satisfy metadata, backlink, and render checks.
 - The render script has executable mode `100755` and is directly invocable locally and in CI.
-- `package-lock.json` resolves `@mermaid-js/mermaid-cli` exactly to `11.16.0`; no `node_modules`, generated diagram output, or SVG is tracked.
+- `package-lock.json` resolves `@mermaid-js/mermaid-cli` exactly to `11.16.0`; no `node_modules` or output below `architecture/diagrams/generated/` is tracked. SVGs elsewhere remain permitted when they are explicitly classified, approved architecture derivatives.
 - The twelve implementation commits after the captured base contain no whitespace errors: eleven task-ending commits plus Task 8's separate independent-review evidence commit.
 - The durable baseline ref resolves to a verified commit before its final range check and is deleted only after all other verification succeeds.
 - There is no tracked working-tree or index diff, and scoped status contains no framework artifacts. Unrelated untracked/user state shown by the final status report is left untouched and does not fail acceptance.
@@ -1323,5 +1425,5 @@ Expected results:
 - Every inventory row has non-empty exact material-block coverage and disposition rationale; each heading-relative block is covered exactly once, including after archive cutover.
 - The independent review record names distinct reviewer and implementer identities, `APPROVED`, zero unresolved rows, an existing reviewed pre-cutover commit, and the exact inventory blob that remains current after cutover.
 - The old comprehensive-design path is absent and its archived copy is explicitly non-authoritative.
-- Pull-request `opened`, `synchronize`, `reopened`, `edited`, and `ready_for_review` events are all gated; PR whitespace and ADR immutability use the verified merge-base-to-head range, and an unavailable push base falls back to an empty-tree-versus-current-tree whitespace check plus parent-edge ADR immutability checks.
-- No generated SVG or `node_modules` content is tracked.
+- Pull-request `opened`, `synchronize`, `reopened`, `edited`, and `ready_for_review` events are all gated; PR and known-base push whitespace use their verified ranges, while ADR immutability is checked on every parent-to-child edge for every ranged commit in oldest-first/topological order with all-parent merge semantics. An unavailable push base falls back to an empty-tree-versus-current-tree whitespace check plus the same all-parent edge validation over reachable history.
+- No local generated output below `architecture/diagrams/generated/` or `node_modules` content is tracked; classified SVG derivatives elsewhere are not rejected globally.
