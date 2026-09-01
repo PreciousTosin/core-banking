@@ -162,6 +162,72 @@ class ValidatorTest(unittest.TestCase):
         errors = validator.validate_migration_inventory(self.root)
         self.assertTrue(any(fragment in error for error in errors), errors)
 
+    def resolve_complete_migration_fixture(self):
+        rows = self.write_complete_migration_fixture()
+        rows = [row.replace("| unresolved |", "| resolved |") if row.startswith("| 27 |") else row for row in rows]
+        self.write_inventory(rows)
+        return rows
+
+    def write_archive_migration_fixture(self, *, resolved=False):
+        rows = self.write_complete_migration_fixture()
+        source = self.root / "architecture/modern-core-banking-comprehensive-design-revised.md"
+        source.write_text(
+            source.read_text().replace(
+                "Material paragraph for section 13.",
+                "Material paragraph for section 13.\n\n"
+                "### 13.1 Archive fixture subsection\n\n"
+                "Subsection material block.",
+                1,
+            )
+        )
+        self.write(
+            "architecture/destination-13-01.md",
+            '# Destination 13.1\n<a id="source-13-01"></a>\n<!-- migration-source: 13.01 -->\n',
+        )
+        rows.append(
+            "| 13.01 | 13.1 Archive fixture subsection | B01 | service-detail | B01=architecture/destination-13-01.md#source-13-01 | None | B01 belongs in detailed service documentation. | resolved |"
+        )
+        if resolved:
+            rows = [row.replace("| unresolved |", "| resolved |") if row.startswith("| 27 |") else row for row in rows]
+        self.write_inventory(rows)
+        return rows
+
+    def reset_archive_migration_fixture(self, *, resolved=False):
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        return self.write_archive_migration_fixture(resolved=resolved)
+
+    def archive_comprehensive_source(self):
+        old_source = self.root / "architecture/modern-core-banking-comprehensive-design-revised.md"
+        archived_source = self.root / "architecture/archive/modern-core-banking-comprehensive-design-revised.md"
+        archived_source.parent.mkdir(parents=True, exist_ok=True)
+        old_source.replace(archived_source)
+        return archived_source
+
+    def write_archive_review(
+        self,
+        reviewed_commit,
+        inventory_blob,
+        *,
+        reviewer="Independent Reviewer",
+        implementer="Task 7 Implementer",
+        outcome="APPROVED",
+        unresolved_rows="0",
+        inventory_path="architecture/archive/comprehensive-design-migration-inventory.md",
+    ):
+        return self.write(
+            "architecture/archive/comprehensive-design-migration-review.md",
+            "# Comprehensive Design Migration Review\n\n"
+            f"- Reviewed commit: {reviewed_commit}\n"
+            f"- Reviewer: {reviewer}\n"
+            f"- Implementer: {implementer}\n"
+            f"- Outcome: {outcome}\n"
+            f"- Unresolved rows: {unresolved_rows}\n"
+            f"- Inventory path: {inventory_path}\n"
+            f"- Inventory blob: {inventory_blob}\n",
+        )
+
     def test_metadata_requires_exact_arc42_collection(self):
         self.write_complete_arc42()
         self.write("architecture/arc42/unexpected.md", "# Unexpected\n")
@@ -1076,6 +1142,149 @@ class ValidatorTest(unittest.TestCase):
         self.write_inventory(rows)
         errors = validator.validate_migration_inventory(self.root)
         self.assertFalse(any("missing migration row for source heading 13.08" in error for error in errors), errors)
+
+    def test_archive_state_selects_exactly_one_source_and_rechecks_full_inventory(self):
+        self.assertTrue(hasattr(validator, "validate_archive_state"), "validate_archive_state must be implemented")
+        self.assertTrue(hasattr(validator, "select_comprehensive_source"), "select_comprehensive_source must be implemented")
+        self.assertIn("archive", validator.CHECKS)
+        self.assertIn("archive", validator.VALIDATORS)
+
+        self.write_archive_migration_fixture()
+        selected, errors = validator.select_comprehensive_source(self.root, False)
+        self.assertEqual(self.root / validator.MIGRATION_SOURCE, selected)
+        self.assertEqual([], errors)
+        self.assertEqual([], validator.validate_archive_state(self.root))
+        migration_errors = validator.validate_migration_inventory(self.root)
+        self.assertEqual(1, sum("unresolved migration row 27" in error for error in migration_errors), migration_errors)
+        self.assertFalse(any("comprehensive source" in error for error in migration_errors), migration_errors)
+
+        self.reset_archive_migration_fixture(resolved=True)
+        selected, errors = validator.select_comprehensive_source(self.root, True)
+        self.assertEqual(self.root / validator.MIGRATION_SOURCE, selected)
+        self.assertEqual([], errors)
+        self.assertEqual([], validator.validate_archive_state(self.root))
+        self.assertEqual([], validator.validate_migration_inventory(self.root))
+
+        self.reset_archive_migration_fixture(resolved=True)
+        self.init_git()
+        reviewed_commit = self.commit_all("resolved migration inventory")
+        inventory_blob = self.git("rev-parse", f"{reviewed_commit}:architecture/archive/comprehensive-design-migration-inventory.md")
+        self.write_archive_review(reviewed_commit, inventory_blob)
+        archived_source = self.archive_comprehensive_source()
+        archived_source.write_text(
+            archived_source.read_text().replace(
+                "# Modern Core Banking System\n",
+                "# Modern Core Banking System\n\n"
+                "Historical source document — non-authoritative; see /ARCHITECTURE.md and the migration inventory.\n",
+                1,
+            )
+        )
+        selected, errors = validator.select_comprehensive_source(self.root, True)
+        self.assertEqual(archived_source, selected)
+        self.assertEqual([], errors)
+        self.assertEqual([], validator.validate_archive_state(self.root))
+        self.assertEqual([], validator.validate_migration_inventory(self.root))
+
+        invalid_states = (
+            ("unresolved-source-loss", False, "neither comprehensive source"),
+            ("resolved-source-loss", True, "neither comprehensive source"),
+            ("unresolved-premature-archive", False, "archived comprehensive source requires all migration rows resolved"),
+            ("unresolved-duplicate-copy", False, "both comprehensive source paths exist"),
+            ("resolved-duplicate-copy", True, "both comprehensive source paths exist"),
+        )
+        for name, resolved, fragment in invalid_states:
+            with self.subTest(state=name):
+                self.reset_archive_migration_fixture(resolved=resolved)
+                old_source = self.root / validator.MIGRATION_SOURCE
+                archived_source = self.root / validator.MIGRATION_ARCHIVE_SOURCE
+                if "source-loss" in name:
+                    old_source.unlink()
+                elif "premature-archive" in name:
+                    self.archive_comprehensive_source()
+                else:
+                    archived_source.parent.mkdir(parents=True, exist_ok=True)
+                    archived_source.write_text(old_source.read_text())
+                selected, selection_errors = validator.select_comprehensive_source(self.root, resolved)
+                self.assertIsNone(selected)
+                self.assertTrue(any(fragment in error for error in selection_errors), selection_errors)
+                state_errors = validator.validate_archive_state(self.root)
+                self.assertTrue(any(fragment in error for error in state_errors), state_errors)
+                migration_errors = validator.validate_migration_inventory(self.root)
+                self.assertTrue(any(fragment in error for error in migration_errors), migration_errors)
+
+        for mutation, fragment in (
+            (lambda text: text.replace("**Version:** 3.1\n", "", 1), "document preamble must tokenize independently"),
+            (lambda text: text.replace("Material paragraph for section 7.", "", 1), "source key does not map to a material source heading: 07"),
+        ):
+            with self.subTest(selected_source_content=fragment):
+                self.reset_archive_migration_fixture(resolved=True)
+                archived_source = self.archive_comprehensive_source()
+                archived_source.write_text(mutation(archived_source.read_text()))
+                migration_errors = validator.validate_migration_inventory(self.root)
+                self.assertTrue(any(fragment in error for error in migration_errors), migration_errors)
+
+        self.reset_archive_migration_fixture(resolved=True)
+        self.archive_comprehensive_source()
+        state_errors = validator.validate_archive_state(self.root)
+        self.assertTrue(any("migration review is required" in error for error in state_errors), state_errors)
+
+    def test_archive_review_binds_named_approval_to_committed_inventory(self):
+        self.assertTrue(hasattr(validator, "validate_archive_review"), "validate_archive_review must be implemented")
+        self.assertIn("archive-review", validator.CHECKS)
+        self.assertIn("archive-review", validator.VALIDATORS)
+
+        self.init_git()
+        self.write("README.md", "# Fixture repository\n")
+        earlier_commit = self.commit_all("fixture root")
+        self.write_archive_migration_fixture(resolved=True)
+        reviewed_commit = self.commit_all("resolved migration inventory")
+        inventory_blob = self.git("rev-parse", f"{reviewed_commit}:{validator.MIGRATION_INVENTORY}")
+        self.write_archive_review(reviewed_commit, inventory_blob)
+        self.assertEqual([], validator.validate_archive_review(self.root))
+
+        review_path = self.root / validator.MIGRATION_REVIEW
+        valid_review = review_path.read_text()
+        source_blob = self.git("rev-parse", f"{reviewed_commit}:{validator.MIGRATION_SOURCE}")
+        invalid_reviews = (
+            ("same-identity", valid_review.replace("Independent Reviewer", "Task 7 Implementer", 1), "Reviewer and Implementer must be distinct"),
+            ("empty-reviewer", valid_review.replace("Independent Reviewer", "", 1), "Reviewer must be non-empty"),
+            ("outcome", valid_review.replace("Outcome: APPROVED", "Outcome: CHANGES_REQUESTED", 1), "Outcome must be literal APPROVED"),
+            ("nonzero-recorded", valid_review.replace("Unresolved rows: 0", "Unresolved rows: 1", 1), "Unresolved rows must be integer zero"),
+            ("wrong-path", valid_review.replace(validator.MIGRATION_INVENTORY, "architecture/archive/other.md", 1), "Inventory path must be"),
+            ("malformed-commit", valid_review.replace(reviewed_commit, "ABC", 1), "Reviewed commit must be lowercase 40-hex"),
+            ("nonexistent-commit", valid_review.replace(reviewed_commit, "0" * 40, 1), "Reviewed commit does not exist"),
+            ("wrong-review-commit", valid_review.replace(reviewed_commit, earlier_commit, 1), "Reviewed commit must equal HEAD before review evidence is tracked"),
+            ("malformed-blob", valid_review.replace(inventory_blob, "ABC", 1), "Inventory blob must be lowercase 40-hex"),
+            ("nonexistent-blob", valid_review.replace(inventory_blob, "f" * 40, 1), "Inventory blob does not exist"),
+            ("wrong-blob", valid_review.replace(inventory_blob, source_blob, 1), "Inventory blob does not match reviewed commit inventory"),
+            ("duplicate-field", valid_review + f"- Reviewer: Second Reviewer\n", "Reviewer must occur exactly once"),
+        )
+        for name, invalid_review, fragment in invalid_reviews:
+            with self.subTest(review=name):
+                review_path.write_text(invalid_review)
+                errors = validator.validate_archive_review(self.root)
+                self.assertTrue(any(fragment in error for error in errors), errors)
+        review_path.write_text(valid_review)
+
+        inventory = self.root / validator.MIGRATION_INVENTORY
+        inventory.write_text(inventory.read_text().replace("| resolved |", "| unresolved |", 1))
+        errors = validator.validate_archive_review(self.root)
+        self.assertTrue(any("current inventory has unresolved rows" in error for error in errors), errors)
+        inventory.write_text(self.git("show", f"{reviewed_commit}:{validator.MIGRATION_INVENTORY}") + "\n")
+        self.assertEqual([], validator.validate_archive_review(self.root))
+
+        self.git("add", validator.MIGRATION_REVIEW)
+        self.git("commit", "-q", "-m", "record independent review")
+        self.assertEqual([], validator.validate_archive_review(self.root))
+        self.write("unrelated.txt", "later cutover work\n")
+        self.commit_all("later task work")
+        self.assertEqual([], validator.validate_archive_review(self.root))
+
+        inventory.write_text(inventory.read_text().replace("B01 belongs", "B01 still belongs", 1))
+        self.git("add", validator.MIGRATION_INVENTORY)
+        self.git("commit", "-q", "-m", "change inventory after review")
+        errors = validator.validate_archive_review(self.root)
+        self.assertTrue(any("current committed inventory differs from reviewed inventory" in error for error in errors), errors)
 
 
 class DiagramAndToolingValidatorTest(unittest.TestCase):

@@ -12,10 +12,13 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 from urllib.parse import unquote, urlsplit
 
-CHECKS = frozenset({"adrs", "diagrams", "links", "metadata", "migration", "structure", "tooling", "traceability"})
+CHECKS = frozenset({"adrs", "archive", "archive-review", "diagrams", "links", "metadata", "migration", "structure", "tooling", "traceability"})
 
 MIGRATION_SOURCE = "architecture/modern-core-banking-comprehensive-design-revised.md"
+MIGRATION_ARCHIVE_SOURCE = "architecture/archive/modern-core-banking-comprehensive-design-revised.md"
+MIGRATION_ARCHIVE_BANNER = "Historical source document — non-authoritative; see /ARCHITECTURE.md and the migration inventory."
 MIGRATION_INVENTORY = "architecture/archive/comprehensive-design-migration-inventory.md"
+MIGRATION_REVIEW = "architecture/archive/comprehensive-design-migration-review.md"
 MIGRATION_HEADER = (
     "Source key",
     "Source heading",
@@ -918,21 +921,22 @@ def _material_headings(source_text: str) -> tuple[dict[str, MaterialHeading], se
             material[key] = MaterialHeading(key, heading, blocks)
     return material, roots
 
-def _validate_source_preamble(source_text: str) -> list[str]:
+def _validate_source_preamble(source_text: str, archived: bool = False) -> list[str]:
     first_numbered = re.search(r"^##\s+1\.\s+", source_text, re.M)
     if not first_numbered:
         return [_migration_error("document preamble cannot be delimited because section 1 is missing")]
     raw_lines = source_text[:first_numbered.start()].splitlines()
     material_lines = [(index, line.strip()) for index, line in enumerate(raw_lines) if line.strip()]
     lines = [line for _, line in material_lines]
-    expected_prefix = [
-        "# Modern Core Banking System",
-        "## Comprehensive Architecture and Single-VPS Proof-of-Concept Design",
-    ]
+    expected_prefix = ["# Modern Core Banking System"]
+    if archived:
+        expected_prefix.append(MIGRATION_ARCHIVE_BANNER)
+    expected_prefix.append("## Comprehensive Architecture and Single-VPS Proof-of-Concept Design")
     metadata_labels = ("Status", "Version", "Date", "Base currency", "Audience")
-    valid = len(lines) == 8 and lines[:2] == expected_prefix and lines[-1] == "---"
-    valid = valid and all(re.match(rf"^\*\*{re.escape(label)}:\*\*\s+\S", lines[index + 2]) for index, label in enumerate(metadata_labels))
-    metadata_positions = [index for index, _ in material_lines[2:7]]
+    metadata_start = len(expected_prefix)
+    valid = len(lines) == len(expected_prefix) + 6 and lines[:metadata_start] == expected_prefix and lines[-1] == "---"
+    valid = valid and all(re.match(rf"^\*\*{re.escape(label)}:\*\*\s+\S", lines[index + metadata_start]) for index, label in enumerate(metadata_labels))
+    metadata_positions = [index for index, _ in material_lines[metadata_start:metadata_start + 5]]
     valid = valid and len(metadata_positions) == 5 and metadata_positions == list(range(metadata_positions[0], metadata_positions[0] + 5))
     return [] if valid else [_migration_error("document preamble must tokenize independently as exact P01, P02, and P03 material")]
 
@@ -1052,7 +1056,7 @@ def _validate_destination(root: Path, row: MigrationRow, destination: str, expec
         errors.append(_migration_error(f"destination must use repository/path.md#explicit-anchor for {row.source_key}: {destination or 'empty'}"))
         return
     path_name, anchor = match.groups()
-    if path_name == MIGRATION_SOURCE:
+    if path_name in {MIGRATION_SOURCE, MIGRATION_ARCHIVE_SOURCE}:
         errors.append(_migration_error(f"destination must not point to the comprehensive source for {row.source_key}"))
         return
     target = root / path_name
@@ -1104,14 +1108,29 @@ def _validate_resolved_proposal(root: Path, row: MigrationRow, destinations: lis
         if existing != [target]:
             errors.append(_migration_error(f"proposal registry identity {anchor} must have one sole active or archive record"))
 
+def select_comprehensive_source(root: Path, all_rows_resolved: bool) -> tuple[Path | None, list[str]]:
+    old_source = root / MIGRATION_SOURCE
+    archived_source = root / MIGRATION_ARCHIVE_SOURCE
+    old_exists = old_source.is_file()
+    archived_exists = archived_source.is_file()
+    if old_exists and archived_exists:
+        return None, [_migration_error("both comprehensive source paths exist; exactly one is required")]
+    if not old_exists and not archived_exists:
+        return None, [_migration_error("neither comprehensive source path exists; exactly one is required")]
+    if archived_exists and not all_rows_resolved:
+        return None, [_migration_error("archived comprehensive source requires all migration rows resolved")]
+    return (archived_source if archived_exists else old_source), []
+
 def validate_migration_inventory(root: Path) -> list[str]:
-    source = root / MIGRATION_SOURCE
-    if not source.is_file():
-        return [_migration_error(f"source document is required: {MIGRATION_SOURCE}")]
+    rows, errors = _parse_migration_inventory(root / MIGRATION_INVENTORY)
+    all_rows_resolved = bool(rows) and all(row.resolution == "resolved" for row in rows)
+    source, source_errors = select_comprehensive_source(root, all_rows_resolved)
+    errors.extend(source_errors)
+    if source is None:
+        return sorted(set(errors))
     source_text = source.read_text()
     headings, source_roots = _material_headings(source_text)
-    rows, errors = _parse_migration_inventory(root / MIGRATION_INVENTORY)
-    errors.extend(_validate_source_preamble(source_text))
+    errors.extend(_validate_source_preamble(source_text, source == root / MIGRATION_ARCHIVE_SOURCE))
 
     keys = Counter(row.source_key for row in rows)
     for key, count in sorted(keys.items()):
@@ -1221,6 +1240,147 @@ def validate_migration_inventory(root: Path) -> list[str]:
                 errors.append(_migration_error(f"duplicate migration marker ({path_name}, {anchor}, {source_key})"))
             elif not expected_count:
                 errors.append(_migration_error(f"unexpected migration marker ({path_name}, {anchor or 'no-anchor'}, {source_key})"))
+    return sorted(set(errors))
+
+ARCHIVE_REVIEW_FIELDS = (
+    "Reviewed commit",
+    "Reviewer",
+    "Implementer",
+    "Outcome",
+    "Unresolved rows",
+    "Inventory path",
+    "Inventory blob",
+)
+
+def _archive_review_error(message: str) -> str:
+    return f"{MIGRATION_REVIEW}: {message}"
+
+def _parse_archive_review(path: Path) -> tuple[dict[str, str], list[str]]:
+    if not path.is_file():
+        return {}, [_archive_review_error("migration review is required")]
+    values = defaultdict(list)
+    for line in path.read_text().splitlines():
+        match = re.match(r"^- ([^:]+):\s*(.*)$", line)
+        if match and match.group(1) in ARCHIVE_REVIEW_FIELDS:
+            values[match.group(1)].append(match.group(2).strip())
+    errors = []
+    fields = {}
+    for field in ARCHIVE_REVIEW_FIELDS:
+        occurrences = values[field]
+        if len(occurrences) != 1:
+            errors.append(_archive_review_error(f"{field} must occur exactly once"))
+        else:
+            fields[field] = occurrences[0]
+    return fields, errors
+
+def _run_git_bytes(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+def validate_archive_review(root: Path) -> list[str]:
+    fields, errors = _parse_archive_review(root / MIGRATION_REVIEW)
+    if len(fields) != len(ARCHIVE_REVIEW_FIELDS):
+        return sorted(set(errors))
+
+    reviewer = fields["Reviewer"]
+    implementer = fields["Implementer"]
+    if not reviewer:
+        errors.append(_archive_review_error("Reviewer must be non-empty"))
+    if not implementer:
+        errors.append(_archive_review_error("Implementer must be non-empty"))
+    if reviewer and reviewer == implementer:
+        errors.append(_archive_review_error("Reviewer and Implementer must be distinct"))
+    if fields["Outcome"] != "APPROVED":
+        errors.append(_archive_review_error("Outcome must be literal APPROVED"))
+    try:
+        unresolved_rows = int(fields["Unresolved rows"])
+    except ValueError:
+        unresolved_rows = None
+    if unresolved_rows != 0:
+        errors.append(_archive_review_error("Unresolved rows must be integer zero"))
+    if fields["Inventory path"] != MIGRATION_INVENTORY:
+        errors.append(_archive_review_error(f"Inventory path must be {MIGRATION_INVENTORY}"))
+
+    inventory_rows, inventory_errors = _parse_migration_inventory(root / MIGRATION_INVENTORY)
+    errors.extend(inventory_errors)
+    if any(row.resolution != "resolved" for row in inventory_rows):
+        errors.append(_archive_review_error("current inventory has unresolved rows"))
+
+    reviewed_commit = fields["Reviewed commit"]
+    inventory_blob = fields["Inventory blob"]
+    commit_valid = re.fullmatch(r"[0-9a-f]{40}", reviewed_commit) is not None
+    blob_valid = re.fullmatch(r"[0-9a-f]{40}", inventory_blob) is not None
+    if not commit_valid:
+        errors.append(_archive_review_error("Reviewed commit must be lowercase 40-hex"))
+    if not blob_valid:
+        errors.append(_archive_review_error("Inventory blob must be lowercase 40-hex"))
+
+    commit_exists = commit_valid and _run_git(root, "cat-file", "-e", f"{reviewed_commit}^{{commit}}").returncode == 0
+    blob_exists = blob_valid and _run_git(root, "cat-file", "-e", f"{inventory_blob}^{{blob}}").returncode == 0
+    if commit_valid and not commit_exists:
+        errors.append(_archive_review_error("Reviewed commit does not exist"))
+    if blob_valid and not blob_exists:
+        errors.append(_archive_review_error("Inventory blob does not exist"))
+
+    reviewed_inventory_blob = None
+    reviewed_inventory = None
+    if commit_exists:
+        resolved_blob = _run_git(root, "rev-parse", "--verify", f"{reviewed_commit}:{MIGRATION_INVENTORY}")
+        if resolved_blob.returncode or not re.fullmatch(r"[0-9a-f]{40}", resolved_blob.stdout.strip()):
+            errors.append(_archive_review_error("Reviewed commit does not contain the inventory path"))
+        else:
+            reviewed_inventory_blob = resolved_blob.stdout.strip()
+            shown = _run_git_bytes(root, "show", f"{reviewed_commit}:{MIGRATION_INVENTORY}")
+            if shown.returncode:
+                errors.append(_archive_review_error("Reviewed commit inventory bytes cannot be read"))
+            else:
+                reviewed_inventory = shown.stdout
+        old_at_review = _run_git(root, "cat-file", "-e", f"{reviewed_commit}:{MIGRATION_SOURCE}").returncode == 0
+        archive_at_review = _run_git(root, "cat-file", "-e", f"{reviewed_commit}:{MIGRATION_ARCHIVE_SOURCE}").returncode == 0
+        if not old_at_review or archive_at_review:
+            errors.append(_archive_review_error("Reviewed commit must be the pre-cutover comprehensive source state"))
+    if reviewed_inventory_blob is not None and reviewed_inventory_blob != inventory_blob:
+        errors.append(_archive_review_error("Inventory blob does not match reviewed commit inventory"))
+
+    inventory_path = root / MIGRATION_INVENTORY
+    if reviewed_inventory is not None and inventory_path.is_file() and inventory_path.read_bytes() != reviewed_inventory:
+        errors.append(_archive_review_error("current filesystem inventory differs from reviewed inventory"))
+    head_inventory = _run_git_bytes(root, "show", f"HEAD:{MIGRATION_INVENTORY}")
+    if head_inventory.returncode:
+        errors.append(_archive_review_error("current committed inventory cannot be read at HEAD"))
+    elif reviewed_inventory is not None and head_inventory.stdout != reviewed_inventory:
+        errors.append(_archive_review_error("current committed inventory differs from reviewed inventory"))
+
+    head = _run_git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    head_commit = head.stdout.strip() if head.returncode == 0 else ""
+    tracked = _run_git(root, "ls-files", "--error-unmatch", "--", MIGRATION_REVIEW).returncode == 0
+    if not tracked:
+        if commit_valid and reviewed_commit != head_commit:
+            errors.append(_archive_review_error("Reviewed commit must equal HEAD before review evidence is tracked"))
+    else:
+        introduction = _run_git(root, "log", "--diff-filter=A", "--format=%H", "--", MIGRATION_REVIEW)
+        introduction_commits = [line for line in introduction.stdout.splitlines() if line]
+        if introduction.returncode or len(introduction_commits) != 1:
+            errors.append(_archive_review_error("review evidence must have one unique introduction commit"))
+        else:
+            parents = _run_git(root, "rev-list", "--parents", "-n", "1", introduction_commits[0])
+            parent_parts = parents.stdout.split()
+            if parents.returncode or len(parent_parts) != 2:
+                errors.append(_archive_review_error("review evidence introduction commit must have one parent"))
+            elif commit_valid and reviewed_commit != parent_parts[1]:
+                errors.append(_archive_review_error("Reviewed commit must equal the review evidence introduction parent"))
+    return sorted(set(errors))
+
+def validate_archive_state(root: Path) -> list[str]:
+    rows, _ = _parse_migration_inventory(root / MIGRATION_INVENTORY)
+    all_rows_resolved = bool(rows) and all(row.resolution == "resolved" for row in rows)
+    source, errors = select_comprehensive_source(root, all_rows_resolved)
+    if source == root / MIGRATION_ARCHIVE_SOURCE:
+        errors.extend(validate_archive_review(root))
     return sorted(set(errors))
 
 ADR_STATUSES = frozenset({"Proposed", "Accepted", "Rejected", "Superseded", "Deprecated"})
@@ -2288,6 +2448,8 @@ def validate_traceability(root: Path) -> list[str]:
 Validator = Callable[[Path], list[str]]
 VALIDATORS: dict[str, Validator] = {
     "adrs": validate_adrs,
+    "archive": validate_archive_state,
+    "archive-review": validate_archive_review,
     "diagrams": validate_diagrams,
     "links": validate_links,
     "metadata": validate_metadata,
