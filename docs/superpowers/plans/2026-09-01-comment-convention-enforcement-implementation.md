@@ -12,17 +12,19 @@
 
 **Base commit:** `3812f00` on `master` ("Ignore native tool worktrees under .claude").
 
+**Status: EXECUTED on 2026-09-01**, on branch `worktree-comment-convention-enforcement-plan`, in commits `b4cf2aa` (Task 1), `655ed13` (Task 2), `dfb8ceb` + `9f56d06` (Task 3), `f70e196` (Task 4). Every step ran as written and produced the output it predicts, including all eight canaries through Maven. The two risks the plan could not close when it was written are now closed: **plugin 3.6.0 with the Checkstyle 14.1.0 override works** (`BUILD SUCCESS`, `You have 0 Checkstyle violations.`), and **the full gate passes** — `./mvnw clean verify` with Docker, 254 tests, 0 failures, 0 errors, `MigrationIT` included, with `checkstyle:3.6.0:check (check-comment-conventions)` running in the same build. The 13.11.0 fallback was not needed. Two corrections the real run forced are folded into the text below: the `mise exec` prefix is mandatory, not a fallback, and each violation prints twice in two formats.
+
 ## Global Constraints
 
 - Every command runs inside whichever checkout the executor was given — the main checkout or an isolated worktree. Each command block anchors itself with `cd "$(git rev-parse --show-toplevel)"` instead of an absolute path, because this repository executes implementation plans in worktrees (`superpowers:using-git-worktrees`), and a worktree-isolated session is refused outright if a git command targets the shared checkout. Never substitute a literal path.
 - Checkstyle is pinned to exactly `14.1.0` and the plugin to exactly `3.6.0`. The plugin bundles Checkstyle `9.3` (2022), which cannot parse Java 25 sources, so the `<dependencies>` override is required for the build to work at all — it is not a preference.
-- Java 25 only. `services/funds-core/mise.toml` pins `java = "25"` and the POM's enforcer rule is `[25,26)`. Every Maven command in this plan is run from `services/funds-core`, never from the repository root with `-f`, because mise resolves the toolchain by working directory and the root selects JDK 27.
+- Java 25 only. `services/funds-core/mise.toml` pins `java = "25"` and the POM's enforcer rule is `[25,26)`. Every Maven command is run from `services/funds-core`, never from the repository root with `-f`. **Prefix every Maven command with `mise exec java@25 --`.** `cd` alone is not enough: mise only resolves the toolchain by directory when its shell hook is active, which it is not in a non-interactive shell, so a bare `./mvnw` there picks up the global JDK 27 and the enforcer rejects the build. Verified on 2026-09-01: `./mvnw -v` reported 27 from inside the module; `mise exec java@25 -- ./mvnw -v` reported 25.0.2.
 - The Checkstyle configuration contains no Maven property expansion (`${...}`), so the same file can be run standalone with the Checkstyle CLI. Do not introduce `propertyExpansion`.
 - The only source-file edits in this plan are two Javadoc comments in one test-support file (Task 3). No production Java, SQL, or configuration behaviour changes. `git diff` on `services/funds-core/src/main` must be empty at the end.
 - No canary probe file may survive its task. Each canary step is followed by a delete step and a `git status --porcelain` check before the commit.
 - Never run `./mvnw verify` (or any test goal) while a canary migration file exists under `src/main/resources/db/migration/`; Flyway would apply it in the Testcontainers database. Canary migrations are validated with `checkstyle:check` only.
 - Rules that cannot be checked mechanically stay in human review. "A comment that restates its code" and "accuracy over coverage" are review rules, not build rules, and this plan does not attempt to automate them.
-- `./mvnw clean verify` requires Docker (PostgreSQL Testcontainers). Docker is not reachable from Claude Code sessions on this host, so the full gate is the human partner's step and must be reported as "not run" by any agent that could not run it.
+- `./mvnw clean verify` requires Docker (PostgreSQL Testcontainers). A session whose login predates the user's addition to the `docker` group does not have it: `id -nG` will not list `docker` even though `/etc/group` does. Run the gate through `newgrp docker < script.sh` (there is no `sg` on this host). If Docker is genuinely unreachable, the gate is the human partner's step and must be reported as "not run" — never as passed.
 - Every task ends with its own verification and a commit before the next task starts.
 
 ## Baseline evidence
@@ -80,7 +82,7 @@ These were settled before the plan was written. Do not re-open them during execu
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw -v
+mise exec java@25 -- ./mvnw -v
 ```
 
 Expected: `Java version: 25.0.2`. If it reports 27, you are in the wrong directory or mise is not resolving; prefix every later Maven command with `mise exec java@25 --`.
@@ -178,7 +180,7 @@ In `services/funds-core/pom.xml`, add inside `<build><plugins>` after the `maven
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD SUCCESS`, no `[ERROR]` lines from Checkstyle. First run downloads the plugin and Checkstyle 14.1.0 (~15 MB). If it fails with `cannot initialize module <name>`, the rule name is wrong for Checkstyle 14 — fix the config, do not downgrade.
@@ -202,7 +204,7 @@ public class CanaryProbe {
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE`, with three Checkstyle violations.
@@ -238,7 +240,7 @@ public class CanaryProbe {
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with:
@@ -273,7 +275,7 @@ public class CanaryProbe {
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with exactly these three, one per rule:
@@ -291,7 +293,7 @@ Every rule in the configuration has now failed a build on purpose. A rule that c
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
 rm src/main/java/com/corebanking/funds/CanaryProbe.java
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD SUCCESS`.
@@ -300,7 +302,7 @@ Expected: `BUILD SUCCESS`.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw validate
+mise exec java@25 -- ./mvnw validate
 ```
 
 Expected: `BUILD SUCCESS`, and the log contains `--- checkstyle:3.6.0:check (check-comment-conventions) @ funds-core ---`. This also proves the enforcer accepted the JDK.
@@ -382,7 +384,7 @@ Leave `<includeTestResources>false</includeTestResources>` as it is.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD SUCCESS`.
@@ -403,7 +405,7 @@ Do not run `verify` or any test goal while this file exists.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with `V999__canary.sql:1: Missing a header - not enough lines in file. [RegexpHeader]`.
@@ -419,7 +421,7 @@ CREATE TABLE funds.canary(id int);
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with `V999__canary.sql:2: Line does not match expected header line of '^--.*$'. [RegexpHeader]`. This proves a token one-line header does not satisfy the rule.
@@ -436,7 +438,7 @@ CREATE TABLE funds.canary(id int);
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with `V999__canary.sql:2: Work items belong in the tracker, not in source. [RegexpSingleline]`, and no `RegexpHeader` violation — the header is now valid.
@@ -465,7 +467,7 @@ public class CanaryProbe {
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with exactly one violation, `CanaryProbe.java:6: Work items belong in the tracker, not in source. [RegexpSingleline]`. A second violation here means the migration canary was not deleted.
@@ -476,7 +478,7 @@ Expected: `BUILD FAILURE` with exactly one violation, `CanaryProbe.java:6: Work 
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
 rm src/main/java/com/corebanking/funds/CanaryProbe.java
 ls src/main/resources/db/migration/
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 The `ls` must show exactly the eight `V001`-`V006` files and no `V999`.
@@ -522,7 +524,7 @@ In `services/funds-core/pom.xml`, inside the checkstyle plugin's `<configuration
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD FAILURE` with exactly two violations:
@@ -554,14 +556,14 @@ Above `public record SuccessfulCommand(` at what is now line 259, add:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw checkstyle:check
+mise exec java@25 -- ./mvnw checkstyle:check
 ```
 
 Expected: `BUILD SUCCESS`.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw -q -DskipTests compile test-compile
+mise exec java@25 -- ./mvnw -q -DskipTests compile test-compile
 ```
 
 Expected: success. Comments cannot break compilation, but this catches a stray edit.
@@ -627,7 +629,7 @@ gate. The ruleset is `services/funds-core/config/checkstyle/checkstyle.xml`:
 `MissingJavadocMethod` is deliberately not enabled: requiring Javadoc on every
 method produces comments that restate the signature.
 
-Run it alone with `./mvnw checkstyle:check` from `services/funds-core`. The
+Run it alone with `mise exec java@25 -- ./mvnw checkstyle:check` from `services/funds-core`. The
 Checkstyle version is pinned in the POM because the plugin's bundled 9.3 cannot
 parse Java 25.
 
@@ -641,7 +643,7 @@ stays with the reviewer.
 In `AGENTS.md`, in "Before opening a pull request", after the line `- [ ] No comment restates its code; no `TODO`/`FIXME` was added.`, add:
 
 ```markdown
-- [ ] `./mvnw checkstyle:check` passes in `services/funds-core` (it also runs
+- [ ] `mise exec java@25 -- ./mvnw checkstyle:check` passes in `services/funds-core` (it also runs
       inside `validate`, so a violation fails the build before any test does).
 ```
 
@@ -696,20 +698,24 @@ Expected: empty.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw clean
-./mvnw validate
+mise exec java@25 -- ./mvnw clean
+mise exec java@25 -- ./mvnw validate
 ```
 
 Expected: `BUILD SUCCESS` with the `check-comment-conventions` execution in the log.
 
-- [ ] **5. The full test gate — human partner's step**
+- [ ] **5. The full test gate**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-./mvnw clean verify
+mise exec java@25 -- ./mvnw clean verify
 ```
 
-Requires Docker for PostgreSQL Testcontainers, which is unreachable from Claude Code sessions on this host. An agent that cannot run this must report it as "not run", never as passed. `MigrationIT` must still pass: this plan adds no migration and edits no migration text, so its `V004` string assertions are unaffected, but the run is the proof.
+Requires Docker for PostgreSQL Testcontainers. If the session's process groups do not include `docker`, put the two lines above in a script and run `newgrp docker < script.sh`. An agent that still cannot reach Docker must report this as "not run", never as passed.
+
+`MigrationIT` must pass: this change adds no migration and edits no migration text, so its `V004` string assertions are unaffected, but the run is the proof.
+
+Result on 2026-09-01: `BUILD SUCCESS`, `Tests run: 254, Failures: 0, Errors: 0, Skipped: 0`, with `checkstyle:3.6.0:check (check-comment-conventions)` in the same build and `MigrationIT` at 36 tests green.
 
 ## Rollback
 
