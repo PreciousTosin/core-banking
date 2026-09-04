@@ -4,7 +4,7 @@
 
 **Goal:** Let a human engineer run funds-core locally against a migrated, seeded PostgreSQL, drive postings, reversals and proofs over a dev-only HTTP surface, get fast test feedback, and find all of that in a service-local documentation set that links into the existing architecture governance.
 
-**Architecture:** Four `%dev.` properties turn on Dev Services migration plus a repeatable Flyway seed under `db/dev-seed`; a `devtools` package holds a JAX-RS resource, a reference resolver and an exception mapper, all excluded from the prod build profile; the smoke script proves the packaged image serves 404 on the dev path; `PackagingContractTest` pins the dev keys; four Markdown documents under `services/funds-core/docs/` describe the workflow and link outward to arc42, ADRs and conventions.
+**Architecture:** Four `%dev.` infrastructure properties turn on Dev Services migration plus a repeatable Flyway seed under `db/dev-seed`; an exact `@IfBuildProfile(anyOf = {"dev", "test"})` allowlist includes the `devtools` JAX-RS resource and reference resolver only in those two build profiles. The resource owns its error mapping so dev-only semantics cannot affect other REST resources. The smoke script proves the packaged image serves 404 on the dev path. `PackagingContractTest` pins the full profile-key set; four Markdown documents under `services/funds-core/docs/` describe the workflow and link outward to updated arc42 views, ADRs and conventions.
 
 **Tech Stack:** Java 25 (mise-pinned), Maven 3.9.16 wrapper, Quarkus 3.33.3.1 (`quarkus-rest`, `quarkus-rest-jackson` added), Flyway, PostgreSQL 18.6 via Dev Services and Testcontainers, JUnit 5, RestAssured, Checkstyle 14.1.0, mise tasks.
 
@@ -18,9 +18,9 @@
 
 - Every command runs inside whichever checkout the executor was given. Each command block anchors itself with `cd "$(git rev-parse --show-toplevel)/services/funds-core"` because this repository executes implementation plans in worktrees (`superpowers:using-git-worktrees`). Never substitute a literal path.
 - Java 25 only. **Prefix every Maven command with `mise exec java@25 --`.** A bare `./mvnw` in a non-interactive shell picks up the host JDK 27 and the enforcer rule `[25,26)` rejects the build. `mise run <task>` applies the toolchain itself and needs no prefix.
-- `./mvnw clean verify` requires Docker for the PostgreSQL Testcontainers gate and must never use a host database (CLAUDE.md). If `id -nG` does not list `docker`, run the gate through `newgrp docker < script.sh`. If Docker is genuinely unreachable, the gate is the human partner's step and is reported as **not run**, never as passed.
+- `./mvnw clean verify` requires Docker for the PostgreSQL Testcontainers gate and must never use a host database (CLAUDE.md). If `id -nG` does not list `docker`, run the anchored gate command through `newgrp docker -c 'mise run verify'`. If Docker is genuinely unreachable, the gate is the human partner's step and is reported as **not run**, never as passed.
 - Checkstyle runs in `validate` with `MissingJavadocType` at scope `package`, so **every new class, record, interface and test class needs a Javadoc purpose comment whose first sentence ends with a period**. `TODO`, `FIXME` and `XXX` fail the build in `.java` and `.sql`.
-- The 19 production keys in `PackagingContractTest.CONTROLLED_PROPERTIES` keep their values and their single assignment. Only `%dev.`-prefixed keys are added to `application.properties`, and only the four named in the spec.
+- The 19 production keys in `PackagingContractTest.CONTROLLED_PROPERTIES` keep their values and their single assignment. The only new profile-prefixed keys are the four `%dev.` infrastructure keys named in the spec; bean inclusion is enforced by the exact build-profile allowlist, not a configurable property.
 - `README.md` must keep every heading in `assertUniqueHeadings` exactly once, the line `./scripts/prod-runtime-smoke.sh core-banking/funds-core:accounting-kernel` exactly once inside "Build and verification", the phrase `fail closed before readiness can be UP` inside "Database roles and startup", `sha256:f9e65324` and the phrase `all four production-runtime probes` exactly once inside "Base-image review and refresh", the 11 `| ACC-xx |` rows once each, and the 13 exclusion bullets. `docs/health-contract.md` must keep its three headings exactly once.
 - No production behaviour changes: migrations `V001` to `V006`, `PostingService`, `ReversalService`, `JdbcLedgerRepository` and the proof classes are not edited. `git diff` on `src/main/java/com/corebanking/funds/{application,domain,infrastructure,runtime}` must be empty at the end.
 - Comments follow `docs/conventions/code-comments.md`: the why, not the what.
@@ -30,23 +30,27 @@
 
 | Path | Responsibility |
 |---|---|
-| `src/main/resources/application.properties` | four `%dev.` keys (Task 1) |
+| `src/main/resources/application.properties` | four `%dev.` Dev Services/Flyway keys (Task 1) |
+| `src/test/resources/application.properties` | distinct database name and reuse-off isolation for destructive tests (Task 1) |
 | `mise.toml` | tasks `dev`, `test`, `verify`, `checkstyle` (Task 1) |
-| `src/test/java/com/corebanking/funds/PackagingContractTest.java` | pins the `%dev.` key set (Task 1) |
+| `src/test/java/com/corebanking/funds/PackagingContractTest.java` | pins the complete dev/test profile-key set (Task 1) |
 | `src/main/resources/db/dev-seed/R__dev_reference_ledger.sql` | repeatable, idempotent reference seed (Task 2) |
 | `src/test/java/com/corebanking/funds/application/DevSeedIT.java` | seed applies twice and accepts a posting (Task 2) |
+| `src/test/java/com/corebanking/funds/application/DevProfileBootstrapIT.java` | boots the actual dev config profile, verifies Flyway's repeatable seed, and drives it over HTTP (Task 4) |
 | `src/test/java/com/corebanking/funds/infrastructure/postgres/MigrationIT.java` | test profile applies 8 versioned and 0 repeatable migrations (Task 2) |
 | `pom.xml` | `quarkus-rest`, `quarkus-rest-jackson` (Task 3) |
 | `src/main/java/com/corebanking/funds/devtools/DevLedgerReferences.java` | resolves book context, cutoff, default book, reference description (Task 3) |
 | `src/main/java/com/corebanking/funds/devtools/DevPostingRequest.java`, `DevPostingLine.java`, `DevPostingResponse.java`, `DevReferenceResponse.java`, `DevErrorResponse.java`, `DevReversalRequest.java` | JSON records (Tasks 3 and 4) |
 | `src/main/java/com/corebanking/funds/devtools/DevLedgerResource.java` | `/dev/ledger` endpoints (Tasks 3 and 4) |
-| `src/main/java/com/corebanking/funds/devtools/DevLedgerExceptionMapper.java` | domain exception to HTTP status (Task 4) |
+| `src/main/java/com/corebanking/funds/devtools/DevLedgerResource.java` | resource-local domain exception to HTTP mapping (Task 4) |
 | `src/test/java/com/corebanking/funds/application/DevLedgerResourceIT.java` | RestAssured coverage of the surface (Tasks 3 and 4) |
 | `scripts/prod-runtime-smoke.sh` | 404 assertion inside the reachable-database probe (Task 5) |
 | `README.md`, `docs/health-contract.md` | dev profile sentences and the index pointer (Task 5) |
 | `docs/README.md`, `docs/developer-guide.md`, `docs/change-recipes.md` | service documentation set (Task 6) |
-| `docs/test-catalogue.md` | already committed with this plan; linked from the index (Task 6) |
+| `docs/test-catalogue.md` | refreshed after the new test classes and methods land (Task 6) |
 | `AGENTS.md` (repository root) | pointer to the developer guide (Task 6) |
+| `architecture/arc42/05-building-block-view.md`, `06-runtime-view.md`, `07-deployment-view.md` | current-state devtools boundary, runtime path and profile isolation (Task 6) |
+| `architecture/diagrams/funds-core-components.mmd` | devtools HTTP adapter and read-only reference-query edge (Task 6) |
 
 The two test classes for the dev tooling live in `com.corebanking.funds.application` because `TestPostingStack` is package-private there and is the only fixture that seeds the reference graph; moving or widening it is out of scope.
 
@@ -56,21 +60,30 @@ The two test classes for the dev tooling live in `com.corebanking.funds.applicat
 
 **Files:**
 - Modify: `src/main/resources/application.properties` (append after line 32)
+- Modify: `src/test/resources/application.properties` (give destructive tests a distinct Dev Services database name)
 - Modify: `src/test/java/com/corebanking/funds/PackagingContractTest.java` (add one constant near line 59 and one test after line 315)
 - Modify: `mise.toml`
 
 **Interfaces:**
-- Produces: the property `%dev.quarkus.flyway.locations=db/migration,db/dev-seed` that Task 2's seed directory relies on; mise task names `dev`, `test`, `verify`, `checkstyle` that Task 6's documents cite.
+- Produces: the property `%dev.quarkus.flyway.locations=db/migration,db/dev-seed` that Task 2's seed directory and Task 4's dev-profile bootstrap test rely on; mise task names `dev`, `test`, `verify`, `checkstyle` that Task 6's documents cite.
 
 - [ ] **Step 1: Write the failing packaging test**
+
+Add `"src/test/resources/application.properties"` to `CONTRACT_INPUTS` next
+to the main properties path. Update the class purpose comment to say it reads
+both main and test configuration. Also add the test-resource path to the
+`nonSentinelContractInputSymlinksFailBeforeContentOrMetadataAccess` and
+`nestedContractInputsRejectSymlinkedParentDirectoriesBeforeRepositoryValidation`
+parameter lists. This gives the new input the same exact-Git-path and
+symlink-free trust coverage as every existing contract input; without the
+allowlist entry, `read(...)` rejects it before the property assertion runs.
 
 Add the constant directly after `CONTROLLED_PROPERTIES` (which ends at line 79):
 
 ```java
-    // The dev profile may only add these keys. Anything else with a profile prefix is a
-    // production-contract change in disguise, because Quarkus resolves %dev. keys ahead of the
-    // base keys above whenever quarkus:dev runs (docs/developer-guide.md).
-    private static final Map<String, String> DEV_PROFILE_PROPERTIES = Map.of(
+    // Non-production configuration is restricted to the infrastructure needed by dev mode.
+    // Bean inclusion uses an exact build-profile allowlist and is not configurable.
+    private static final Map<String, String> NON_PRODUCTION_PROFILE_PROPERTIES = Map.of(
         "%dev.quarkus.datasource.devservices.image-name", "postgres:18.6-bookworm",
         "%dev.quarkus.datasource.devservices.reuse", "true",
         "%dev.quarkus.flyway.migrate-at-start", "true",
@@ -81,7 +94,7 @@ Add the test directly after `productionConfigurationHasOneEffectiveAssignmentFor
 
 ```java
     @Test
-    void devProfileOverridesAreTheExactPinnedSetAndLeavePackagedFlywayLocationsAlone() throws Exception {
+    void nonProductionProfileOverridesAreExactAndLeavePackagedDefaultsAlone() throws Exception {
         String source = read(MODULE, "src/main/resources/application.properties");
         var properties = new Properties();
         properties.load(new StringReader(source));
@@ -92,11 +105,20 @@ Add the test directly after `productionConfigurationHasOneEffectiveAssignmentFor
                 profileKeys.add(key);
             }
         }
-        assertEquals(DEV_PROFILE_PROPERTIES.keySet(), profileKeys, "only the pinned %dev keys may exist");
-        DEV_PROFILE_PROPERTIES.forEach((key, expected) -> assertEquals(expected, properties.getProperty(key), key));
+        assertEquals(NON_PRODUCTION_PROFILE_PROPERTIES.keySet(), profileKeys,
+            "only the pinned dev profile keys may exist");
+        NON_PRODUCTION_PROFILE_PROPERTIES.forEach(
+            (key, expected) -> assertEquals(expected, properties.getProperty(key), key));
         assertNull(properties.getProperty("quarkus.flyway.locations"),
             "packaged Flyway locations stay at the default so db/dev-seed can never run in the image");
         assertFalse(properties.getProperty("%dev.quarkus.flyway.locations").contains("jdbc:"));
+
+        var testProperties = new Properties();
+        testProperties.load(new StringReader(
+            read(MODULE, "src/test/resources/application.properties")));
+        assertEquals("funds_core_test",
+            testProperties.getProperty("quarkus.datasource.devservices.db-name"),
+            "destructive tests need a database identity distinct from the live dev service");
     }
 ```
 
@@ -110,10 +132,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-mise exec java@25 -- ./mvnw -q test -Dtest=PackagingContractTest#devProfileOverridesAreTheExactPinnedSetAndLeavePackagedFlywayLocationsAlone
+mise exec java@25 -- ./mvnw -q test -Dtest=PackagingContractTest#nonProductionProfileOverridesAreExactAndLeavePackagedDefaultsAlone
 ```
 
-Expected: `FAIL` with `only the pinned %dev keys may exist ==> expected: <[%dev.quarkus...]> but was: <[]>`.
+Expected: `FAIL` because the four pinned dev keys and the isolated test database name are absent.
 
 - [ ] **Step 3: Add the dev profile keys**
 
@@ -121,14 +143,21 @@ Append to `src/main/resources/application.properties` after the `%prod.` block:
 
 ```properties
 
-# Dev profile only. quarkus:dev starts a PostgreSQL 18.6 Dev Services container, migrates it and
-# applies the repeatable reference seed under db/dev-seed so an engineer can post immediately.
-# The base keys above keep their packaged values: PackagingContractTest pins this exact key set
-# and the packaged Flyway locations stay at the default (docs/developer-guide.md).
+# Dev profile only. quarkus:dev starts a PostgreSQL 18.6 Dev Services container, migrates it,
+# applies the repeatable reference seed. Java annotations allow the unauthenticated driving
+# surface only in exact dev and test build profiles; configuration cannot opt in another profile.
+# PackagingContractTest pins this exact set and keeps packaged Flyway locations at the default.
 %dev.quarkus.datasource.devservices.image-name=postgres:18.6-bookworm
 %dev.quarkus.datasource.devservices.reuse=true
 %dev.quarkus.flyway.migrate-at-start=true
 %dev.quarkus.flyway.locations=db/migration,db/dev-seed
+```
+
+Append to `src/test/resources/application.properties`:
+
+```properties
+# Destructive integration fixtures must not share the live dev-mode database.
+quarkus.datasource.devservices.db-name=funds_core_test
 ```
 
 - [ ] **Step 4: Run the whole packaging contract to verify it passes**
@@ -180,13 +209,14 @@ Expected: four tasks listed; `BUILD SUCCESS` with `You have 0 Checkstyle violati
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 git add services/funds-core/src/main/resources/application.properties \
+        services/funds-core/src/test/resources/application.properties \
         services/funds-core/src/test/java/com/corebanking/funds/PackagingContractTest.java \
         services/funds-core/mise.toml
 git commit -m "Add a pinned dev profile and mise tasks to funds-core
 
 quarkus:dev now migrates its Dev Services PostgreSQL and reads the
-db/dev-seed Flyway location. PackagingContractTest pins the four %dev
-keys so no override can reach the packaged contract unnoticed.
+db/dev-seed Flyway location. The dev and test profiles explicitly opt
+into the driving surface, and PackagingContractTest pins every key.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -213,6 +243,8 @@ package com.corebanking.funds.application;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
@@ -230,12 +262,13 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.util.PSQLException;
 
 /**
- * Proves the dev-profile seed under db/dev-seed installs the reference graph, survives being
- * applied twice (Flyway re-runs a repeatable migration whenever its checksum changes), and
- * yields a graph the real posting stack accepts. The test profile never adds db/dev-seed to its
- * Flyway locations, so the file is executed here by hand against the migrated test database.
+ * Proves the dev-profile seed under db/dev-seed installs its fixed reference graph, survives an
+ * unchanged second application, rejects stale reused state, and yields a graph the real posting
+ * stack accepts. The test profile never adds db/dev-seed to its Flyway locations, so the file is
+ * executed here by hand against the migrated test database.
  */
 @QuarkusTest
 class DevSeedIT {
@@ -256,12 +289,9 @@ class DevSeedIT {
 
     @Test
     void seedInstallsTheReferenceGraphTwiceWithoutErrorAndAcceptsAPosting() throws Exception {
-        String seed;
-        try (var stream = getClass().getResourceAsStream(SEED)) {
-            assertNotNull(stream, "seed resource must be on the classpath: " + SEED);
-            seed = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-        }
+        String seed = readSeed();
         applySeed(seed);
+        long governanceRevision = governanceRevision();
         applySeed(seed);
 
         assertEquals(1L, count("funds.book"));
@@ -272,11 +302,35 @@ class DevSeedIT {
         assertEquals(2L, count("funds.ledger_account_chart_mapping"));
         assertEquals(0L, count("funds.journal"));
         assertEquals(0L, count("funds.materialised_balance"));
+        assertEquals(governanceRevision, governanceRevision(),
+            "an unchanged repeatable seed must not advance chart governance");
 
         var stack = TestPostingStack.create(dataSource, PostingTransactionObserver.noop());
         var result = stack.postingService().post(command());
         assertEquals(TestPostingStack.uuid(9_001), result.journalId());
         assertEquals(1L, count("funds.journal"));
+    }
+
+    @Test
+    void changedSeedRejectsStaleImmutableStateInAReusedDatabase() throws Exception {
+        String seed = readSeed();
+        applySeed(seed);
+        String changedSeed = seed.replace(
+            "TIMESTAMPTZ '2026-01-01 00:00:00+00'",
+            "TIMESTAMPTZ '2026-01-02 00:00:00+00'");
+
+        SQLException failure = assertThrows(SQLException.class, () -> applySeed(changedSeed));
+        assertTrue(failure.getMessage().contains("discard the reused Dev Services database"));
+        assertTrue(failure instanceof PSQLException);
+        assertEquals("dev_reference_seed_drift",
+            ((PSQLException) failure).getServerErrorMessage().getConstraint());
+    }
+
+    private String readSeed() throws Exception {
+        try (var stream = getClass().getResourceAsStream(SEED)) {
+            assertNotNull(stream, "seed resource must be on the classpath: " + SEED);
+            return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+        }
     }
 
     private void applySeed(String seed) throws SQLException {
@@ -301,6 +355,19 @@ class DevSeedIT {
                  "SELECT status FROM funds.chart_version WHERE chart_version_id = '00000000-0000-0000-0000-000000000002'")) {
             rows.next();
             return rows.getString(1);
+        }
+    }
+
+    private long governanceRevision() throws SQLException {
+        try (var connection = dataSource.getConnection();
+             var statement = connection.createStatement();
+             var rows = statement.executeQuery("""
+                 SELECT chart_governance_revision
+                 FROM funds.book
+                 WHERE book_id = '00000000-0000-0000-0000-000000000001'
+                 """)) {
+            rows.next();
+            return rows.getLong(1);
         }
     }
 
@@ -349,13 +416,14 @@ Expected: `FAIL` with `seed resource must be on the classpath: /db/dev-seed/R__d
 ```sql
 -- R__dev_reference_ledger: repeatable development seed, applied only when the dev profile adds
 -- db/dev-seed to quarkus.flyway.locations (application.properties). Installs the reference
--- graph the integration tests use (TestPostingStack) under fixed identities so every engineer's
+-- fixed identities and core reference shape derived from TestPostingStack, with dev-specific
+-- attributes, so every engineer's
 -- /dev/ledger session speaks about the same book, chart, period and accounts. Seeds no
 -- balances, journals or projections: those must come from real postings so proofs stay
--- meaningful. Idempotent by construction, because Flyway re-runs a repeatable migration
--- whenever its checksum changes. Rows that a V005 trigger would reject on re-insert (open
--- accounts and mappings after activation) are guarded with NOT EXISTS; the rest use
--- ON CONFLICT DO NOTHING; activation is guarded by status = 'DRAFT'.
+-- meaningful. An unchanged script is idempotent. When the checksum changes, the assertion at
+-- the end rejects stale immutable rows in a reused Dev Services database rather than silently
+-- retaining a graph that no longer matches this file. Rows whose V005 triggers reject a repeated
+-- insert are guarded with NOT EXISTS; activation is guarded by status = 'DRAFT'.
 INSERT INTO funds.book
     (book_id, legal_entity_id, functional_currency, timezone, calendar_code, accounting_policy_version)
 VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000008',
@@ -364,15 +432,17 @@ ON CONFLICT (book_id) DO NOTHING;
 
 INSERT INTO funds.chart_version
     (chart_version_id, book_id, version, status, approval_reference)
-VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001',
-        1, 'DRAFT', 'APP-DEV-CHART-001')
-ON CONFLICT (chart_version_id) DO NOTHING;
+SELECT '00000000-0000-0000-0000-000000000002',
+       '00000000-0000-0000-0000-000000000001', 1, 'DRAFT', 'APP-DEV-CHART-001'
+WHERE NOT EXISTS (SELECT 1 FROM funds.chart_version
+                  WHERE chart_version_id = '00000000-0000-0000-0000-000000000002');
 
--- One open period spanning the whole of 2026 so a booking time of "now" lands inside it.
+-- A deliberately long-lived dev-only period keeps current-time exploration usable without
+-- pretending this fixture is a production accounting calendar.
 INSERT INTO funds.accounting_period
     (period_id, book_id, business_date_from, business_date_to, status)
 VALUES ('00000000-0000-0000-0000-000000000007', '00000000-0000-0000-0000-000000000001',
-        DATE '2026-01-01', DATE '2026-12-31', 'OPEN')
+        DATE '2020-01-01', DATE '2099-12-31', 'OPEN')
 ON CONFLICT (period_id) DO NOTHING;
 
 INSERT INTO funds.product_definition (product_id, product_code)
@@ -427,6 +497,74 @@ UPDATE funds.chart_version
 SET status = 'ACTIVE', activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
 WHERE chart_version_id = '00000000-0000-0000-0000-000000000002'
   AND status = 'DRAFT';
+
+DO $seed_assertion$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM funds.book b
+        JOIN funds.chart_version c ON c.book_id = b.book_id
+        JOIN funds.accounting_period p ON p.book_id = b.book_id
+        JOIN funds.product_definition d ON d.product_id =
+            '00000000-0000-0000-0000-000000000003'
+        JOIN funds.product_version v ON v.product_id = d.product_id
+        WHERE b.book_id = '00000000-0000-0000-0000-000000000001'
+          AND b.legal_entity_id = '00000000-0000-0000-0000-000000000008'
+          AND b.functional_currency = 'NGN' AND b.timezone = 'Africa/Lagos'
+          AND b.calendar_code = 'NG' AND b.accounting_policy_version = 1
+          AND c.chart_version_id = '00000000-0000-0000-0000-000000000002'
+          AND c.version = 1 AND c.status = 'ACTIVE'
+          AND c.approval_reference = 'APP-DEV-CHART-001'
+          AND c.activated_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+          AND c.retired_at IS NULL
+          AND p.period_id = '00000000-0000-0000-0000-000000000007'
+          AND p.business_date_from = DATE '2020-01-01'
+          AND p.business_date_to = DATE '2099-12-31' AND p.status = 'OPEN'
+          AND d.product_code = 'DEV-SAVINGS'
+          AND v.product_version_id = '00000000-0000-0000-0000-000000000004'
+          AND v.version = 1
+          AND v.effective_from = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+          AND v.approval_reference = 'APP-DEV-SAVINGS-001'
+          AND v.effective_to IS NULL AND v.policy_hash = repeat('a', 64)
+          AND v.policy_json = '{}'::jsonb AND v.product_kind = 'SAVINGS'
+          AND v.finance_principle = 'CONVENTIONAL'
+          AND EXISTS (SELECT 1 FROM funds.ledger_account a
+                      WHERE a.account_id = '00000000-0000-0000-0000-000000000005'
+                        AND a.book_id = b.book_id AND a.account_scope = 'INTERNAL'
+                        AND a.product_version_id IS NULL AND a.currency = 'NGN'
+                        AND a.status = 'OPEN' AND a.authorised_floor_minor = 0
+                        AND a.created_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+                        AND a.closed_at IS NULL)
+          AND EXISTS (SELECT 1 FROM funds.ledger_account a
+                      WHERE a.account_id = '00000000-0000-0000-0000-000000000006'
+                        AND a.book_id = b.book_id AND a.account_scope = 'CUSTOMER'
+                        AND a.product_version_id = v.product_version_id
+                        AND a.currency = 'NGN' AND a.status = 'OPEN'
+                        AND a.authorised_floor_minor = 0
+                        AND a.created_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+                        AND a.closed_at IS NULL)
+          AND EXISTS (SELECT 1 FROM funds.ledger_account_chart_mapping m
+                      WHERE m.account_id = '00000000-0000-0000-0000-000000000005'
+                        AND m.book_id = b.book_id AND m.chart_version_id = c.chart_version_id
+                        AND m.account_code = 'PROVIDER-ASSET' AND m.account_currency = 'NGN'
+                        AND m.account_class = 'ASSET' AND m.normal_balance = 'DEBIT'
+                        AND m.control_account_code = 'PROVIDER-CASH'
+                        AND m.account_role = 'INTERNAL' AND m.currency_policy = 'ACCOUNT_CURRENCY'
+                        AND m.permitted_direction = 'BOTH')
+          AND EXISTS (SELECT 1 FROM funds.ledger_account_chart_mapping m
+                      WHERE m.account_id = '00000000-0000-0000-0000-000000000006'
+                        AND m.book_id = b.book_id AND m.chart_version_id = c.chart_version_id
+                        AND m.account_code = 'CUSTOMER-LIABILITY' AND m.account_currency = 'NGN'
+                        AND m.account_class = 'LIABILITY' AND m.normal_balance = 'CREDIT'
+                        AND m.control_account_code = 'CUSTOMER-DEPOSITS'
+                        AND m.account_role = 'CUSTOMER' AND m.currency_policy = 'ACCOUNT_CURRENCY'
+                        AND m.permitted_direction = 'BOTH')
+    ) THEN
+        RAISE EXCEPTION 'dev reference seed differs from immutable reused state; discard the reused Dev Services database and restart dev mode'
+            USING ERRCODE = '55000', CONSTRAINT = 'dev_reference_seed_drift';
+    END IF;
+END
+$seed_assertion$;
 ```
 
 Checkstyle's `RegexpHeader` applies only to `db/migration/*.sql` (POM `resourceIncludes`), so the `R__` first line is not checked, but the header block is kept to the convention anyway.
@@ -438,7 +576,7 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 mise exec java@25 -- ./mvnw -q test -Dtest=DevSeedIT
 ```
 
-Expected: `Tests run: 1, Failures: 0`. If the second `applySeed` fails with `ledger_account_chart_mapping_frozen` or `active_chart_account_onboarding_deferred`, a `NOT EXISTS` guard is missing on the failing statement; the `ON CONFLICT` form is not enough for those two tables because their BEFORE triggers fire ahead of conflict resolution.
+Expected: both cases pass. If the second unchanged `applySeed` fails with `ledger_account_chart_mapping_frozen` or `active_chart_account_onboarding_deferred`, a `NOT EXISTS` guard is missing on the failing statement; the `ON CONFLICT` form is not enough for those two tables because their BEFORE triggers fire ahead of conflict resolution. If the drift case does not fail with `dev_reference_seed_drift`, the seed can silently diverge in a reused database.
 
 - [ ] **Step 5: Write the failing migration-history assertion**
 
@@ -593,43 +731,6 @@ class DevLedgerResourceIT {
         assertEquals(2L, count("funds.posting"));
     }
 
-    @Test
-    void unbalancedJournalIsRejectedWith422AndTheDomainExceptionName() throws SQLException {
-        given().contentType(ContentType.JSON).body("""
-            {"commandId":"%s","transactionType":"DEV_TEST","narration":"unbalanced",
-             "bookingTime":"2026-01-15T10:00:00Z",
-             "lines":[{"accountId":"%s","currency":"NGN","signedMinorUnits":100},
-                      {"accountId":"%s","currency":"NGN","signedMinorUnits":-99}]}
-            """.formatted(COMMAND, PROVIDER, CUSTOMER))
-            .when().post("/dev/ledger/postings")
-            .then().statusCode(422)
-            .body("error", equalTo("InvalidJournalException"));
-        assertEquals(0L, count("funds.journal"));
-    }
-
-    @Test
-    void changedBodyUnderTheSameCommandIdIsAnIdempotencyConflict() {
-        given().contentType(ContentType.JSON).body(inflow(COMMAND, 1_000_000))
-            .when().post("/dev/ledger/postings").then().statusCode(200);
-        given().contentType(ContentType.JSON).body(inflow(COMMAND, 2_000_000))
-            .when().post("/dev/ledger/postings")
-            .then().statusCode(409)
-            .body("error", equalTo("IdempotencyConflictException"));
-    }
-
-    @Test
-    void bookingTimeOutsideEveryOpenPeriodIsABadRequest() {
-        given().contentType(ContentType.JSON).body("""
-            {"commandId":"%s","transactionType":"DEV_TEST","narration":"wrong period",
-             "bookingTime":"2027-03-01T10:00:00Z",
-             "lines":[{"accountId":"%s","currency":"NGN","signedMinorUnits":100},
-                      {"accountId":"%s","currency":"NGN","signedMinorUnits":-100}]}
-            """.formatted(COMMAND, PROVIDER, CUSTOMER))
-            .when().post("/dev/ledger/postings")
-            .then().statusCode(400)
-            .body("error", equalTo("IllegalArgumentException"));
-    }
-
     // NGN 10,000.00 provider inflow: +amount on the debit-normal asset, -amount on the
     // credit-normal customer liability, booked inside the seeded January 2026 period.
     static String inflow(String commandId, long amount) {
@@ -666,9 +767,9 @@ Expected: every method fails with `Expected status code <200> but was <404>` (no
 In `pom.xml`, after the `quarkus-micrometer-registry-prometheus` line (33):
 
 ```xml
-        <!-- The dev-only /dev/ledger surface (devtools package). The resource beans carry
-             @UnlessBuildProfile("prod"), so the packaged image serves no JAX-RS endpoint;
-             scripts/prod-runtime-smoke.sh asserts the 404. -->
+        <!-- The dev-only /dev/ledger surface (devtools package). Its beans use an exact dev/test
+             build-profile allowlist, so configuration cannot include them in another profile;
+             the smoke script asserts the production 404. -->
         <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-rest</artifactId></dependency>
         <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-rest-jackson</artifactId></dependency>
 ```
@@ -773,7 +874,8 @@ public record DevPostingResponse(UUID commandId, String requestHash, UUID journa
 ```java
 package com.corebanking.funds.devtools;
 
-import io.quarkus.arc.profile.UnlessBuildProfile;
+import com.corebanking.funds.domain.exception.LedgerPersistenceException;
+import io.quarkus.arc.profile.IfBuildProfile;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import java.sql.SQLException;
@@ -788,11 +890,11 @@ import javax.sql.DataSource;
 /**
  * Read-only lookups that turn a book id and a booking time into the governance coordinates a
  * JournalDraft needs. A real caller carries these itself; the dev surface resolves them so an
- * engineer can post with a handful of fields. Failures are IllegalArgumentException so the
- * mapper reports them as 400 rather than as a ledger fault.
+ * engineer can post with a handful of fields. Missing governance coordinates are bad requests;
+ * database failures retain the kernel's persistence-failure vocabulary.
  */
 @Singleton
-@UnlessBuildProfile("prod")
+@IfBuildProfile(anyOf = {"dev", "test"})
 public class DevLedgerReferences {
 
     /** Governance coordinates of one book for one booking time. */
@@ -821,7 +923,7 @@ public class DevLedgerReferences {
             }
             return rows.getObject(1, UUID.class);
         } catch (SQLException failure) {
-            throw new IllegalStateException("reference lookup failed", failure);
+            throw new LedgerPersistenceException(failure);
         }
     }
 
@@ -853,13 +955,13 @@ public class DevLedgerReferences {
                 return new BookContext(
                     bookId,
                     rows.getObject(1, UUID.class),
-                    rows.getInt(2),
-                    ZoneId.of(rows.getString(3)),
                     rows.getObject(4, UUID.class),
-                    rows.getObject(5, UUID.class));
+                    rows.getObject(5, UUID.class),
+                    rows.getInt(2),
+                    ZoneId.of(rows.getString(3)));
             }
         } catch (SQLException failure) {
-            throw new IllegalStateException("reference lookup failed", failure);
+            throw new LedgerPersistenceException(failure);
         }
     }
 
@@ -875,7 +977,7 @@ public class DevLedgerReferences {
                 return rows.getLong(1);
             }
         } catch (SQLException failure) {
-            throw new IllegalStateException("cutoff lookup failed", failure);
+            throw new LedgerPersistenceException(failure);
         }
     }
 
@@ -945,7 +1047,7 @@ public class DevLedgerReferences {
             }
             return new DevReferenceResponse(bookId, legalEntityId, chartVersionId, policyVersion, timezone, periods, accounts);
         } catch (SQLException failure) {
-            throw new IllegalStateException("reference lookup failed", failure);
+            throw new LedgerPersistenceException(failure);
         }
     }
 }
@@ -965,7 +1067,7 @@ import com.corebanking.funds.application.PostingService;
 import com.corebanking.funds.domain.CurrencyCode;
 import com.corebanking.funds.domain.JournalDraft;
 import com.corebanking.funds.domain.PostingLine;
-import io.quarkus.arc.profile.UnlessBuildProfile;
+import io.quarkus.arc.profile.IfBuildProfile;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import jakarta.ws.rs.Consumes;
@@ -994,7 +1096,7 @@ import java.util.UUID;
  */
 @Path("/dev/ledger")
 @Singleton
-@UnlessBuildProfile("prod")
+@IfBuildProfile(anyOf = {"dev", "test"})
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class DevLedgerResource {
@@ -1017,11 +1119,9 @@ public class DevLedgerResource {
     @POST
     @Path("/postings")
     public DevPostingResponse post(DevPostingRequest request) {
-        Objects.requireNonNull(request, "request body");
+        request = required(request, "request body");
         var commandId = request.commandId() != null ? request.commandId() : UUID.randomUUID();
-        var bookingTime = request.bookingTime() != null
-            ? request.bookingTime()
-            : Instant.now().truncatedTo(ChronoUnit.MICROS);
+        var bookingTime = required(request.bookingTime(), "bookingTime");
         var bookId = request.bookId() != null ? request.bookId() : references.defaultBook();
         var context = references.resolve(bookId, bookingTime);
         var valueDate = request.valueDate() != null
@@ -1032,11 +1132,11 @@ public class DevLedgerResource {
         }
         var lines = new ArrayList<PostingLine>(request.lines().size());
         for (int index = 0; index < request.lines().size(); index++) {
-            var line = request.lines().get(index);
+            var line = required(request.lines().get(index), "lines[" + index + "]");
             lines.add(new PostingLine(
                 derived(commandId, "posting:" + index),
-                Objects.requireNonNull(line.accountId(), "lines[" + index + "].accountId"),
-                CurrencyCode.of(Objects.requireNonNull(line.currency(), "lines[" + index + "].currency")),
+                required(line.accountId(), "lines[" + index + "].accountId"),
+                CurrencyCode.of(required(line.currency(), "lines[" + index + "].currency")),
                 line.signedMinorUnits(),
                 0L,
                 line.dimensions() == null ? Map.of() : line.dimensions()));
@@ -1050,7 +1150,7 @@ public class DevLedgerResource {
             context.bookId(),
             context.chartVersionId(),
             context.periodId(),
-            Objects.requireNonNull(request.transactionType(), "transactionType"),
+            required(request.transactionType(), "transactionType"),
             request.narration() == null ? "" : request.narration(),
             bookingTime,
             valueDate,
@@ -1062,26 +1162,30 @@ public class DevLedgerResource {
         return new DevPostingResponse(commandId, requestHash, result.journalId(), result.journalSequence(), result.canonicalHash());
     }
 
-    /**
-     * Identities derived from the command id rather than minted at random, so the same request
-     * body replays to the stored result and a changed body conflicts, as a real caller would see.
-     */
+    /** Identities derived from the command id so immediate retries rebuild the same draft. */
     static UUID derived(UUID commandId, String label) {
         return UUID.nameUUIDFromBytes(("funds-core/dev/" + commandId + "/" + label).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static <T> T required(T value, String name) {
+        if (value == null) {
+            throw new IllegalArgumentException(name + " is required");
+        }
+        return value;
     }
 }
 ```
 
-If `JournalDraft` rejects a blank narration (check `domain/JournalDraft.java` lines 60 to 75 for a `narration.isBlank()` guard), keep the `""` default: the rejection surfaces as an `IllegalArgumentException` and a 400, which is the intended behaviour for a missing field.
+Booking time is deliberately required: it is part of the typed hash, so defaulting it from the wall clock would turn an identical retry into a different command. Value date remains a deterministic default derived from that required instant. If `JournalDraft` rejects a blank narration (check `domain/JournalDraft.java` lines 60 to 75 for a `narration.isBlank()` guard), keep the `""` default: the rejection surfaces as an `IllegalArgumentException` and a 400, which is the intended behaviour for a missing field.
 
-- [ ] **Step 7: Run the test; expect the 422, 409 and 400 cases still failing**
+- [ ] **Step 7: Run the completed Task 3 resource test**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
 mise exec java@25 -- ./mvnw -q test -Dtest=DevLedgerResourceIT
 ```
 
-Expected: `referenceDescribesTheSeededBook` and `postingReturnsTheJournal...` pass; the other three fail with `Expected status code <422|409|400> but was <500>` because no exception mapper exists yet. That is the boundary Task 4 closes. If the reference test fails on `accounts.accountCode`, the ordering is alphabetical by `account_code`, which puts `CUSTOMER-LIABILITY` before `PROVIDER-ASSET`; the expectation already reflects that.
+Expected: both tests pass. Error-status cases belong to Task 4, which adds the resource-local mapper before committing. If the reference test fails on `accounts.accountCode`, the ordering is alphabetical by `account_code`, which puts `CUSTOMER-LIABILITY` before `PROVIDER-ASSET`; the expectation already reflects that.
 
 - [ ] **Step 8: Run checkstyle on the new package**
 
@@ -1115,9 +1219,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `src/main/java/com/corebanking/funds/devtools/DevReversalRequest.java`
 - Create: `src/main/java/com/corebanking/funds/devtools/DevErrorResponse.java`
-- Create: `src/main/java/com/corebanking/funds/devtools/DevLedgerExceptionMapper.java`
 - Modify: `src/main/java/com/corebanking/funds/devtools/DevLedgerResource.java`
 - Modify: `src/test/java/com/corebanking/funds/application/DevLedgerResourceIT.java`
+- Create: `src/test/java/com/corebanking/funds/application/DevProfileBootstrapIT.java`
 
 **Interfaces:**
 - Consumes: `ReversalService.reverse(ReversalRequest)`, `ReversalRequest(UUID commandId, String requestHash, UUID originalJournalId, UUID correlationId, UUID businessTransactionId, UUID currentPeriodId, Instant bookingTime, LocalDate valueDate, String reason)`, `CanonicalCommandHasher.reversalV2(ReversalRequest)`, `AccountingProofService.trialBalance(UUID, CurrencyCode, long)` and `controlAccount(UUID, String, CurrencyCode, long)`, the domain exceptions under `com.corebanking.funds.domain.exception`.
@@ -1129,13 +1233,62 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 grep -n "extends" src/main/java/com/corebanking/funds/domain/exception/*.java
 ```
 
-Expected: every class extends `RuntimeException` directly or through `LedgerPersistenceException`. If any extends a checked exception, add it to the mapper's `switch` as its own `ExceptionMapper`; do not change the exception.
+Expected: every class extends `RuntimeException` directly or through `LedgerPersistenceException`. If any extends a checked exception, add a resource-local `@ServerExceptionMapper` overload for that checked type; do not change the exception.
 
 - [ ] **Step 2: Add the failing reversal and proof tests**
 
 Append to `DevLedgerResourceIT`:
 
 ```java
+    @Test
+    void unbalancedJournalIsRejectedWith422AndTheDomainExceptionName() throws SQLException {
+        given().contentType(ContentType.JSON).body("""
+            {"commandId":"%s","transactionType":"DEV_TEST","narration":"unbalanced",
+             "bookingTime":"2026-01-15T10:00:00Z",
+             "lines":[{"accountId":"%s","currency":"NGN","signedMinorUnits":100},
+                      {"accountId":"%s","currency":"NGN","signedMinorUnits":-99}]}
+            """.formatted(COMMAND, PROVIDER, CUSTOMER))
+            .when().post("/dev/ledger/postings")
+            .then().statusCode(422)
+            .body("error", equalTo("InvalidJournalException"));
+        assertEquals(0L, count("funds.journal"));
+    }
+
+    @Test
+    void changedBodyUnderTheSameCommandIdIsAnIdempotencyConflict() {
+        given().contentType(ContentType.JSON).body(inflow(COMMAND, 1_000_000))
+            .when().post("/dev/ledger/postings").then().statusCode(200);
+        given().contentType(ContentType.JSON).body(inflow(COMMAND, 2_000_000))
+            .when().post("/dev/ledger/postings")
+            .then().statusCode(409)
+            .body("error", equalTo("IdempotencyConflictException"));
+    }
+
+    @Test
+    void bookingTimeOutsideEveryOpenPeriodIsABadRequest() {
+        given().contentType(ContentType.JSON).body("""
+            {"commandId":"%s","transactionType":"DEV_TEST","narration":"wrong period",
+             "bookingTime":"2027-03-01T10:00:00Z",
+             "lines":[{"accountId":"%s","currency":"NGN","signedMinorUnits":100},
+                      {"accountId":"%s","currency":"NGN","signedMinorUnits":-100}]}
+            """.formatted(COMMAND, PROVIDER, CUSTOMER))
+            .when().post("/dev/ledger/postings")
+            .then().statusCode(400)
+            .body("error", equalTo("IllegalArgumentException"));
+    }
+
+    @Test
+    void bookingTimeIsRequiredBecauseItIsPartOfTheReplayHash() {
+        given().contentType(ContentType.JSON).body("""
+            {"commandId":"%s","transactionType":"DEV_TEST","narration":"missing time",
+             "lines":[{"accountId":"%s","currency":"NGN","signedMinorUnits":100},
+                      {"accountId":"%s","currency":"NGN","signedMinorUnits":-100}]}
+            """.formatted(COMMAND, PROVIDER, CUSTOMER))
+            .when().post("/dev/ledger/postings")
+            .then().statusCode(400)
+            .body("error", equalTo("IllegalArgumentException"));
+    }
+
     @Test
     void reversalNegatesTheOriginalAndASecondReversalIsRejected() throws SQLException {
         var original = given().contentType(ContentType.JSON).body(inflow(COMMAND, 1_000_000))
@@ -1194,9 +1347,9 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 mise exec java@25 -- ./mvnw -q test -Dtest=DevLedgerResourceIT
 ```
 
-Expected: the two new tests fail with `Expected status code <200> but was <404>`; the three status-mapping tests from Task 3 still fail with 500.
+Expected: the reversal and proof tests fail with `Expected status code <200> but was <404>`; the four newly added status-mapping tests fail with 500. Task 4 now supplies both the endpoints and their resource-local mapper before its commit.
 
-- [ ] **Step 4: Write the request, error and mapper types**
+- [ ] **Step 4: Write the request and error types, then add resource-local mapping**
 
 `src/main/java/com/corebanking/funds/devtools/DevReversalRequest.java`:
 
@@ -1208,8 +1361,8 @@ import java.time.LocalDate;
 import java.util.UUID;
 
 /**
- * A reversal as an engineer types it: which journal, why, and optionally when and under which
- * command id. The current period, correlation identities and typed hash are resolved or derived.
+ * A reversal as an engineer types it: which journal, why, the required hash-bearing booking
+ * time, and optionally which command id. Period and correlation identities are resolved or derived.
  */
 public record DevReversalRequest(
     UUID commandId,
@@ -1232,34 +1385,26 @@ package com.corebanking.funds.devtools;
 public record DevErrorResponse(String error, String message) {}
 ```
 
-`src/main/java/com/corebanking/funds/devtools/DevLedgerExceptionMapper.java`:
+Add these imports to `DevLedgerResource`:
 
 ```java
-package com.corebanking.funds.devtools;
-
 import com.corebanking.funds.domain.exception.AccountingPeriodClosedException;
 import com.corebanking.funds.domain.exception.IdempotencyConflictException;
 import com.corebanking.funds.domain.exception.InvalidJournalException;
 import com.corebanking.funds.domain.exception.LedgerCapacityException;
 import com.corebanking.funds.domain.exception.LedgerPersistenceException;
 import com.corebanking.funds.domain.exception.MonetaryOverflowException;
-import io.quarkus.arc.profile.UnlessBuildProfile;
-import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.ext.ExceptionMapper;
-import jakarta.ws.rs.ext.Provider;
+import org.jboss.resteasy.reactive.server.ServerExceptionMapper;
+```
 
-/**
- * Maps kernel rejections to HTTP statuses for the dev surface only. The kernel's own outcome
- * vocabulary (README acceptance table) is preserved in the body; the status is a convenience
- * for curl. Applies solely to JAX-RS resources, so health and metrics are untouched.
- */
-@Provider
-@UnlessBuildProfile("prod")
-public class DevLedgerExceptionMapper implements ExceptionMapper<RuntimeException> {
+Add this method to `DevLedgerResource`. A mapper declared in a REST endpoint
+class is invoked only for exceptions thrown from that class, so these dev-only
+semantics cannot alter a future provider/public resource during `%test` runs:
 
-    @Override
-    public Response toResponse(RuntimeException failure) {
+```java
+    @ServerExceptionMapper
+    Response mapFailure(RuntimeException failure) {
         int status = switch (failure) {
             case IdempotencyConflictException _ -> 409;
             case InvalidJournalException _ -> 422;
@@ -1267,7 +1412,6 @@ public class DevLedgerExceptionMapper implements ExceptionMapper<RuntimeExceptio
             case MonetaryOverflowException _ -> 422;
             case LedgerCapacityException _ -> 422;
             case IllegalArgumentException _ -> 400;
-            case NullPointerException _ -> 400;
             case LedgerPersistenceException _ -> 503;
             default -> 500;
         };
@@ -1276,7 +1420,6 @@ public class DevLedgerExceptionMapper implements ExceptionMapper<RuntimeExceptio
             .entity(new DevErrorResponse(failure.getClass().getSimpleName(), failure.getMessage()))
             .build();
     }
-}
 ```
 
 If `LedgerPersistenceException` is a superclass of one of the 422 types, order the `case` arms so the subclass comes first; the compiler reports dominance errors otherwise.
@@ -1322,11 +1465,9 @@ Add the endpoints after `post`:
     @POST
     @Path("/reversals")
     public DevPostingResponse reverse(DevReversalRequest request) {
-        Objects.requireNonNull(request, "request body");
+        request = required(request, "request body");
         var commandId = request.commandId() != null ? request.commandId() : UUID.randomUUID();
-        var bookingTime = request.bookingTime() != null
-            ? request.bookingTime()
-            : Instant.now().truncatedTo(ChronoUnit.MICROS);
+        var bookingTime = required(request.bookingTime(), "bookingTime");
         var bookId = request.bookId() != null ? request.bookId() : references.defaultBook();
         var context = references.resolve(bookId, bookingTime);
         var valueDate = request.valueDate() != null
@@ -1338,13 +1479,13 @@ Add the endpoints after `post`:
         var unsigned = new ReversalRequest(
             commandId,
             "0".repeat(64),
-            Objects.requireNonNull(request.originalJournalId(), "originalJournalId"),
+            required(request.originalJournalId(), "originalJournalId"),
             derived(commandId, "correlation"),
             derived(commandId, "business-transaction"),
             context.periodId(),
             bookingTime,
             valueDate,
-            Objects.requireNonNull(request.reason(), "reason"));
+            required(request.reason(), "reason"));
         var requestHash = hasher.reversalV2(unsigned);
         var signed = new ReversalRequest(
             unsigned.commandId(),
@@ -1370,7 +1511,7 @@ Add the endpoints after `post`:
         var book = bookId != null ? bookId : references.defaultBook();
         return proofService.trialBalance(
             book,
-            CurrencyCode.of(Objects.requireNonNull(currency, "currency")),
+            CurrencyCode.of(required(currency, "currency")),
             cutoff != null ? cutoff : references.currentCutoff(book));
     }
 
@@ -1385,8 +1526,8 @@ Add the endpoints after `post`:
         var book = bookId != null ? bookId : references.defaultBook();
         return proofService.controlAccount(
             book,
-            Objects.requireNonNull(controlCode, "controlCode"),
-            CurrencyCode.of(Objects.requireNonNull(currency, "currency")),
+            required(controlCode, "controlCode"),
+            CurrencyCode.of(required(currency, "currency")),
             cutoff != null ? cutoff : references.currentCutoff(book));
     }
 ```
@@ -1400,24 +1541,112 @@ cd "$(git rev-parse --show-toplevel)/services/funds-core"
 mise exec java@25 -- ./mvnw -q test -Dtest=DevLedgerResourceIT
 ```
 
-Expected: `Tests run: 7, Failures: 0`. If `totalDebits` compares as a `Long` versus `Integer`, replace `equalTo(1_000_000)` with `equalTo(1000000)`; RestAssured's JSON path yields `Integer` for values that fit.
+Expected: `Tests run: 8, Failures: 0`. If `totalDebits` compares as a `Long` versus `Integer`, replace `equalTo(1_000_000)` with `equalTo(1000000)`; RestAssured's JSON path yields `Integer` for values that fit.
 
-- [ ] **Step 7: Run checkstyle and the production-contract tests together**
+- [ ] **Step 7: Add a real dev-profile Flyway bootstrap test**
+
+Create `src/test/java/com/corebanking/funds/application/DevProfileBootstrapIT.java`:
+
+```java
+package com.corebanking.funds.application;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.QuarkusTestProfile;
+import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
+import java.sql.SQLException;
+import java.util.Map;
+import javax.sql.DataSource;
+import org.junit.jupiter.api.Test;
+
+/** Proves the actual dev configuration lets Flyway discover the seed and exposes its graph. */
+@QuarkusTest
+@TestProfile(DevProfileBootstrapIT.DevConfigProfile.class)
+class DevProfileBootstrapIT {
+
+    @Inject
+    DataSource dataSource;
+
+    @Test
+    void devProfileAppliesTheRepeatableSeedAndServesItOverHttp() throws SQLException {
+        assertEquals(1L, scalar("""
+            SELECT count(*) FROM flyway_schema_history
+            WHERE version IS NULL AND description = 'dev reference ledger' AND success
+            """));
+
+        given().when().get("/dev/ledger/reference")
+            .then().statusCode(200)
+            .body("bookId", equalTo("00000000-0000-0000-0000-000000000001"));
+
+        given().contentType("application/json").body("""
+            {"commandId":"22222222-2222-2222-2222-222222222222",
+             "transactionType":"DEPOSIT","narration":"dev bootstrap proof",
+             "bookingTime":"2026-06-15T10:00:00Z","lines":[
+               {"accountId":"00000000-0000-0000-0000-000000000005",
+                "currency":"NGN","signedMinorUnits":100,"dimensions":{}},
+               {"accountId":"00000000-0000-0000-0000-000000000006",
+                "currency":"NGN","signedMinorUnits":-100,"dimensions":{}}]}
+            """)
+            .when().post("/dev/ledger/postings")
+            .then().statusCode(200);
+    }
+
+    private long scalar(String sql) throws SQLException {
+        try (var connection = dataSource.getConnection();
+             var statement = connection.createStatement();
+             var rows = statement.executeQuery(sql)) {
+            rows.next();
+            return rows.getLong(1);
+        }
+    }
+
+    /** Selects the real dev configuration with a distinct, non-reused test database. */
+    public static final class DevConfigProfile implements QuarkusTestProfile {
+        @Override
+        public String getConfigProfile() {
+            return "dev";
+        }
+
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            return Map.of(
+                "quarkus.datasource.devservices.reuse", "false",
+                "quarkus.datasource.devservices.db-name", "funds_core_dev_profile_test");
+        }
+    }
+}
+```
+
+This test must use `getConfigProfile()` rather than copying the Flyway
+locations into `getConfigOverrides()`: the oracle is that the real `%dev`
+configuration works. Its explicit reuse override takes precedence over
+`%dev.quarkus.datasource.devservices.reuse=true`; its distinct database name
+also forces a separate Dev Service from ordinary test-profile runs. Together
+they isolate the test from both the live developer database and destructive
+ordinary test fixtures. Quarkus restarts the application for the distinct
+profile.
+
+- [ ] **Step 8: Run checkstyle and the production-contract tests together**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
 mise run checkstyle
-mise exec java@25 -- ./mvnw -q test -Dtest='PackagingContractTest,DevSeedIT,DevLedgerResourceIT,MigrationIT'
+mise exec java@25 -- ./mvnw -q test -Dtest='PackagingContractTest,DevSeedIT,DevProfileBootstrapIT,DevLedgerResourceIT,MigrationIT'
 ```
 
-Expected: `0 Checkstyle violations`; all four classes pass. The packaging contract must still pass with the two new POM dependencies because it pins plugin executions, not dependencies.
+Expected: `0 Checkstyle violations`; all five classes pass. The packaging contract must still pass with the two new POM dependencies because it pins plugin executions, not dependencies.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 git add services/funds-core/src/main/java/com/corebanking/funds/devtools \
-        services/funds-core/src/test/java/com/corebanking/funds/application/DevLedgerResourceIT.java
+        services/funds-core/src/test/java/com/corebanking/funds/application/DevLedgerResourceIT.java \
+        services/funds-core/src/test/java/com/corebanking/funds/application/DevProfileBootstrapIT.java
 git commit -m "Add dev-only reversal and proof endpoints with status mapping
 
 /dev/ledger/reversals derives its identities and typed hash the same
@@ -1480,9 +1709,9 @@ Replace the whole "Build and verification" section body (keep the heading) with:
 Use Docker access for the PostgreSQL 18.6 Testcontainers gate and Java 25:
 
 ```bash
-cd services/funds-core
-./mvnw clean verify
-./mvnw -DskipTests package
+cd "$(git rev-parse --show-toplevel)/services/funds-core"
+mise run verify
+mise exec java@25 -- ./mvnw -DskipTests package
 docker build -f Dockerfile.jvm -t core-banking/funds-core:accounting-kernel .
 docker run --rm --entrypoint java --memory=640m --cpus=0.60 --pids-limit=256 \
   core-banking/funds-core:accounting-kernel -version
@@ -1494,20 +1723,20 @@ The test gate contains unit, deterministic generated-property, PostgreSQL integr
 Day-to-day development (dev mode with a migrated and seeded database, the development-only `/dev/ledger` surface, continuous testing, single-class runs, database inspection and troubleshooting) is described in the [developer guide](docs/developer-guide.md); the [documentation index](docs/README.md) lists every service-local document and the architecture documents that govern this module. The smoke script's reachable-database probe also asserts that the packaged image answers HTTP 404 on `/dev/ledger/reference`.
 ````
 
-The fenced block inside the Markdown above is the same one the README has today; only the last paragraph is new. The smoke command line stays exactly once.
+This deliberately replaces the README's bare Maven commands with the Java-25-aware mise forms and anchors the directory from the active worktree; it is not a paragraph-only change. The smoke command line stays exactly once.
 
 - [ ] **Step 4: Update the health contract**
 
 In "Endpoints", add a bullet after the `/q/metrics` bullet:
 
 ```markdown
-- `/dev/ledger/*` exists only outside the prod build profile. The packaged image answers HTTP 404 there, which `scripts/prod-runtime-smoke.sh` asserts inside its reachable-database probe.
+- `/dev/ledger/*` uses an exact Java build-profile allowlist for dev and test. No property can enable it in prod or an arbitrary custom profile. `scripts/prod-runtime-smoke.sh` asserts the packaged image answers HTTP 404 inside its reachable-database probe.
 ```
 
 In "Database and migration prerequisite", replace `Tests instead use PostgreSQL 18.6 Dev Services and enable Flyway in the test profile.` with:
 
 ```markdown
-Tests and dev mode instead use PostgreSQL 18.6 Dev Services and enable Flyway in the test and dev profiles; dev mode also applies the repeatable reference seed under `db/dev-seed`.
+Tests and dev mode instead use PostgreSQL 18.6 Dev Services and enable Flyway in the test and dev profiles; dev mode also applies the repeatable reference seed under `db/dev-seed`. Only those two profiles opt into the development ledger surface.
 ```
 
 - [ ] **Step 5: Run the packaging contract**
@@ -1541,8 +1770,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `docs/README.md`
 - Create: `docs/developer-guide.md` (content in Appendix A)
 - Create: `docs/change-recipes.md` (content in Appendix B)
-- Verify present: `docs/test-catalogue.md` (committed together with this plan)
+- Modify: `docs/test-catalogue.md` (refresh its revision, inventory and method entries after Tasks 1 to 4)
 - Modify: `AGENTS.md` at the repository root (Layout section)
+- Modify: `architecture/arc42/05-building-block-view.md`
+- Modify: `architecture/arc42/06-runtime-view.md`
+- Modify: `architecture/arc42/07-deployment-view.md`
+- Modify: `architecture/diagrams/funds-core-components.mmd`
 
 **Interfaces:**
 - Consumes: the mise task names from Task 1, the seeded identities from Task 2, the endpoint paths and status codes from Tasks 3 and 4, the smoke behaviour from Task 5.
@@ -1602,13 +1835,13 @@ Conventions and process:
 
 - [ ] **Step 2: Write the developer guide and the change recipes**
 
-Create `docs/developer-guide.md` with the content of Appendix A and `docs/change-recipes.md` with the content of Appendix B, verbatim.
+Create `docs/developer-guide.md` with the content of Appendix A and `docs/change-recipes.md` with the content of Appendix B, verbatim. Then re-audit `src/test/java`: update `docs/test-catalogue.md`'s reviewed commit, inventory totals and line counts; add complete entries for `DevSeedIT`, `DevProfileBootstrapIT` and `DevLedgerResourceIT`; and add the new methods to the `PackagingContractTest` and `MigrationIT` sections. Do not leave the catalogue claiming the pre-change count of 20 test classes or the old per-class method totals.
 
 - [ ] **Step 3: Check every relative link resolves**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core/docs"
-for f in README.md developer-guide.md change-recipes.md; do
+for f in README.md developer-guide.md change-recipes.md test-catalogue.md; do
   grep -oE '\]\(([^)#]+)' "$f" | sed 's/](//' | grep -vE '^https?://' | while read -r p; do
     [ -e "$p" ] || echo "BROKEN in $f: $p"
   done
@@ -1617,7 +1850,11 @@ done; echo LINKCHECK_DONE
 
 Expected: only `LINKCHECK_DONE`. Fix any `BROKEN` line before continuing.
 
-- [ ] **Step 4: Point AGENTS.md at the guide**
+- [ ] **Step 4: Update the authoritative current-state architecture**
+
+Update `05-building-block-view.md` and `funds-core-components.mmd` to show `devtools` as a build-time-gated inbound HTTP adapter: it calls the application services and performs read-only reference lookups through the datasource, while the domain remains independent of infrastructure. Update `06-runtime-view.md` with the dev request-normalisation flow (required booking time, deterministic identities, current governance resolution, typed hash, then the existing posting/reversal/proof services). Update `07-deployment-view.md` with the dev/test-only opt-in and the production 404 smoke assertion. Add `devtools` paths to the relevant `code_refs` and advance each edited document or diagram's `last_verified` date. These are current-state updates, not a new ADR.
+
+- [ ] **Step 5: Point AGENTS.md at the guide**
 
 In `AGENTS.md`, replace the first Layout bullet:
 
@@ -1637,26 +1874,30 @@ with:
   developer guide, change recipes and test catalogue.
 ```
 
-- [ ] **Step 5: Run the architecture validator (it reads AGENTS.md links) and checkstyle**
+- [ ] **Step 6: Run the architecture validator (it reads AGENTS.md links) and checkstyle**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 python3 architecture/scripts/validate_architecture.py --root .
+architecture/scripts/render-diagrams.sh
 cd services/funds-core && mise run checkstyle
 ```
 
-Expected: the validator exits 0; checkstyle reports 0 violations (Markdown is not scanned, this is a regression check).
+Expected: the validator exits 0, the locked renderer renders every governed Mermaid source in its invocation-owned temporary directory without error, and checkstyle reports 0 violations (Markdown is not scanned, this is a regression check). Generated SVGs remain ignored and untracked by repository policy.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 git add services/funds-core/docs/README.md services/funds-core/docs/developer-guide.md \
-        services/funds-core/docs/change-recipes.md AGENTS.md
-git commit -m "Add the funds-core documentation index, developer guide and change recipes
+        services/funds-core/docs/change-recipes.md services/funds-core/docs/test-catalogue.md \
+        architecture/arc42/05-building-block-view.md architecture/arc42/06-runtime-view.md \
+        architecture/arc42/07-deployment-view.md architecture/diagrams/funds-core-components.mmd \
+        AGENTS.md
+git commit -m "Document funds-core local development and its dev adapter
 
-Service-local documents now link outward to the arc42 views, ADRs and
-conventions that govern the module instead of restating them.
+Service-local documents and the refreshed test catalogue now link to
+the current arc42 views, which record the build-time-gated HTTP adapter.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1671,11 +1912,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/services/funds-core"
-id -nG | grep -qw docker || echo "NO DOCKER GROUP IN THIS SESSION: run through newgrp docker or hand to the human partner"
-mise run verify 2>&1 | tail -40
+if id -nG | grep -qw docker; then
+  mise run verify
+else
+  newgrp docker -c 'mise run verify'
+fi
 ```
 
-Expected: `BUILD SUCCESS`; `Tests run:` total equals the previous baseline plus the new tests (PackagingContractTest +1, MigrationIT +1, DevSeedIT 1, DevLedgerResourceIT 7); `Failures: 0, Errors: 0, Skipped: 0`. Record the totals in the PR body. If Docker is unreachable, stop here and report the gate as **not run**.
+Expected: the command itself exits 0 and prints `BUILD SUCCESS`; `Tests run:` total equals the refreshed catalogue (PackagingContractTest +1, MigrationIT +1, DevSeedIT 2, DevProfileBootstrapIT 1, DevLedgerResourceIT 8); `Failures: 0, Errors: 0, Skipped: 0`. Do not pipe the gate through `tail`: without an explicitly preserved pipeline status, `tail` can mask a Maven or Testcontainers failure. Record the totals in the PR body. If Docker is unreachable even after the `newgrp` branch, stop here and report the gate as **not run**.
 
 - [ ] **Step 2: Walk the dev-mode path once by hand**
 
@@ -1687,16 +1931,17 @@ mise run dev
 In a second shell, once the console reports `Listening on: http://localhost:8080`:
 
 ```bash
+curl -i localhost:8080/q/health/ready
 curl -s localhost:8080/dev/ledger/reference | head -c 400; echo
 curl -s -X POST localhost:8080/dev/ledger/postings -H 'content-type: application/json' -d '{
   "commandId":"11111111-1111-1111-1111-111111111111","transactionType":"PROVIDER_INFLOW",
-  "narration":"NGN 10,000.00 inflow",
+  "narration":"NGN 10,000.00 inflow","bookingTime":"2026-06-15T10:00:00Z",
   "lines":[{"accountId":"00000000-0000-0000-0000-000000000005","currency":"NGN","signedMinorUnits":1000000},
            {"accountId":"00000000-0000-0000-0000-000000000006","currency":"NGN","signedMinorUnits":-1000000}]}'; echo
 curl -s 'localhost:8080/dev/ledger/proofs/trial-balance?currency=NGN'; echo
 ```
 
-Expected: the reference shows book `…0001` with two accounts; the posting returns a `journalId`; the trial balance shows `"balanced":true` with debits and credits of 1000000. Press `q` in the dev console to stop. Paste the three responses into the PR body as evidence.
+Expected: readiness returns HTTP 200 with aggregate `UP`; the reference shows book `…0001` with two accounts; the posting returns a `journalId`; the trial balance shows `"balanced":true`. Exact totals of 1000000 require a clean database. If reuse retained the fixed command id, verify the idempotent replay or use the developer guide's safely scoped reset before expecting a new journal. Press `q` in the dev console to stop. Paste the responses into the PR body as evidence.
 
 - [ ] **Step 3: Build the image and run the smoke script**
 
@@ -1707,7 +1952,7 @@ docker build -f Dockerfile.jvm -t core-banking/funds-core:accounting-kernel .
 ./scripts/prod-runtime-smoke.sh core-banking/funds-core:accounting-kernel
 ```
 
-Expected: the four probe lines as before plus `reachable-database probe: /dev/ledger/reference returned HTTP 404 (development surface absent from the packaged image)`.
+Expected: the four probe lines as before plus `reachable-database probe: /dev/ledger/reference returned HTTP 404 (development surface absent from the packaged image)`. Bean inclusion is an exact Java build-profile allowlist with no configuration override; this runtime probe confirms the prod build omits the surface.
 
 - [ ] **Step 4: Confirm production packages are untouched**
 
@@ -1727,9 +1972,9 @@ Expected: no output.
 Fill the template's architecture-impact section as `Architecture changed; linked below` with:
 
 - Related ADRs: ADR-0002 (the dev surface is a convenience over typed commands, not a new owner), ADR-0008 (two runtime dependencies added inside the same 640 MiB budget).
-- Current-state arc42 sections changed: none; the deployment view already links the smoke script whose probe was extended.
+- Current-state arc42 sections changed: building-block, runtime and deployment views for the build-time-gated devtools adapter, its read-only reference queries and its absence from deployable profiles by default.
 - Proposals: none.
-- Diagrams: none.
+- Diagrams: `architecture/diagrams/funds-core-components.mmd` adds the devtools adapter and its permitted edges.
 - Verification evidence: the verify totals from Step 1, the smoke output from Step 3, and the commit hashes of Tasks 1 to 6.
 
 Walk the AGENTS.md checklist: purpose comments on every new type, no `TODO`, checkstyle passed, no migration edited (V004 text assertions unaffected), verify run with Docker.
@@ -1738,7 +1983,7 @@ Walk the AGENTS.md checklist: purpose comments on every new type, no `TODO`, che
 
 ## Self-review
 
-**Spec coverage.** 5.1 dev profile: Task 1. 5.2 seed and its tests: Task 2. 5.3 inner loops and mise: Task 1 (tasks) and Appendix A (documentation). 5.4 surface, records, mapper, resource test: Tasks 3 and 4. 5.5 packaged-image guard: Task 5. 5.6 documentation set, README, health contract, AGENTS pointer: Tasks 5 and 6. Section 6 testing strategy: every task has a failing test first except Task 5 (shell and Markdown, verified by `bash -n` and the packaging contract) and Task 6 (Markdown, verified by the link check and validator). Section 7 risks: the smoke run in Task 7 covers the dependency risk; Appendix A documents the reuse property.
+**Spec coverage.** 5.1 dev profile: Task 1. 5.2 seed and its tests: Tasks 2 and 4, including the actual dev-config-profile Flyway bootstrap. 5.3 inner loops and mise: Task 1 (tasks) and Appendix A (documentation). 5.4 surface, records, resource-local mapper, resource test: Tasks 3 and 4. 5.5 packaged-image guard: Task 5. 5.6 documentation set, refreshed test catalogue, README, health contract, AGENTS pointer and current-state architecture: Tasks 5 and 6. Section 6 testing strategy: every task has a failing test first except Task 5 (shell and Markdown, verified by `bash -n` and the packaging contract) and Task 6 (Markdown and Mermaid, verified by the link check and architecture validator). Section 7 risks: the smoke run in Task 7 covers the dependency risk; Appendix A documents reuse and the fail-closed seed-drift reset.
 
 **Placeholder scan.** No TBD, TODO, "similar to Task N", or "add validation" phrases. Every code step carries its code. The two documents in the appendices are complete.
 
@@ -1760,11 +2005,15 @@ govern this module.
 
 ## Prerequisites
 
-- JDK 25, managed through mise. The module's `services/funds-core/mise.toml`
+- [mise](https://mise.jdx.dev/getting-started.html), installed and available
+  as `mise` in the shell. It installs and selects the required JDK; do not
+  install a separate JDK just for this module. The module's
+  `services/funds-core/mise.toml`
   pins `java = "25"`. The Maven enforcer plugin in `pom.xml` requires Java in
   range `[25,26)` and Maven `3.9.16` or later, and fails the `validate` phase
   otherwise.
-- Docker, reachable from your shell. The test gate uses Testcontainers to run
+- [Docker Engine or Docker Desktop](https://docs.docker.com/engine/install/),
+  running and reachable from your shell. The test gate uses Testcontainers to run
   PostgreSQL `18.6-bookworm`. Never point the module at a host PostgreSQL
   instance; `CLAUDE.md` requires the test gate to run in Docker, never against
   a host database.
@@ -1774,6 +2023,29 @@ govern this module.
 - git. `PackagingContractTest` resolves the module path through git and fails
   if git is missing or the repository is not a trusted `safe.directory` (see
   Troubleshooting).
+- Bash plus `curl`, `jq`, and GNU `timeout`, all available by those exact
+  command names. The production smoke script checks these before it starts;
+  install them with the package manager for your OS (GNU `timeout` is normally
+  supplied by the `coreutils` package).
+
+Before cloning or building, verify the required external commands:
+
+```bash
+mise --version
+docker info
+command -v bash curl jq timeout
+```
+
+If `docker info` reports a Unix-socket permission error on Linux, follow
+Docker's post-install instructions, then log out and back in so permanent
+group membership is active. For a single command in the current login, use
+`newgrp docker -c 'mise run verify'` from `services/funds-core`. Membership in
+the `docker` group is root-equivalent; do not add it on a shared machine
+without understanding that trust boundary.
+
+To start dev mode before a fresh login activates the group, use
+`newgrp docker -c 'mise run dev'`. This occupies that shell until dev mode
+stops; the permanent login refresh is the normal setup.
 
 ## First run
 
@@ -1812,8 +2084,11 @@ mise run dev
 ```
 
 This runs `./mvnw quarkus:dev`. In the dev console, press `r` to start
-continuous testing; Quarkus re-runs the affected tests every time you save,
-against the same Dev Services database. Press `q` to stop dev mode.
+continuous testing; Quarkus re-runs affected tests under the isolated test
+profile every time you save. Those tests reset ledger tables, so they must
+not share the live dev-mode database. The test configuration disables
+cross-run Dev Services reuse and names its database `funds_core_test`, distinct
+from the live dev service. Press `q` to stop dev mode.
 
 ### A single test class
 
@@ -1846,6 +2121,10 @@ in `application.properties` enables this:
 %dev.quarkus.flyway.locations=db/migration,db/dev-seed
 ```
 
+The Java beans themselves use `@IfBuildProfile(anyOf = {"dev", "test"})`;
+there is no property that can expose this surface in a custom or production
+build profile.
+
 The seed creates a fixed set of reference rows, all under a book of currency
 NGN and time zone Africa/Lagos:
 
@@ -1857,33 +2136,41 @@ NGN and time zone Africa/Lagos:
 | Product version | `00000000-0000-0000-0000-000000000004` |
 | Provider asset account (`PROVIDER-CASH` control) | `00000000-0000-0000-0000-000000000005` |
 | Customer liability account (`CUSTOMER-DEPOSITS` control) | `00000000-0000-0000-0000-000000000006` |
-| Accounting period (OPEN, calendar 2026) | `00000000-0000-0000-0000-000000000007` |
-| Legal entity | `00000000-0000-0000-0000-000000000008` |
+| Accounting period (OPEN, dev-only 2020–2099 window) | `00000000-0000-0000-0000-000000000007` |
+| Book's legal-entity identifier (there is no separate legal-entity table) | `00000000-0000-0000-0000-000000000008` |
 
-To reuse the Dev Services container across dev-mode restarts (so the seed
-does not have to reapply on every restart), add this to
+To reuse the Dev Services container across dev-mode restarts, add this to
 `~/.testcontainers.properties`:
 
 ```properties
 testcontainers.reuse.enable=true
 ```
 
-Dev mode also exposes a dev-only HTTP surface under `/dev/ledger`, excluded
-from the production build profile. It is not a contract: real callers submit
+The repeatable seed accepts an unchanged rerun. If a later seed revision
+changes an immutable fixture attribute, startup fails with
+`dev_reference_seed_drift`; use the safely scoped reset procedure under
+"Inspecting and resetting the database", then restart dev mode so the current
+seed is installed from a clean schema.
+
+Dev mode also exposes an HTTP surface under `/dev/ledger`, positively enabled
+only by the exact dev/test build-profile allowlist. Prod and arbitrary custom
+profiles do not include it. The surface has no authentication: bind it only to
+localhost and never port-forward or expose the dev-mode listener. It is not a contract: real callers submit
 typed commands with their own request hash (see ADR-0002). The packaged
 image returns HTTP 404 on `/dev/ledger/reference`, and the smoke script
 asserts this.
 
 Endpoints:
 
-- `GET /dev/ledger/reference` returns the seeded ids above.
+- `GET /dev/ledger/reference` returns the seeded book, legal-entity, chart,
+  period and account ids. Product and product-version ids remain database-only.
 - `POST /dev/ledger/postings` takes JSON with an optional `commandId`, a
-  `transactionType`, a `narration`, optional `bookingTime` and `valueDate`,
+  `transactionType`, a `narration`, required `bookingTime`, optional `valueDate`,
   and `lines` (each with `accountId`, `currency`, `signedMinorUnits`, and
   `dimensions`). The server resolves the book, chart, period and policy
   version and computes the typed request hash for you.
-- `POST /dev/ledger/reversals` takes `{originalJournalId, reason}` and an
-  optional `commandId`.
+- `POST /dev/ledger/reversals` takes `originalJournalId`, `reason`, required
+  `bookingTime`, and an optional `commandId`.
 - `GET /dev/ledger/proofs/trial-balance?bookId&currency&cutoff` and
   `GET /dev/ledger/proofs/control-account?bookId&controlCode&currency&cutoff`
   return the independent proofs described in the README.
@@ -1898,12 +2185,29 @@ field, booking time outside every open period, unknown book) returns 400. A
 
 Identities are derived from the `commandId`: journal, posting, correlation and
 business-transaction ids are name-based UUIDs of the command id, and the typed
-request hash is computed from the resulting draft. Sending the same body with
-the same `commandId` twice therefore returns the stored result, and changing
-the body under the same `commandId` returns 409, exactly what a real caller
-observes. Omit `commandId` to get a fresh random one per request.
+request hash is computed from the resulting draft. While book governance is
+unchanged, sending the same body with the same `commandId` twice returns the
+stored result, and changing a hash-bearing field under that command id returns
+409. Booking time is required so an identical retry cannot acquire a new
+hash-bearing wall-clock value. This convenience still resolves chart, period
+and policy at request time and therefore does not promise replay across a chart
+rotation, policy change or period closure; real callers pin those coordinates.
+Omit `commandId` to get a fresh random one per request.
 
-Worked example: post NGN 10,000.00 (1,000,000 minor units) as a debit to the
+Wait until startup reports that Quarkus is listening, then verify runtime
+readiness before using the surface:
+
+```bash
+curl -i http://localhost:8080/q/health/ready
+```
+
+Proceed only after it returns HTTP 200 with aggregate status `UP`. This proves
+live datasource connectivity, not that production migrations or role grants
+are correct.
+
+The following exact totals assume a clean dev database. If you enabled
+cross-run reuse and have already used the fixture, reset it first using the
+procedure below. Worked example: post NGN 10,000.00 (1,000,000 minor units) as a debit to the
 seeded provider asset account and a credit to the seeded customer liability
 account, then reverse it, then check the trial balance.
 
@@ -1916,6 +2220,7 @@ curl -s -X POST http://localhost:8080/dev/ledger/postings \
     "commandId": "11111111-1111-1111-1111-111111111111",
     "transactionType": "DEPOSIT",
     "narration": "worked example deposit",
+    "bookingTime": "2026-06-15T10:00:00Z",
     "lines": [
       {"accountId": "00000000-0000-0000-0000-000000000005",
        "currency": "NGN", "signedMinorUnits": 1000000, "dimensions": {}},
@@ -1931,7 +2236,8 @@ The response carries `journalId`, `journalSequence`, `canonicalHash` and the
 ```bash
 curl -s -X POST http://localhost:8080/dev/ledger/reversals \
   -H 'Content-Type: application/json' \
-  -d '{"originalJournalId": "<journal-id-from-the-posting-response>", "reason": "worked example reversal"}'
+  -d '{"originalJournalId": "<journal-id-from-the-posting-response>",
+       "reason": "worked example reversal", "bookingTime": "2026-06-16T10:00:00Z"}'
 ```
 
 Then run both proofs. `cutoff` is a journal sequence, not a time; leave it out
@@ -1949,7 +2255,7 @@ The control-account proof shows the `CUSTOMER-DEPOSITS` source total and
 projection total agreeing, with `difference: 0`; after the reversal both are
 back to 0.
 
-## Inspecting the database
+## Inspecting and resetting the database
 
 List the running Dev Services container:
 
@@ -1966,6 +2272,40 @@ docker exec -it <container> psql -U quarkus -d quarkus
 `quarkus` as both user and database name are Dev Services defaults. If a
 container was started with different values, check `docker inspect
 <container>` for the actual environment.
+
+Generic datasource environment variables such as
+`QUARKUS_DATASOURCE_JDBC_URL`, `QUARKUS_DATASOURCE_USERNAME` and
+`QUARKUS_DATASOURCE_PASSWORD` disable or redirect zero-config Dev Services.
+Unset them for this workflow:
+
+```bash
+unset QUARKUS_DATASOURCE_JDBC_URL QUARKUS_DATASOURCE_USERNAME \
+  QUARKUS_DATASOURCE_PASSWORD QUARKUS_DATASOURCE_DEVSERVICES_ENABLED
+```
+
+Also remove equivalent values from project/profile configuration rather than
+merely overriding them in another file. Confirm the startup log plus `docker ps`
+show the expected `postgres:18.6-bookworm` container before posting. Never aim
+the unauthenticated dev surface or its destructive tests at a shared database.
+
+To recover from `dev_reference_seed_drift`, first stop dev mode. List running
+and stopped candidates, inspect each candidate, and remove only the container
+whose image, environment and published port match the just-stopped funds-core
+Dev Service:
+
+```bash
+docker ps -a --filter ancestor=postgres:18.6-bookworm
+docker inspect <candidate-container-id>
+docker rm -f <verified-funds-core-container-id>
+mise run dev
+```
+
+Every angle-bracket token above is a placeholder: replace it with the exact
+container id you verified; never paste the token literally or automate the
+removal from a broad image-name match.
+
+`docker rm -f` is destructive: it discards all local journals in that Dev
+Services container. Ordinary restarts do not require this reset.
 
 ## Packaging and smoke
 
@@ -2003,8 +2343,8 @@ correctly reflects a live database connection check.
 | Symptom | Fix |
 |---|---|
 | Maven enforcer rejects your JDK version | Run through mise: `mise exec java@25 -- ./mvnw ...`. |
-| Docker unreachable, or Dev Services fails to start | Check your Docker group membership with `id -nG`. If `docker` is missing, run `newgrp docker` to pick up the group in your current shell. |
-| A child-JVM crash test fails or hangs | The child process needs the same JDK on its `PATH` as the parent build; make sure `mise exec java@25` (or an equivalent shell setup) applies to the whole invocation, not just the outer `mvnw`. |
+| Docker unreachable, or Dev Services fails to start | Run `docker info`. On Linux, activate permanent Docker-group membership by logging out and back in, run one gate with `newgrp docker -c 'mise run verify'`, or launch dev mode with `newgrp docker -c 'mise run dev'`. Also check that no external datasource variables redirect dev mode. |
+| A child-JVM crash test fails or hangs | The test launches `${java.home}/bin/java`; run the parent Maven process through `mise exec java@25 --` so its `java.home` is the pinned JDK. |
 | `PackagingContractTest` fails in CI citing an "exact Git-tracked path" | git is missing from the CI image, or the repository is not registered as a `safe.directory` for the user running the build. |
 | `documentedRuntimeSmokeIsExecutable` fails | The checkout has `core.fileMode=false`, so the executable bit on `scripts/prod-runtime-smoke.sh` was not preserved. |
 | Tests hang on a `TRUNCATE` statement | A previous test run left a race in a cancelled state holding a lock. Restart the PostgreSQL Testcontainer (or your local database, if you are inspecting manually) rather than waiting. |
@@ -2090,18 +2430,20 @@ timeout limit in `src/main/resources/application.properties`.
 - Do not add a raw JDBC URL to the file. The three production connection
   values (`FUNDS_DB_JDBC_URL`, `FUNDS_APP_DB_USER`, `FUNDS_APP_DB_PASSWORD`)
   are supplied only through mounted deployment configuration and secrets.
-- The `%dev` profile keys are pinned too:
+- The non-production profile keys are pinned too:
   `%dev.quarkus.datasource.devservices.image-name`,
   `%dev.quarkus.datasource.devservices.reuse`,
   `%dev.quarkus.flyway.migrate-at-start`, and
   `%dev.quarkus.flyway.locations`. Treat a change to any of these the same
-  way as a `%prod` or unconditioned property change.
+  way as a `%prod` or unconditioned property change. Devtools inclusion is an
+  exact Java build-profile allowlist and must never become configurable.
 
 **Tests that will fail if you forget**: `PackagingContractTest` reads
 `pom.xml`, `application.properties`, `Dockerfile.jvm`, `README.md`,
 `docs/health-contract.md`, and `scripts/prod-runtime-smoke.sh` as text and
-asserts they agree; a drifted value in one file while another still claims
-the old value fails the test.
+enforces specific structural and literal contracts. It does not prove that
+all prose agrees, so manually review the affected README and health-contract
+claims whenever a pinned value changes.
 
 **Verify**: `mise run verify`, then read the "Memory boundary" section of
 the README and `docs/health-contract.md` to confirm they still describe the
@@ -2208,17 +2550,20 @@ elements, because `PackagingContractTest` checks them literally:
 
 **Also change**:
 
-- Remember this is a Flyway repeatable migration (`R__` prefix): it re-runs
-  automatically whenever its checksum changes, on the next dev-mode start or
-  test run that applies migrations.
-- Keep it idempotent, because the migration re-runs against a database that
-  already holds the rows. `ON CONFLICT DO NOTHING` is enough for the book,
-  chart, period, product and product version. It is not enough for
-  `ledger_account` and `ledger_account_chart_mapping`: their V005 BEFORE
-  INSERT triggers (`active_chart_account_onboarding_deferred`,
-  `ledger_account_chart_mapping_frozen`) fire before conflict resolution once
-  the chart is active, so those inserts use `INSERT ... SELECT ... WHERE NOT
-  EXISTS`. Guard the activation `UPDATE` with `status = 'DRAFT'`.
+- Remember this is a Flyway repeatable migration (`R__` prefix): Flyway tries
+  it again whenever its checksum changes on the next dev-mode start. Immutable
+  fixture changes cannot be upgraded in place; the final assertion must fail
+  with `dev_reference_seed_drift` and an instruction to discard the reused
+  Dev Services database rather than silently retain stale rows.
+- Keep an unchanged rerun idempotent. `ON CONFLICT DO NOTHING` is sufficient
+  to avoid duplicate inserts for the book, chart, period, product and product
+  version only because the final assertion compares the persisted immutable
+  attributes with the current seed. It is not enough for `chart_version`,
+  `ledger_account` or `ledger_account_chart_mapping`: their V005 BEFORE INSERT
+  triggers mutate governance revisions or reject before conflict resolution,
+  so those inserts use `INSERT ... SELECT ... WHERE NOT EXISTS`. The unchanged
+  rerun test must prove the book governance revision does not advance. Guard
+  the activation `UPDATE` with `status = 'DRAFT'`.
 - Seed no balances, journals or projections; proofs must come from real
   postings.
 - If you change a seeded id or attribute that the developer guide's worked
@@ -2226,10 +2571,12 @@ elements, because `PackagingContractTest` checks them literally:
   seeded accounts, the accounting period, or the legal entity), update the
   developer guide's reference table and worked example to match.
 
-**Tests that will fail if you forget**: `DevSeedIT` applies the seed twice
-against the migrated test database, asserts the row counts and the active
-chart, and posts through the real stack against the seeded graph.
-`DevLedgerResourceIT` and the developer guide use the same identities.
+**Tests that will fail if you forget**: `DevSeedIT` applies the unchanged seed
+twice, proves stale reused state fails with `dev_reference_seed_drift`, asserts
+the row counts and active chart, and posts through the real stack against the seeded graph.
+`DevProfileBootstrapIT`, `DevLedgerResourceIT` and the developer guide use the
+same identities; the bootstrap test additionally proves the real `%dev`
+Flyway location discovers the repeatable migration.
 
 **Verify**: `mise run verify`, then start `mise run dev` and confirm
 `GET /dev/ledger/reference` returns the expected ids.
@@ -2241,7 +2588,7 @@ changing how an existing exception maps to an HTTP response.
 
 **Also change**:
 
-- `DevLedgerExceptionMapper` in the `devtools` package, which maps domain
+- The resource-local `@ServerExceptionMapper` method in `DevLedgerResource`, which maps domain
   rejections to 422, idempotency conflicts to 409, malformed input to 400 and
   persistence failures to 503, all with `{error, message}` bodies. An unmapped
   new exception falls through to 500, which the dev surface reports with the
@@ -2300,13 +2647,13 @@ Before opening a pull request, `AGENTS.md` asks you to confirm:
 - [ ] New public types have a purpose comment; new migrations have a header
       comment block.
 - [ ] No comment restates its code; no `TODO`/`FIXME` was added.
-- [ ] `./mvnw checkstyle:check` passes in `services/funds-core`.
+- [ ] `mise run checkstyle` passes in `services/funds-core`.
 - [ ] If a migration was edited, the tests that read it as text still pass
       (for example `MigrationIT` asserts on `V004__application_roles.sql`
       that it contains exactly three `CREATE ROLE funds_...` lines and never
       contains `IF NOT EXISTS`, `ALTER ROLE funds_`, `pg_auth_members`, or
       `REVOKE %I FROM %I`, comments included).
-- [ ] `./mvnw clean verify` was run in `services/funds-core` with Docker
+- [ ] `mise run verify` was run in `services/funds-core` with Docker
       available.
 
 `docs/conventions/code-comments.md` adds: comment the why, not the what;
